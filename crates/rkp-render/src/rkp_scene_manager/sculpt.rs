@@ -1429,7 +1429,6 @@ mod tests {
             brick_start: 0,
             brick_count: 0,
             skinning: None,
-            splats: Vec::new(),
             mesh_vertices: Vec::new(),
             mesh_indices: Vec::new(),
             mesh_indices_free_list: Vec::new(),
@@ -1443,7 +1442,6 @@ mod tests {
             dag_produced: Vec::new(),
             cpu_octree: SparseOctree::new(depth, base_vs),
             mesh_dirty: false,
-            splats_dirty: false,
             clusters_dirty: false,
             cluster_spatial_index,
         }

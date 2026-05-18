@@ -179,16 +179,7 @@ pub(super) fn run_pre_frame(
         // leaves the trackers populated for retry.
         sm.clear_geometry_dirty_ranges();
         let t_clear = t3.elapsed();
-        // Phase B-2 — keep the splat-raster per-asset vertex-buffer
-        // cache in step with the loaded asset set. Re-upload all of
-        // them on every geometry-epoch bump rather than tracking which
-        // assets actually changed; matches the upload_geometry "build
-        // everything from scratch" pattern, and the cost is bounded by
-        // total splat count (rare, off-the-hot-path).
-        for (handle, splats) in sm.iter_loaded_asset_splats() {
-            state.renderer.upload_splats_for_asset(handle.raw(), splats);
-        }
-        // Phase 2 (splat-to-mesh pivot) — same logic for the mesh
+        // Mesh path — keep the per-asset (vbo, ibo) cache in step with the
         // path's per-asset (vbo, ibo) cache. iter_loaded_asset_meshes
         // skips empty mesh extractions (procedurals etc.) so this only
         // touches assets that produced a non-empty surface mesh at

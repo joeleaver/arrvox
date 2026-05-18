@@ -1,34 +1,26 @@
-//! `SplatPass` — render pipeline owner for the surface-splat path.
+//! Shared per-instance render infrastructure.
 //!
-//! Visibility-buffer architecture: this pass writes only what the raster
-//! can produce uniquely (world position, per-leaf id, per-instance id).
-//! A separate compute pass (`splat_resolve_pass`) reads those and fills
-//! in the rest of the G-buffer (normal / material / glass). The split
-//! exists so the raster pass fits under wgpu's default
-//! `max_color_attachment_bytes_per_sample` limit (32 B; we use 24 B
-//! across three attachments).
+//! Owns the `SplatInstanceUniform` (per-scene-instance uniform — world
+//! matrix, object id, bone-skinning state) and the bind-group layouts
+//! every raster path consumes:
+//!  * `g0` — scene-wide: camera + leaf_attr_pool + bone_matrices +
+//!    bone_dual_quats. One bind group per pass.
+//!  * `g1` — per-instance: a 96 B `SplatInstanceUniform`. One bind group
+//!    per scene instance.
 //!
-//! Two bind groups:
-//!  * `g0` — scene-wide: camera (`CameraUniforms`, 224 B) + `leaf_attr_pool`
-//!    (storage<read>, the vertex shader reads `normal_oct` to build the
-//!    disc tangent basis). Bind once per pass.
-//!  * `g1` — per-instance: a 80 B `SplatInstanceUniform` carrying the
-//!    instance's world matrix + `object_id`. One bind group per scene
-//!    instance; rebound between draws.
+//! Historical note: this file used to also own the splat-raster render
+//! pipeline. After the splat→mesh pivot the raster was retired; the
+//! per-instance uniform + layouts proved general-purpose and are still
+//! used by the mesh raster, mesh shadow render, mesh LOD select, and
+//! user-shader mesh paths. Names will be renamed `splat_*` → `mesh_*` in
+//! the cleanup audit.
 
-use crate::gbuffer::{GBUFFER_DEPTH_FORMAT, GBUFFER_POSITION_FORMAT};
 use crate::rkp_scene::CameraUniforms;
-
-use super::extract::SplatVertex;
-
-const GBUFFER_PICK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
-const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 
 /// Per-instance uniform — one mat4 world transform, the entity's
 /// `object_id` (written into the pick texture), and the per-instance
-/// bone-skinning state (Phase 6.6). 96 B, multiple of 16. CPU mirror
-/// of the `SplatInstance` struct in `splat.wesl` and the matching
-/// declaration in the mesh raster + shadow shaders.
+/// bone-skinning state. 96 B, multiple of 16. CPU mirror of the
+/// `SplatInstance` struct in the mesh raster + shadow shaders.
 ///
 /// **Skinning semantics:**
 /// * `skinning_mode == SKINNING_MODE_NONE` → instance is not skinned
@@ -51,10 +43,10 @@ const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Ui
 /// added to every cell's centroid. The mesh VS subtracts it from
 /// `local_pos` before applying bone matrices (which were trained
 /// against grid-frame positions, origin at the octree corner) and
-/// adds it back after, before the world transform. Splat path
-/// ignores it. For unskinned instances `grid_origin` is irrelevant
-/// because the VS skips the subtract/add path entirely; the engine
-/// still uploads a sane value for debugging.
+/// adds it back after, before the world transform. For unskinned
+/// instances `grid_origin` is irrelevant because the VS skips the
+/// subtract/add path entirely; the engine still uploads a sane value
+/// for debugging.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SplatInstanceUniform {
@@ -83,9 +75,9 @@ pub const SKINNING_MODE_NONE: u32 = u32::MAX;
 
 const _: () = assert!(std::mem::size_of::<SplatInstanceUniform>() == 96);
 // Hand-checked field offsets — must match the WGSL declaration in
-// `mesh.wesl` / `mesh_shadow.wesl` / `splat.wesl`. WGSL's uniform
-// buffer layout treats vec3 as size-12-align-16, so a u32 following
-// vec3 sits immediately after at offset 76 (no auto-pad to 80).
+// `mesh.wesl` / `mesh_shadow.wesl`. WGSL's uniform buffer layout
+// treats vec3 as size-12-align-16, so a u32 following vec3 sits
+// immediately after at offset 76 (no auto-pad to 80).
 const _: () = {
     use std::mem::offset_of;
     assert!(offset_of!(SplatInstanceUniform, world) == 0);
@@ -98,9 +90,10 @@ const _: () = {
 };
 pub const SPLAT_INSTANCE_BYTES: u64 = std::mem::size_of::<SplatInstanceUniform>() as u64;
 
-/// Splat-rasterizer GPU pass.
+/// Shared per-instance bind-group layouts (g0 = scene-wide,
+/// g1 = per-instance). Owned by every raster path the renderer
+/// dispatches.
 pub struct SplatPass {
-    pub pipeline: wgpu::RenderPipeline,
     pub g0_layout: wgpu::BindGroupLayout,
     pub g1_layout: wgpu::BindGroupLayout,
 }
@@ -138,14 +131,10 @@ impl SplatPass {
                     },
                     count: None,
                 },
-                // bone_matrices (storage<read>) — Phase 6.6 mesh-VS
-                // skinning. Carries the per-frame `mat3x4`-packed LBS
-                // palette concatenated across all skinned entities;
-                // the per-instance `bone_offset_lbs` indexes into it.
-                // Splat path doesn't use it (splats render rest-pose
-                // splats; deformation lives in the user-shader path),
-                // so leaving the binding declared but unread is fine —
-                // wgpu doesn't require shaders to read every binding.
+                // bone_matrices (storage<read>) — mesh-VS LBS skinning.
+                // Carries the per-frame `mat3x4`-packed LBS palette
+                // concatenated across all skinned entities; the
+                // per-instance `bone_offset_lbs` indexes into it.
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::VERTEX,
@@ -156,8 +145,8 @@ impl SplatPass {
                     },
                     count: None,
                 },
-                // bone_dual_quats (storage<read>) — Phase 6.6 mesh-VS
-                // DQS palette, parallel to `bone_matrices`. Indexed by
+                // bone_dual_quats (storage<read>) — mesh-VS DQS
+                // palette, parallel to `bone_matrices`. Indexed by
                 // the per-instance `bone_offset_dqs`.
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
@@ -174,9 +163,9 @@ impl SplatPass {
 
         // ── g1: per-instance uniform ───────────────────────────────
         // Visibility includes COMPUTE so the same per-VR
-        // `splat_instance_bind_groups` drive both the splat / mesh
-        // render pipelines (vertex+fragment) AND the Phase 6.2
-        // `mesh_lod_select` compute pass — one bind group, one layout.
+        // per-instance bind groups drive the mesh render pipelines
+        // (vertex+fragment) AND the `mesh_lod_select` compute pass —
+        // one bind group, one layout.
         let g1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("splat g1"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -191,105 +180,7 @@ impl SplatPass {
             }],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("splat pipeline layout"),
-            bind_group_layouts: &[Some(&g0_layout), Some(&g1_layout)],
-            immediate_size: 0,
-        });
-
-        let module = crate::compile_pass_shader(
-            device,
-            wesl::include_wesl!("splat"),
-            "splat",
-        );
-
-        // SplatVertex: 32 B per instance. (See `extract::SplatVertex`.)
-        let vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<SplatVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    shader_location: 0,
-                    offset: 0,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    shader_location: 1,
-                    offset: 12,
-                    format: wgpu::VertexFormat::Float32,
-                },
-                wgpu::VertexAttribute {
-                    shader_location: 2,
-                    offset: 16,
-                    format: wgpu::VertexFormat::Uint32,
-                },
-            ],
-        };
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("splat"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vert_main"),
-                compilation_options: Default::default(),
-                buffers: &[vertex_layout],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None, // Disc splats are double-sided
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: GBUFFER_DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("frag_main"),
-                compilation_options: Default::default(),
-                // Three-attachment visibility-buffer output:
-                //   position (16) + pick (4) + leaf_slot (4) = 24 B.
-                // Order is locked by `splat.wesl`'s `FsOut`.
-                targets: &[
-                    Some(wgpu::ColorTargetState {
-                        format: GBUFFER_POSITION_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    Some(wgpu::ColorTargetState {
-                        format: GBUFFER_PICK_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    Some(wgpu::ColorTargetState {
-                        format: GBUFFER_LEAF_SLOT_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                ],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        Self {
-            pipeline,
-            g0_layout,
-            g1_layout,
-        }
+        Self { g0_layout, g1_layout }
     }
 
     /// Build the scene-wide `g0` bind group. Bound once per pass, before
@@ -339,90 +230,6 @@ impl SplatPass {
                 binding: 0,
                 resource: instance_uniform_buffer.as_entire_binding(),
             }],
-        })
-    }
-
-    /// Begin a splat render pass on the supplied G-buffer attachments.
-    /// All three color targets (and the depth buffer) are cleared to
-    /// the same miss sentinels `octree_march` writes for non-hit
-    /// pixels:
-    ///
-    /// | target      | clear value                  |
-    /// |-------------|------------------------------|
-    /// | position    | (0, 0, 0, 1e10)              |
-    /// | pick        | 0xFFFFFFFF                   |
-    /// | leaf_slot   | 0                            |
-    /// | depth       | 1.0                          |
-    ///
-    /// The remaining G-buffer entries (normal / material / glass) are
-    /// **not** cleared by this pass — the resolve compute pass writes
-    /// them per-pixel based on the leaf_slot value at the same coord.
-    /// For miss pixels the resolve pass writes zeros, matching what
-    /// the compute march writes for non-hits.
-    pub fn begin_pass<'a>(
-        &'a self,
-        encoder: &'a mut wgpu::CommandEncoder,
-        position_view: &wgpu::TextureView,
-        pick_view: &wgpu::TextureView,
-        leaf_slot_view: &wgpu::TextureView,
-        depth_view: &wgpu::TextureView,
-        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'a>>,
-    ) -> wgpu::RenderPass<'a> {
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("splat render"),
-            color_attachments: &[
-                Some(wgpu::RenderPassColorAttachment {
-                    view: position_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0e10,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: pick_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    // miss_pick_id = 0xFFFFFFFF (see octree_march.wesl
-                    // line 1245). wgpu casts the .r component of the
-                    // f64 Color struct to u32 for Uint targets.
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 4_294_967_295.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: leaf_slot_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                }),
-            ],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes,
-            occlusion_query_set: None,
-            multiview_mask: None,
         })
     }
 }

@@ -16,7 +16,6 @@ use super::types::{
     AssetEntry, AssetHandle, AssetInfo, ReloadResult, SkinBrick, SkinningAssetData,
 };
 use crate::mesh_pass::extract_surface_mesh;
-use crate::splat_pass::extract_splats;
 
 impl RkpSceneManager {
     fn resolve_rkp_path(path: &str) -> Result<PathBuf, String> {
@@ -449,29 +448,6 @@ impl RkpSceneManager {
         let final_leaf_attr_slot_count =
             self.leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
 
-        // Splat extraction — flatten the surface into one
-        // `SplatVertex` per occupied cell, in object-local coordinates.
-        // The render side uploads this to a per-asset GPU vertex buffer
-        // and rasterizes it as oriented disc splats when the editor's
-        // primary-visibility path is set to splats. Tree nodes are
-        // already in their final compacted/morton form here, and brick
-        // ids have been remapped to scene-global; the brick cells'
-        // leaf_attr ids likewise. So `tree.as_slice()` paired with the
-        // scene-global `brick_pool.as_slice()` produces splats whose
-        // `leaf_attr_id` indexes directly into `leaf_attr_pool` — the
-        // same indirection the splat shader's vertex stage expects.
-        let asset_extent =
-            (1u32 << header.octree_depth as u8) as f32 * header.base_voxel_size;
-        let aabb_center = (aabb.min + aabb.max) * 0.5;
-        let asset_grid_origin = aabb_center - glam::Vec3::splat(asset_extent * 0.5);
-        let splats = extract_splats(
-            tree.as_slice(),
-            header.octree_depth as u8,
-            header.base_voxel_size,
-            asset_grid_origin,
-            self.brick_pool.as_slice(),
-        );
-
         // v5+ pre-built mesh deserialization. The .rkp ships
         // `(MeshVertex[], u32[], MeshletCluster[])` so the editor
         // skips the ~12s `extract_surface_mesh` +
@@ -527,6 +503,10 @@ impl RkpSceneManager {
                 "[RkpSceneManager] {}: v4 .rkp without baked mesh sections — extracting + building DAG at load (re-import to avoid this)",
                 rkp_path.display(),
             );
+            let asset_extent =
+                (1u32 << header.octree_depth as u8) as f32 * header.base_voxel_size;
+            let aabb_center = (aabb.min + aabb.max) * 0.5;
+            let asset_grid_origin = aabb_center - glam::Vec3::splat(asset_extent * 0.5);
             let (v, i_unc) = extract_surface_mesh(
                 tree.as_slice(),
                 header.octree_depth as u8,
@@ -711,7 +691,7 @@ impl RkpSceneManager {
         let handle = self.octree.allocate(&tree);
 
         eprintln!(
-            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs, {} splats, mesh {} verts / lod0 {} tris / dag {} tris / {} clusters max-lod {}",
+            "[RkpSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs, mesh {} verts / lod0 {} tris / dag {} tris / {} clusters max-lod {}",
             rkp_path.display(),
             actual_cell_count,
             voxel_count,
@@ -721,7 +701,6 @@ impl RkpSceneManager {
             dedup_count,
             if dedup_count > 0 { raw_count as f64 / dedup_count as f64 } else { 0.0 },
             final_leaf_attr_slot_count - leaf_attr_slot_count,
-            splats.len(),
             mesh_vertices.len(),
             mesh_lod0_index_count / 3,
             mesh_indices.len() / 3,
@@ -854,7 +833,6 @@ impl RkpSceneManager {
             brick_start: scene_brick_offset,
             brick_count: file_brick_count,
             skinning,
-            splats,
             mesh_vertices,
             mesh_indices,
             mesh_indices_free_list: Vec::new(),
@@ -868,7 +846,6 @@ impl RkpSceneManager {
             dag_produced,
             cpu_octree: tree,
             mesh_dirty: true,
-            splats_dirty: true,
             clusters_dirty: true,
             cluster_spatial_index,
         })
@@ -878,42 +855,6 @@ impl RkpSceneManager {
     /// asset was imported without bone weights.
     pub fn skinning_data(&self, handle: AssetHandle) -> Option<&SkinningAssetData> {
         self.asset_cache.get(handle)?.skinning.as_ref()
-    }
-
-    /// Splat-rasterizer surface data for `handle`. One `SplatVertex` per
-    /// occupied surface cell, in object-local coordinates; the per-
-    /// instance world matrix is applied in the splat vertex shader.
-    /// Returns `None` for an unknown handle. The slice is shared across
-    /// every scene-instance of the asset; the render side uploads it
-    /// once per geometry epoch.
-    pub fn asset_splats(
-        &self,
-        handle: AssetHandle,
-    ) -> Option<&[crate::splat_pass::SplatVertex]> {
-        Some(self.asset_cache.get(handle)?.splats.as_slice())
-    }
-
-    /// Iterator over `(AssetHandle, &[SplatVertex])` for every loaded
-    /// asset. Used by the render thread to keep the per-asset GPU
-    /// vertex-buffer cache in sync with the CPU-side asset cache —
-    /// called once per geometry epoch after `upload_geometry`.
-    ///
-    /// Skips empty splat lists (procedural assets, future-proof) so
-    /// the caller's upload loop only touches assets that need it.
-    pub fn iter_loaded_asset_splats(
-        &self,
-    ) -> impl Iterator<Item = (AssetHandle, &[crate::splat_pass::SplatVertex])> {
-        self.asset_cache
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, slot)| {
-                let entry = slot.as_ref()?;
-                if entry.splats.is_empty() || !entry.splats_dirty {
-                    return None;
-                }
-                Some((AssetHandle::from_raw(idx as u32), entry.splats.as_slice()))
-            })
     }
 
     /// Surface-mesh `(vertices, indices, lod0_index_count)` for
@@ -994,17 +935,16 @@ impl RkpSceneManager {
             })
     }
 
-    /// Clear every loaded asset's `mesh_dirty / splats_dirty /
-    /// clusters_dirty` flags. The render thread calls this after each
-    /// geometry-epoch upload loop completes — assets that didn't
-    /// upload (already-clean entries) are no-op writes, but any entry
-    /// the upload touched gets its dirty flag dropped so the next
-    /// epoch bump doesn't re-upload it.
+    /// Clear every loaded asset's `mesh_dirty / clusters_dirty`
+    /// flags. The render thread calls this after each geometry-epoch
+    /// upload loop completes — assets that didn't upload
+    /// (already-clean entries) are no-op writes, but any entry the
+    /// upload touched gets its dirty flag dropped so the next epoch
+    /// bump doesn't re-upload it.
     pub fn mark_loaded_asset_uploads_clean(&mut self) {
         for slot in self.asset_cache.entries.iter_mut() {
             if let Some(entry) = slot.as_mut() {
                 entry.mesh_dirty = false;
-                entry.splats_dirty = false;
                 entry.clusters_dirty = false;
                 // Slab-allocator dirty ranges live in lockstep with
                 // `mesh_dirty` — they were just consumed by

@@ -21,7 +21,7 @@ use crate::rkp_shade::{ShadeParams, GpuLight, GpuMaterial};
 use crate::rkp_atmosphere::RkpAtmospherePass;
 use crate::mesh_pass::{MeshPass, MeshVertex, MeshletCluster};
 use crate::mesh_shadow_map_pass::MeshShadowMapPass;
-use crate::splat_pass::{SplatDraw, SplatPass, SplatVertex};
+use crate::splat_pass::{SplatDraw, SplatPass};
 use crate::splat_resolve_pass::SplatResolvePass;
 use wgpu_profiler::GpuProfiler;
 
@@ -142,15 +142,9 @@ pub struct RkpRenderer {
     /// One pipeline shared across viewports; per-VR bind group lives
     /// on `ViewportRenderer`.
     pub brush_state: crate::brush_state_pass::BrushStatePass,
-    /// Per-asset vertex-buffer cache for the splat path. Indexed by
-    /// `AssetHandle::raw()` — `splat_buffers[handle.raw() as usize]`
-    /// is `Some((vbo, splat_count))` for assets whose splat data has
-    /// been uploaded, `None` otherwise. Grows as new assets are
-    /// loaded; entries are cleared on `release_splats_for_asset`.
-    splat_buffers: Vec<Option<(wgpu::Buffer, u32)>>,
-    /// Surface-mesh raster pipeline (Phase 2 of the splat-to-mesh
-    /// pivot). Shares `g0_layout` / `g1_layout` with `splat_pass` so
-    /// the same per-VR bind groups drive both pipelines.
+    /// Surface-mesh raster pipeline. Shares `g0_layout` / `g1_layout`
+    /// with `splat_pass` (a stub container for those layouts after the
+    /// splat-prototype removal; will be renamed in cleanup).
     pub mesh_pass: MeshPass,
     /// Mesh-rendered directional shadow-map pipeline (Phase 3 of the
     /// pivot). Renders the same triangles from the light's POV; per-VR
@@ -409,7 +403,6 @@ impl RkpRenderer {
             mesh_proxy,
             user_shader_mesh,
             brush_state,
-            splat_buffers: Vec::new(),
             mesh_pass,
             mesh_shadow_map,
             mesh_lod_select_pass,
@@ -435,47 +428,6 @@ impl RkpRenderer {
     /// CI override, see `dispatch_mesh_shadow`).
     pub fn set_shadow_csm_threshold_falloff(&mut self, v: f32) {
         self.shadow_csm_threshold_falloff = v.clamp(1.0, 6.0);
-    }
-
-    /// Upload (or replace) the splat vertex buffer for a given asset.
-    /// Caller passes the asset's `AssetHandle::raw()` and the
-    /// `&[SplatVertex]` from `RkpSceneManager::asset_splats`. Re-upload
-    /// is safe — the previous buffer (if any) is dropped at the end of
-    /// the call. Empty splat lists clear the cached entry.
-    pub fn upload_splats_for_asset(&mut self, handle_raw: u32, splats: &[SplatVertex]) {
-        use wgpu::util::DeviceExt;
-        let idx = handle_raw as usize;
-        if idx >= self.splat_buffers.len() {
-            self.splat_buffers.resize_with(idx + 1, || None);
-        }
-        if splats.is_empty() {
-            self.splat_buffers[idx] = None;
-            return;
-        }
-        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("splat asset vbo"),
-            contents: bytemuck::cast_slice(splats),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        self.splat_buffers[idx] = Some((buffer, splats.len() as u32));
-    }
-
-    /// Drop the cached splat vertex buffer for `handle_raw`. Called
-    /// when an asset is released or invalidated.
-    pub fn release_splats_for_asset(&mut self, handle_raw: u32) {
-        let idx = handle_raw as usize;
-        if let Some(slot) = self.splat_buffers.get_mut(idx) {
-            *slot = None;
-        }
-    }
-
-    /// Look up the cached splat vertex buffer. Returns `(buffer,
-    /// splat_count)` when the asset has been uploaded, else `None`.
-    pub fn splat_buffer(&self, handle_raw: u32) -> Option<(&wgpu::Buffer, u32)> {
-        self.splat_buffers
-            .get(handle_raw as usize)
-            .and_then(|s| s.as_ref())
-            .map(|(b, c)| (b, *c))
     }
 
     /// Upload (or replace) the surface-mesh vertex + index buffers for
@@ -820,171 +772,6 @@ impl RkpRenderer {
     /// the same G-buffer the compute march writes, so the downstream
     /// shade / SSAO / etc passes are unchanged.
     ///
-    /// Steps:
-    ///   1. Refresh the per-VR `g0` bind group (if scene buffers /
-    ///      lights+materials moved).
-    ///   2. Grow per-instance uniform slots to `draws.len()`.
-    ///   3. Write each `SplatDraw`'s world matrix + object_id into its
-    ///      slot via `queue.write_buffer`.
-    ///   4. Begin the splat render pass (clears all six gbuffer
-    ///      targets to march-equivalent miss sentinels).
-    ///   5. For each draw with a cached vertex buffer, bind the slot's
-    ///      g1 + the asset's vbo and `pass.draw(0..4, 0..count)`.
-    ///
-    /// Draws with no cached vertex buffer (asset not yet uploaded) are
-    /// silently skipped — they'll show through as the "miss" clear,
-    /// matching how the march path handles missing assets.
-    pub fn dispatch_splat(
-        &mut self,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        viewport: &mut crate::viewport_renderer::ViewportRenderer,
-        draws: &[SplatDraw],
-    ) {
-        viewport.refresh_splat_g0(&self.device, self);
-        viewport.refresh_splat_resolve_bindings(&self.device, self);
-        viewport.ensure_splat_instance_capacity(&self.device, self, draws.len() as u32);
-        for (slot, d) in draws.iter().enumerate() {
-            viewport.write_splat_instance(
-                queue,
-                slot as u32,
-                &d.world,
-                d.object_id,
-                d.grid_origin,
-                d.bone_offset_lbs,
-                d.bone_offset_dqs,
-                d.skinning_mode,
-            );
-        }
-
-        // RKP_SPLAT_STATS=1 prints per-frame draw stats with a
-        // per-asset breakdown. The breakdown distinguishes "lots of
-        // unique geometry" from "few unique assets × many instances"
-        // — different shapes call for different optimizations
-        // (frustum cull / hardware-instanced single draw / LOD cut).
-        if std::env::var("RKP_SPLAT_STATS").is_ok() {
-            use std::collections::HashMap;
-            // handle_raw → (instance_count, splats_per_asset)
-            let mut per_asset: HashMap<u32, (u32, u32)> = HashMap::new();
-            let mut total_splats: u64 = 0;
-            let mut drawn = 0u32;
-            let mut missing = 0u32;
-            for d in draws {
-                match self.splat_buffer(d.asset_handle_raw) {
-                    Some((_, count)) => {
-                        total_splats += count as u64;
-                        drawn += 1;
-                        let entry = per_asset
-                            .entry(d.asset_handle_raw)
-                            .or_insert((0, count));
-                        entry.0 += 1;
-                    }
-                    None => missing += 1,
-                }
-            }
-            let unique_splats: u64 = per_asset.values().map(|(_, s)| *s as u64).sum();
-            eprintln!(
-                "[splat] {}×{} · {} draws ({} drawn, {} skipped) · {} unique assets · {} unique splats · {} total rasterized",
-                viewport.width, viewport.height,
-                draws.len(), drawn, missing,
-                per_asset.len(), unique_splats, total_splats,
-            );
-            // Sort by total contribution descending so the heaviest
-            // hitter shows up first.
-            let mut rows: Vec<_> = per_asset.iter().collect();
-            rows.sort_by_key(|(_, (n, s))| std::cmp::Reverse(*n as u64 * *s as u64));
-            for (handle, (n_inst, splats)) in rows {
-                eprintln!(
-                    "  asset {}: {} inst × {} splats = {}",
-                    handle, n_inst, splats, *n_inst as u64 * *splats as u64,
-                );
-            }
-        }
-
-        let g0_bg = viewport
-            .splat_g0_bg
-            .as_ref()
-            .expect("splat g0 bg present after refresh_splat_g0");
-
-        // 0. Clear the rest_pos texture so its .w stays 0 across the
-        //    splat path. The splat raster doesn't bind rest_pos —
-        //    only the mesh raster writes it — but `splat_resolve` reads
-        //    it to decide whether to do per-pixel octree descent. If
-        //    we don't clear, leftover mesh-frame writes leak through
-        //    on splat frames and the resolve mis-descends with stale
-        //    rest_pos values, producing wrong cell colors. The cheapest
-        //    portable clear is a render pass with a single color
-        //    attachment whose only op is LoadOp::Clear.
-        {
-            let _clear_rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("splat clear rest_pos"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &viewport.gbuffer.rest_pos_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
-
-        // 1. Visibility-buffer raster — writes position + pick +
-        //    leaf_slot for hit pixels; clears all three (and depth) to
-        //    march-equivalent miss sentinels.
-        let q_raster = self.profiler.begin_query("splat_raster", encoder);
-        {
-            let mut rp = self.splat_pass.begin_pass(
-                encoder,
-                &viewport.gbuffer.position_view,
-                &viewport.pick_view,
-                &viewport.gbuffer.leaf_slot_view,
-                &viewport.gbuffer.depth_view,
-                None,
-            );
-            rp.set_pipeline(&self.splat_pass.pipeline);
-            rp.set_bind_group(0, g0_bg, &[]);
-            for (slot, d) in draws.iter().enumerate() {
-                let Some((vbo, count)) = self.splat_buffer(d.asset_handle_raw) else {
-                    continue;
-                };
-                let g1_bg = &viewport.splat_instance_bind_groups[slot];
-                rp.set_bind_group(1, g1_bg, &[]);
-                rp.set_vertex_buffer(0, vbo.slice(..));
-                rp.draw(0..4, 0..count);
-            }
-        }
-        self.profiler.end_query(encoder, q_raster);
-
-        // 2. Resolve compute — reads (leaf_slot, pick) per pixel,
-        //    writes normal / material / glass via the storage-texture
-        //    G-buffer entries. Branches on leaf_slot==0 to write march-
-        //    equivalent miss sentinels for non-hit pixels (so those
-        //    targets don't need a separate clear).
-        let resolve_g0 = viewport
-            .splat_resolve_g0_bg
-            .as_ref()
-            .expect("splat_resolve g0 bg present after refresh");
-        let resolve_g1 = viewport
-            .splat_resolve_g1_bg
-            .as_ref()
-            .expect("splat_resolve g1 bg present after refresh");
-        let q_resolve = self.profiler.begin_query("splat_resolve", encoder);
-        self.splat_resolve.dispatch(
-            encoder,
-            resolve_g0,
-            resolve_g1,
-            viewport.width,
-            viewport.height,
-        );
-        self.profiler.end_query(encoder, q_resolve);
-    }
-
     /// Rasterize procedural proxy meshes into the existing G-buffer.
     /// V1 mesh-path user-shader raster — one indirect draw per
     /// active user-shader material. Composites onto the G-buffer
@@ -2323,24 +2110,15 @@ impl RkpRenderer {
                 encoder, viewport.width, viewport.height, None,
             );
             self.profiler.end_query(encoder, q);
-        } else if splat {
-            self.dispatch_splat(queue, encoder, viewport, splat_draws);
-        } else if mesh {
-            // Mesh path consumes the same per-instance draw list as
-            // splat — both record (asset_handle, world, object_id).
-            self.dispatch_mesh(queue, encoder, viewport, splat_draws);
         } else {
-            viewport.march.clear_stats(encoder);
-            let q = self.profiler.begin_query("march", encoder);
-            viewport.march.dispatch(
-                encoder, queue, &viewport.scene_bind_group,
-                object_count, viewport.width, viewport.height, 0,
-                shadow_steps, num_lights, lod_enabled, surfacenet_enabled,
-                tile_count_x, tlas_node_count,
-                shadow_map_enabled, time, asset_count, None,
-            );
-            self.profiler.end_query(encoder, q);
+            // Mesh primary visibility is the only non-preview path.
+            // `splat_draws` records (asset_handle, world, object_id)
+            // per scene instance — name to be renamed `mesh_draws` in
+            // the cleanup audit.
+            self.dispatch_mesh(queue, encoder, viewport, splat_draws);
         }
+        let _ = splat;
+        let _ = mesh;
 
         // 1a'. Proxy-mesh raster — composites procedural triangle
         //      meshes onto the G-buffer regardless of primary mode.

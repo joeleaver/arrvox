@@ -41,8 +41,8 @@ pub struct AssetHandle(u32);
 impl AssetHandle {
     pub fn raw(self) -> u32 { self.0 }
     /// Build an `AssetHandle` from its raw u32 representation.
-    /// Internal-only — used by `iter_loaded_asset_splats` to surface
-    /// handles without exposing the private constructor.
+    /// Internal-only.
+    #[allow(dead_code)]
     pub(super) fn from_raw(raw: u32) -> Self { AssetHandle(raw) }
 }
 
@@ -109,25 +109,10 @@ pub(super) struct AssetEntry {
     /// section. Phase-3 scatter pass reads this to drive the per-frame
     /// bone-field write.
     pub(super) skinning: Option<SkinningAssetData>,
-    /// Flattened surface-voxel data for the splat-rasterizer path. One
-    /// entry per non-empty, non-interior cell, in **object-local**
-    /// coordinates (per-instance world is applied in the splat vertex
-    /// shader). Shared across every scene-instance of this asset; the
-    /// render side uploads it to a GPU vertex buffer once per geometry
-    /// epoch via `RkpRenderer::upload_splats_for_asset`.
-    ///
-    /// ~32 B per cell. A 2.5 M-cell asset (elephant) carries ~80 MB
-    /// resident on the CPU; future optimization may release the Vec
-    /// after the GPU buffer is built, but for now we keep it so re-
-    /// extraction isn't needed when the GPU side reallocates.
-    pub(super) splats: Vec<crate::splat_pass::SplatVertex>,
-    /// Surface-mesh vertices from naive surface-nets extraction
-    /// (Phase 1 of the splat-to-mesh pivot). Object-local positions on
-    /// grid corners; carries oct-packed normal + `leaf_attr_id`. Sized
-    /// proportional to surface area, not voxel count — typically a
-    /// large fraction of `splats.len()` on assets with thin shells.
-    /// Stored alongside `splats` until the Phase 2 forward triangle
-    /// pipeline replaces the splat path.
+    /// Surface-mesh vertices from naive surface-nets extraction.
+    /// Object-local positions on grid corners; carries oct-packed
+    /// normal + `leaf_attr_id`. Sized proportional to surface area,
+    /// not voxel count.
     pub(super) mesh_vertices: Vec<crate::mesh_pass::MeshVertex>,
     /// Triangle indices into `mesh_vertices`.
     ///
@@ -215,12 +200,10 @@ pub(super) struct AssetEntry {
     /// the one asset the sculpt mutated.
     ///
     /// Set to `true` at load. Sculpt sets `mesh_dirty` and
-    /// `clusters_dirty` true; splats never change post-load so
-    /// `splats_dirty` only fires on the first upload. The render
-    /// thread clears all three after upload via
+    /// `clusters_dirty` true. The render thread clears both after
+    /// upload via
     /// [`RkpSceneManager::mark_loaded_asset_uploads_clean`].
     pub(super) mesh_dirty: bool,
-    pub(super) splats_dirty: bool,
     pub(super) clusters_dirty: bool,
     /// D7 — bucket-grid spatial index over LOD-0 `meshlet_clusters`.
     /// Queried by `clusters_in_brush_grid_aabb` to skip the ~105 k-
@@ -760,7 +743,6 @@ mod slab_tests {
             brick_start: 0,
             brick_count: 0,
             skinning: None,
-            splats: Vec::new(),
             mesh_vertices: Vec::new(),
             mesh_indices: initial.to_vec(),
             mesh_indices_free_list: Vec::new(),
@@ -774,7 +756,6 @@ mod slab_tests {
             dag_produced: Vec::new(),
             cpu_octree: SparseOctree::new(8, 1.0),
             mesh_dirty: false,
-            splats_dirty: false,
             clusters_dirty: false,
             cluster_spatial_index:
                 crate::rkp_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
@@ -962,7 +943,6 @@ mod slab_tests {
             brick_start: 0,
             brick_count: 0,
             skinning: None,
-            splats: Vec::new(),
             mesh_vertices: Vec::new(),
             mesh_indices: Vec::new(),
             mesh_indices_free_list: Vec::new(),
@@ -976,7 +956,6 @@ mod slab_tests {
             dag_produced: Vec::new(),
             cpu_octree: SparseOctree::new(8, 1.0),
             mesh_dirty: false,
-            splats_dirty: false,
             clusters_dirty: false,
             cluster_spatial_index:
                 crate::rkp_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
