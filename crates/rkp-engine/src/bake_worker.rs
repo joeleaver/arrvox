@@ -39,7 +39,7 @@ use rkp_render::proc_sample::GpuEvaluator;
 use rkp_render::proc_surface_nets::{GpuSurfaceNets, SurfaceMesh};
 use rkp_core::mesh_cluster::MeshletCluster;
 
-use crate::components::{BakeMode, SpatialData, Transform};
+use crate::components::{SpatialData, Transform};
 use crate::generator::{GenerateFn, GeneratorError};
 
 /// What the worker will voxelize into a `BakeArtifact`, or skip past if
@@ -111,12 +111,6 @@ pub struct BakeRequest {
     /// Set → this is a generator-emitted child bake. Drives main-thread
     /// post-processing (spawn new entity vs. update existing).
     pub generator_child: Option<GeneratorChildSpec>,
-    /// Whether the worker should voxelize-and-integrate (default,
-    /// works for every existing path) or run GPU surface-nets and
-    /// return a triangle proxy mesh. `BakeMode::ProxyMesh` is only
-    /// valid on `BakeInput::Procedural` — `Artifact` inputs are
-    /// already-voxelized and have no SDF to mesh from.
-    pub bake_mode: BakeMode,
 }
 
 /// Worker → engine handoff. Integrate has already run on the worker
@@ -316,67 +310,56 @@ fn run_bake(
 ) -> BakeResult {
     let t_start = std::time::Instant::now();
 
-    // Step 1a: ProxyMesh fast-path — bypass voxelization entirely
-    // and run GPU surface-nets directly on the SDF. Only valid for
-    // `BakeInput::Procedural` (Artifact has no SDF to mesh from).
-    if matches!(req.bake_mode, BakeMode::ProxyMesh) {
-        if let BakeInput::Procedural(instructions) = req.input {
-            let sn = surface_nets.get_or_insert_with(|| GpuSurfaceNets::new(device));
-            // Cell size matches the procedural's chosen voxel size,
-            // so proxy mesh detail tracks the existing voxel-size
-            // tier the user picks. Caps follow the spike's
-            // `O(N²) × const` rule.
-            let extent = (req.aabb.max - req.aabb.min).max_element();
-            let grid_n = ((extent / req.voxel_size).ceil() as u32).max(8);
-            let n2 = (grid_n as u64).pow(2);
-            let vertex_cap = (n2 * 16).min(u32::MAX as u64) as u32;
-            let index_cap = (n2 * 96).min(u32::MAX as u64) as u32;
-            let (mesh, _stats) = sn.extract(
-                device,
-                queue,
-                &instructions,
-                req.aabb.min,
-                req.aabb.max,
-                grid_n,
-                vertex_cap,
-                index_cap,
-                /* read_geometry = */ true,
-            );
-            let outcome = match mesh {
-                Some(m) => {
-                    let cluster = m.single_cluster();
-                    BakeOutcome::ProxyMeshOk {
-                        surface_mesh: m,
-                        cluster,
-                    }
+    // Procedural inputs always produce a triangle proxy mesh via
+    // GPU surface-nets-from-SDF. Artifact inputs (already-voxelized
+    // `.rkp` loads) take the voxelize/integrate path below.
+    if let BakeInput::Procedural(instructions) = req.input {
+        let sn = surface_nets.get_or_insert_with(|| GpuSurfaceNets::new(device));
+        // Cell size matches the procedural's chosen voxel size, so
+        // proxy mesh detail tracks the existing voxel-size tier the
+        // user picks. Caps follow the spike's `O(N²) × const` rule.
+        let extent = (req.aabb.max - req.aabb.min).max_element();
+        let grid_n = ((extent / req.voxel_size).ceil() as u32).max(8);
+        let n2 = (grid_n as u64).pow(2);
+        let vertex_cap = (n2 * 16).min(u32::MAX as u64) as u32;
+        let index_cap = (n2 * 96).min(u32::MAX as u64) as u32;
+        let (mesh, _stats) = sn.extract(
+            device,
+            queue,
+            &instructions,
+            req.aabb.min,
+            req.aabb.max,
+            grid_n,
+            vertex_cap,
+            index_cap,
+            /* read_geometry = */ true,
+        );
+        let outcome = match mesh {
+            Some(m) => {
+                let cluster = m.single_cluster();
+                BakeOutcome::ProxyMeshOk {
+                    surface_mesh: m,
+                    cluster,
                 }
-                None => BakeOutcome::Failed,
-            };
-            return BakeResult {
-                entity: req.entity,
-                generation: req.generation,
-                aabb: req.aabb,
-                voxel_size: req.voxel_size,
-                root_scale: req.root_scale,
-                outcome,
-                generator_child: req.generator_child,
-            };
-        }
+            }
+            None => BakeOutcome::Failed,
+        };
+        return BakeResult {
+            entity: req.entity,
+            generation: req.generation,
+            aabb: req.aabb,
+            voxel_size: req.voxel_size,
+            root_scale: req.root_scale,
+            outcome,
+            generator_child: req.generator_child,
+        };
     }
 
-    // Step 1: get an artifact, either by voxelizing a tree or by
-    // accepting one the caller already built.
+    // Artifact-input voxelize/integrate path — used by imported
+    // `.rkp` loads (which carry pre-voxelized data the file format
+    // ships with).
     let artifact = match req.input {
-        BakeInput::Procedural(instructions) => {
-            let sdf_fn = |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
-                evaluator
-                    .evaluate(device, queue, positions, &instructions)
-                    .into_iter()
-                    .map(|r| r.into_tuple())
-                    .collect()
-            };
-            rkp_core::voxelize_to_artifact(sdf_fn, &req.aabb, req.voxel_size)
-        }
+        BakeInput::Procedural(_) => unreachable!("handled above"),
         BakeInput::Artifact(a) => Some(a),
     };
     let t_after_voxelize = t_start.elapsed();

@@ -160,25 +160,11 @@ impl RenderGeometry {
     }
 }
 
-/// What the bake worker does with a procedural's tree. Determines
-/// whether the procedural ends up as voxels (default) or as a flat
-/// triangle proxy mesh that bypasses the voxel pool entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BakeMode {
-    /// Voxelize → integrate into the scene-global octree + brick
-    /// pools. Required for paint, sculpt, surface user-shaders, and
-    /// any future per-leaf operations.
-    Voxelize,
-    /// Run GPU surface-nets on the SDF → emit a flat triangle mesh
-    /// the renderer draws via the standard mesh raster path. No
-    /// voxels are allocated; paint / sculpt / surface user-shaders
-    /// are unsupported on these entities until they're converted.
-    ProxyMesh,
-}
-
-impl Default for BakeMode {
-    fn default() -> Self { BakeMode::Voxelize }
-}
+// Procedurals always bake to a triangle proxy mesh via GPU
+// surface-nets-from-SDF — voxelization of procedural objects was
+// retired alongside the splat-march path. Imported `.rkp` assets
+// still voxelize for sculpt/paint compatibility (that path lives
+// in `rkp-import` / `BakeInput::Artifact`, not here).
 
 /// Octree spatial data for a renderable entity. Not serialized — rebuilt on load.
 #[derive(Debug, Clone)]
@@ -405,11 +391,6 @@ pub struct ProceduralGeometry {
     /// indicator.
     #[serde(default, skip)]
     pub bake_in_flight: bool,
-    /// Whether the bake worker should voxelize this procedural or
-    /// emit a triangle proxy mesh. Persists across save/load — same
-    /// procedural always renders the same way.
-    #[serde(default)]
-    pub bake_mode: BakeMode,
 }
 
 impl Default for ProceduralGeometry {
@@ -447,7 +428,6 @@ impl ProceduralGeometry {
             last_evaluated_root_scale: glam::Vec3::ONE,
             bake_generation: 0,
             bake_in_flight: false,
-            bake_mode: BakeMode::Voxelize,
         }
     }
 }

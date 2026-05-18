@@ -293,12 +293,6 @@ impl EngineState {
             .ok()
             .and_then(|r| r.spatial.clone())
             .and_then(|g| g.into_octree());
-        let bake_mode = self
-            .world
-            .get::<&ProceduralGeometry>(entity)
-            .map(|pg| pg.bake_mode)
-            .unwrap_or_default();
-
         let (aabb, voxel_size) = procedural_voxel_params(&tree_clone, base_voxel_size);
         let instructions = rkp_procedural::flatten_tree(&tree_clone);
         let root_scale = tree_clone
@@ -321,7 +315,6 @@ impl EngineState {
             prev_spatial,
             cache_output_path,
             generator_child: None,
-            bake_mode,
         };
         if self.bake_worker.tx_request.send(req).is_err() {
             self.console.warn("bake worker channel closed".to_string());
