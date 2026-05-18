@@ -387,7 +387,7 @@ fn gpu_lookup_matches_coord_lookup() {
     let _voxel_count = r.voxel_count;
 
     let vs = tree.base_voxel_size();
-    let extent = tree.extent() as f32 * vs;
+    let _extent = tree.extent() as f32 * vs;
     let mut mismatches = 0u32;
     let mut total = 0u32;
 
@@ -402,7 +402,7 @@ fn gpu_lookup_matches_coord_lookup() {
             coord.z as f32 * vs + leaf_vs * 0.5,
         );
 
-        let (gpu_slot, gpu_depth) = gpu_style_lookup(&tree, pos);
+        let (gpu_slot, _gpu_depth) = gpu_style_lookup(&tree, pos);
         let (coord_node, _) = tree.lookup_with_depth(coord).unwrap();
         let coord_slot = if is_leaf(coord_node) { leaf_slot(coord_node) } else { coord_node };
 
@@ -442,7 +442,7 @@ fn gpu_lookup_matches_rkp_file() {
     let vs = header.base_voxel_size;
     let tree = SparseOctree::from_raw(&octree_nodes, depth, vs);
 
-    let voxel_data = crate::asset_file::read_rkp_voxels(&mut reader, &header).unwrap();
+    let _voxel_data = crate::asset_file::read_rkp_voxels(&mut reader, &header).unwrap();
 
     let extent = tree.extent() as f32 * vs;
     let mut mismatches = 0u32;

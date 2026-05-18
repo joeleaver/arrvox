@@ -1,5 +1,5 @@
 use super::*;
-use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::io::{Cursor, Seek, SeekFrom};
 
 
 #[test]

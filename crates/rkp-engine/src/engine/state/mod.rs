@@ -64,7 +64,7 @@ pub(crate) struct EntityPaintedCache {
 
 use crate::camera::CameraControlState;
 
-use super::{CameraState, EngineConfig, FrameCallback};
+use super::CameraState;
 
 /// A click-pick awaiting a G-buffer readback. The viewport tag
 /// determines interpretation: MAIN resolves to a scene entity; BUILD

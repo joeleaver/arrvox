@@ -1,7 +1,6 @@
 use super::*;
 use glam::{Quat, Vec3};
 use crate::rapier_world::PhysicsWorld;
-use rapier3d::prelude::*;
 
 
 #[test]

@@ -1926,32 +1926,32 @@ impl RkpRenderer {
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         viewport: &mut crate::viewport_renderer::ViewportRenderer,
-        object_count: u32,
-        shadow_steps: u32,
-        num_lights: u32,
-        lod_enabled: bool,
-        surfacenet_enabled: bool,
-        tile_offsets: &[u8],
-        tile_object_ids: &[u8],
-        tile_count_x: u32,
-        tlas_node_count: u32,
+        _object_count: u32,
+        _shadow_steps: u32,
+        _num_lights: u32,
+        _lod_enabled: bool,
+        _surfacenet_enabled: bool,
+        _tile_offsets: &[u8],
+        _tile_object_ids: &[u8],
+        _tile_count_x: u32,
+        _tlas_node_count: u32,
         // Phase B-redux Phase 3a — frame time + asset count. Threaded
         // through to march params for `instance_at` derivation.
-        time: f32,
-        asset_count: u32,
+        _time: f32,
+        _asset_count: u32,
         // Phase 8 — TLAS prim count (one per shadow caster). The
         // shadow-map setup pass walks `tlas_prims[0..prim_count]`;
         // `tlas_node_count` is the BVH node count, which is up to
         // `2*prim_count - 1` and not what the setup needs.
-        tlas_prim_count: u32,
+        _tlas_prim_count: u32,
         // Phase 8 — scene extent (max world dimension) used by the
         // setup pass to extrude per-prim AABBs along `light_dir`
         // for the shadow-frustum cull.
-        scene_extent: f32,
+        _scene_extent: f32,
         // Phase 8 — camera world→NDC matrix forwarded to the
         // shadow-map setup pass so it can shadow-frustum-cull
         // each prim against the visible region.
-        camera_view_proj: [[f32; 4]; 4],
+        _camera_view_proj: [[f32; 4]; 4],
         // Phase 8 — when true, dispatch the shadow-map chain
         // (clear → setup → scatter) after primary visibility.
         // Engine sets this when there's a live directional shadow

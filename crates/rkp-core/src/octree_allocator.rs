@@ -584,7 +584,7 @@ mod tests {
     }
 
     /// GPU-style position lookup on the packed (rebased) allocator buffer.
-    fn gpu_lookup_packed(buf: &[u32], root: u32, depth: u8, extent: f32, vs: f32, pos: glam::Vec3) -> u32 {
+    fn gpu_lookup_packed(buf: &[u32], root: u32, depth: u8, extent: f32, _vs: f32, pos: glam::Vec3) -> u32 {
         use crate::sparse_octree::{EMPTY_NODE, INTERIOR_NODE, is_leaf, leaf_slot};
         let mut offset = root as usize;
         let mut half = extent * 0.5;

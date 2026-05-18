@@ -50,7 +50,7 @@ impl EngineState {
         // a pending geometry bump. Cheap (just Instant::elapsed) and
         // only logs when relevant.
         let phase_pre_drain = std::time::Instant::now();
-        let (pre_bump, pre_submit) = {
+        let (_pre_bump, pre_submit) = {
             let sm = self.scene_mgr.lock().expect("scene_mgr poisoned");
             (sm.last_geometry_bump_ns(), sm.last_geometry_submit_ns())
         };
@@ -1561,7 +1561,7 @@ fn count_painted_halves(
     right: &mut u32,
 ) {
     use rkp_core::sparse_octree::{
-        is_brick, is_leaf, leaf_slot, brick_id, EMPTY_NODE, INTERIOR_NODE,
+        is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
     };
     use rkp_core::brick_pool::{BRICK_DIM, BRICK_CELLS, BRICK_INTERIOR};
     const BRICK_CELL_EMPTY: u32 = 0xFFFF_FFFFu32;

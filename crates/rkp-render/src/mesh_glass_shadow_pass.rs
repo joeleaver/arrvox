@@ -222,7 +222,7 @@ impl MeshGlassShadowPass {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn mesh_glass_shadow_shader_is_valid_wgsl() {

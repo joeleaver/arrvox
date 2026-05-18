@@ -1,6 +1,5 @@
 use super::*;
 use glam::{UVec3, Vec3};
-use rkp_core::brick_face_links::FACE_EMPTY;
 use rkp_core::brick_pool::{BrickPool, BRICK_DIM};
 use rkp_core::leaf_attr_pool::LeafAttrPool;
 use rkp_core::sparse_octree::SparseOctree;

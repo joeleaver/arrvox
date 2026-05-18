@@ -1,5 +1,5 @@
 use super::*;
-use glam::{IVec3, Vec3};
+use glam::IVec3;
 use rkp_core::sparse_octree::{INTERIOR_NODE, make_brick, make_leaf};
 use rkp_core::{BRICK_DIM, BRICK_INTERIOR, BrickPool};
 

@@ -304,7 +304,7 @@ fn run_bake(
     req: BakeRequest,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    evaluator: &mut GpuEvaluator,
+    _evaluator: &mut GpuEvaluator,
     surface_nets: &mut Option<GpuSurfaceNets>,
     scene_mgr: &Arc<Mutex<RkpSceneManager>>,
 ) -> BakeResult {

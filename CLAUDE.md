@@ -1,8 +1,8 @@
-# RKIPatch — Sparse Surface Voxel Graphics Engine
+# RKIPatch — Surface-Mesh Voxel Graphics Engine
 
 ## What This Is
 
-A real-time graphics engine where **every object is a sparse octree of surface voxels**. A leaf in the tree IS a point on the surface; the tree's existence defines the geometry. Each leaf carries a prefiltered surface normal (octahedrally packed) and material references — everything needed to shade it in a single 8-byte read.
+A real-time graphics engine where **every object is a sparse octree of surface voxels** that gets meshed (via per-cluster Karis-Nanite-style surface nets + DAG LOD) into triangles for rendering. A leaf in the tree IS a point on the surface; the tree's existence defines the geometry. Each leaf carries a prefiltered octahedrally-packed normal + material references — everything needed to shade it in a single 8-byte read.
 
 There is no per-voxel opacity field. Transparency is a per-material property. Surfaces are defined by leaf existence in the octree, not by an isosurface of a scalar field.
 
@@ -10,24 +10,31 @@ This is a sibling project to [RKIField](../rkifield/) (SDF engine). Both share c
 
 ## Origin and where we are now
 
-RKIPatch began as a splat-accumulation rendering experiment. Over time the design converged:
+RKIPatch began as a splat-accumulation rendering experiment. Over time the design converged through several pivots:
 
-- **Surface defined by sparse octree leaves.** The octree-build classifier uses the 1-Lipschitz property of a signed distance function (sampled from the primitive / mesh) to decide Empty / Interior / Mixed at each octree level. No opacity values are stored per voxel; leaf existence IS the occupancy bit.
-- **Prefiltered per-leaf normals.** The SDF gradient at each voxel center is computed once during voxelization, octahedrally packed (2× snorm16 in a u32, <0.05° worst-case roundtrip error), and stored in `LeafAttr`. The shader reads one 8-byte `LeafAttr` per hit to get both normal and material — no gradient reconstruction at shade time, no voxel_pool indirection.
-- **Surface-finding march.** Compute ray marcher descends the octree per pixel, finds the first leaf, reads its `LeafAttr`, writes G-buffer. One read per hit for material + normal.
-- **Deferred rendering.** March writes G-buffer (position, normal, material). Shading is a separate pass reusing rkf-render's PBR stack, shadows, GI, volumetrics.
-- **Dual-material blending.** `LeafAttr` carries primary material (u16), secondary material (u12), and blend weight (u4) — per-leaf material variation without per-voxel opacity.
-- **Procedural primitives are SDFs.** Sphere/box/capsule/etc. evaluate to signed distance directly; combinators (union/intersect/subtract) use standard SDF algebra (min/max).
+1. **Splat-accumulation rendering** — original framing, retired.
+2. **Per-pixel opacity-field surface march** — compute marcher descended the octree per pixel. Worked, but fragment-bound on dense scenes.
+3. **Splat-rasterizer prototype** — proved 3.9× faster than the marcher on single assets but slower on real scenes. Never shipped past A/B.
+4. **Surface-mesh primary visibility (current)** — assets bake to triangle meshes with cluster-DAG LOD; the renderer rasterizes triangles. Mesh runs at ~4.5 ms vs. march's ~6 ms in dense scenes, with full feature parity (glass, paint, sculpt, CSM shadows, user-shaders).
 
-The project name still says "patch" from the original splat framing; the rendering approach is closer to classical sparse-voxel ray marching with prefiltered surface attributes.
+The project name still says "patch" from the original splat framing; the architecture is now a sparse octree of prefiltered surface voxels → meshed via surface-nets → cluster-DAG LOD → forward triangle rasterization.
+
+### Key invariants of the current architecture
+
+- **Surface defined by sparse octree leaves.** The octree-build classifier uses the 1-Lipschitz property of a signed distance function (sampled from the primitive / mesh) to decide Empty / Interior / Mixed at each octree level.
+- **Prefiltered per-leaf normals.** The SDF gradient at each voxel center is computed once during voxelization, octahedrally packed (2× snorm16 in a u32, <0.05° worst-case roundtrip error), and stored in `LeafAttr`.
+- **Surface-mesh raster.** Imported `.rkp` assets ship with pre-baked triangle meshes + meshlet clusters + DAG groups (v5/v6 file format). The mesh raster pass writes only the visibility-buffer triplet (position, pick, leaf_slot); a compute resolve pass fills in normal/material/glass per pixel via the octree → leaf_attr indirection. Mesh raster + glass + shadow all skin in VS against per-frame bone palettes.
+- **Procedural objects → proxy mesh.** Procedural primitives flatten to an SDF opcode stream and bake to a triangle proxy mesh via GPU surface-nets-from-SDF. No voxelization for procedurals.
+- **Deferred rendering.** Mesh raster + resolve → G-buffer. Shading is a separate pass with full PBR + CSM shadows + atmosphere + volumetrics + post-process.
+- **Dual-material blending.** `LeafAttr` carries primary material (u16), secondary material (u16), and blend weight — per-leaf material variation.
 
 ## Architecture Goals
 
-1. **Deferred rendering pipeline** — splat march writes G-buffer (position, gradient normal, material ID, motion vectors). Shading pass reuses rkf-render's PBR stack, shadows, GI, volumetrics — all for free.
+1. **Deferred mesh rendering** — surface-mesh raster writes G-buffer; resolve compute fills the rest. Shading reuses rkf-render's full PBR stack.
 2. **Per-voxel color** — mesh textures baked into per-voxel RGB during import. Stored in companion color pool (same infrastructure as RKIField).
-3. **Gradient-derived normals** — surface normals computed from the opacity field gradient during the march pass, written to G-buffer. Conventional `dot(normal, light_dir)` lighting via rkf-render's shading pass.
-4. **New .rkp file format** — splat-native storage: opacity per voxel, per-voxel color, multi-LOD, LZ4 compressed.
-5. **Mesh import pipeline** — .glb/.gltf/.obj/.fbx → BVH → SDF function → splat voxelization with opacity baking + texture color sampling.
+3. **Prefiltered octahedral normals** — surface normals come from `LeafAttr.normal_oct`, computed once at voxelization and read at shade time. No gradient reconstruction in the hot path.
+4. **`.rkp` file format** — LZ4-compressed sparse octree + brick pool + per-voxel color + bone weights + baked mesh + meshlet clusters + DAG groups (v6).
+5. **Mesh import pipeline** — .glb/.gltf/.obj/.fbx → BVH → SDF function → octree voxelization → surface-nets meshing → cluster-DAG bake.
 6. **Shared infrastructure** — reuse RKIField's editor UI (rinch), ECS (hecs), MCP server, physics (Rapier), animation, asset streaming, material palette system.
 
 ## Tech Stack
@@ -36,14 +43,14 @@ The project name still says "patch" from the original splat framing; the renderi
 |-----------|--------|-------|
 | Language | **Rust** | Entire codebase |
 | GPU API | **wgpu** | WebGPU via wgpu crate |
-| Shaders | **WGSL** | Compute-only (forward splat + post-process) |
+| Shaders | **WGSL/WESL** | Forward triangle raster + compute resolve + post-process |
 | Windowing | **winit** | |
 | Math | **glam** | f32 vectors, quaternions, matrices |
 | ECS | **hecs** | From RKIField (shared crate) |
 | Physics | **Rapier** | From RKIField (shared crate) |
 | Editor UI | **rinch** | From RKIField (shared crate) |
-| Mesh Import | **rkp-import** | Own crate (`crates/rkp-import`), opacity-octree-native |
-| Compression | **lz4_flex** | Brick data in .rkp files |
+| Mesh Import | **rkp-import** | Own crate (`crates/rkp-import`) |
+| Compression | **lz4_flex** | Section data in .rkp files |
 
 ## Shared Crates (from RKIField)
 
@@ -61,12 +68,13 @@ These live in `../rkifield/crates/` and are referenced as path dependencies:
 ```
 rkipatch/
   crates/
-    rkp-core/        — SplatVoxel wrapper over VoxelSample, opacity accessors, splat brick format
-    rkp-render/      — Splat march pass (opacity field → G-buffer), pipeline orchestration using rkf-render
+    rkp-core/        — sparse octree, brick pool, LeafAttr, mesh extract, asset_file (.rkp v6)
+    rkp-render/      — surface-mesh raster + resolve + shading + post-process pipeline
     rkp-import/      — Mesh → .rkp import pipeline: mesh loaders (glTF/OBJ/FBX),
-                       triangle BVH + winding number, opacity-octree voxelization,
-                       skeleton extraction + .rkskel sidecar, structured progress events
-                       (ProgressReporter / ImportEvent). Replaces the old rkf-import dep.
+                       triangle BVH + winding number, octree voxelization,
+                       surface-nets meshing + cluster-DAG bake,
+                       skeleton extraction + .rkskel sidecar,
+                       structured progress events (ProgressReporter / ImportEvent).
     rkp-convert/     — Thin CLI over rkp-import for headless / CI asset bakes
     rkp-runtime/     — Frame scheduling, ECS glue, streaming
     rkp-editor/      — Editor binary (reuses rinch UI from rkifield)
@@ -77,15 +85,19 @@ rkipatch/
 ## Key Data Types
 
 ```rust
-// SplatVoxel — zero-cost wrapper over rkf-core's VoxelSample (8 bytes)
-// Reinterprets the SDF distance field as opacity.
+// LeafAttr — 8 bytes per surface voxel.
+// word0: octahedrally-packed normal (u32; 2× snorm16, <0.05° error)
+// word1: primary material_id u16 (bits 0-15) | secondary material_id u12 + blend_weight u4 (bits 16-31)
 //
-// word0: f16 opacity (bits 0-15) | blend_weight u8 (bits 16-23) | reserved (bits 24-31)
-// word1: primary material_id u16 (bits 0-15) | secondary material_id u16 (bits 16-31)
-//
-// Provides .opacity()/.set_opacity() accessors.
-// From<VoxelSample> / Into<VoxelSample> for zero-cost conversion.
-// Normals derived from gradient of trilinearly-interpolated opacity field at shade time.
+// Stored in the global `leaf_attr_pool` storage buffer; each octree
+// leaf carries an index. Mesh raster reads it once per pixel during
+// the resolve compute pass.
+
+// MeshVertex — 32 bytes. Object-local position, packed normal,
+// leaf_attr_id, bone weights/indices (for skinned assets).
+
+// MeshletCluster — 64 bytes. Per-cluster index range, error metrics
+// for Karis-Nanite admit, parent group reference for the DAG.
 
 // Per-voxel color: stored in companion ColorBrick pool (same as RKIField)
 // ColorVoxel { packed: u32 } — R|G|B|intensity, 4 bytes
@@ -94,55 +106,49 @@ rkipatch/
 // 16-bit material IDs, dual-material blending per voxel, .rkmat files.
 ```
 
-## Render Pipeline (deferred, maximizing rkf-render reuse)
+## Render Pipeline
 
-Pure splat pipeline — no mixed SDF/splat scenes. Deferred shading reuses rkf-render's
-full PBR stack.
+Triangle mesh primary visibility, deferred shading. The build viewport
+can swap the primary pass for a live procedural SDF raymarcher
+(`BuildPreviewMode::Raymarch`) to preview unbaked edits.
 
 ```
-1. Update transforms → flatten scene hierarchy → upload GpuObject metadata  [reuse rkf-render]
-2. BVH refit → upload GPU BVH nodes                                        [reuse rkf-render]
-3. Tile-based object culling → per-tile object lists                        [reuse rkf-render]
-4. Splat March → per-pixel: find surface in trilinear opacity field,        [NEW — replaces ray_march]
-                 compute gradient normal (6-tap), write G-buffer
-                 (position, normal, material, motion vectors)
-5. Shadow / AO pass                                                         [adapt from rkf-render]
-6. GI — radiance injection + mip                                            [adapt from rkf-render]
-7. Deferred shading — PBR, reads G-buffer + shadows + GI                    [reuse rkf-render]
-8. Volumetrics (fog, god rays, clouds)                                      [reuse rkf-render]
-9. Post-process (bloom, tone map, DoF, motion blur, color grade)            [reuse rkf-render]
-10. TAA / temporal upscale                                                  [reuse rkf-render]
-11. Present                                                                 [reuse rkf-render]
+1. Update transforms → flatten scene hierarchy → upload GpuObject metadata
+2. BVH refit → upload GPU BVH nodes
+3. Atmosphere LUTs (transmittance / multi-scatter / sky-view / aerial perspective)
+4. Mesh LOD select compute — Karis-Nanite admit per cluster → DrawIndexedIndirectArgs
+5. Mesh raster (or proc_raymarch in build-viewport preview mode)
+   → G-buffer (position, pick, leaf_slot)
+6. Mesh resolve compute → fills normal, material, glass from leaf_attr_pool
+7. Proxy-mesh raster (procedural triangle meshes from surface-nets-from-SDF)
+8. User-shader mesh raster (V1 grass/blade/instance shaders)
+9. Mesh glass front/back raster + combine compute → gbuf_glass
+10. Mesh shadow map render + blit compute → shadow_buffer (CSM, 4 cascades)
+11. SSAO
+12. Brush-state probe (paint cursor)
+13. Deferred PBR shade (reads G-buffer + shadow_buffer + SSAO + atmosphere LUTs)
+14. Volumetrics (fog, god rays, clouds)
+15. Glass composite (Fresnel + Beer + screen-space refraction)
+16. God rays
+17. Bloom + bloom composite
+18. Tone map
+19. Wireframe / grid overlays
+20. Present
 ```
-
-The only new pass is step 4 — the splat march that replaces rkf-render's `ray_march.rs`.
-Everything downstream (shading, shadows, GI, post-process) reuses rkf-render code
-directly, since the G-buffer format is compatible.
-
-## POC Reference
-
-The proof-of-concept code is at `../rkipatch-poc-reference/`. Note: the POC used L1 SH
-coefficients which have been dropped in favor of gradient-derived normals. The POC is
-useful as reference for the march structure and compositing, not the data format.
-
-- `splat.rs` — (historical) SH coefficient computation, snorm10 packing — superseded by gradient normals
-- `voxelize_splat.rs` — SDF→splat voxelization — opacity baking logic still relevant
-- `shaders/splat_march.wgsl` — surface-finding march structure still relevant, SH eval replaced by gradient normal
-- `shaders/splat_composite.wgsl` — alpha compositing over deferred background — still relevant
 
 ## Critical Rules
 
-1. **No SDF ray marching for splat objects.** Splats use surface-finding through the opacity field, not iterative sphere tracing.
-2. **Deferred rendering.** Splat march writes G-buffer (position, gradient normal, material, motion vectors). Shading is a separate pass reusing rkf-render's PBR stack.
-3. **Gradient-derived normals.** No stored normals or SH coefficients. Surface normals come from the gradient of the trilinearly-interpolated opacity field (6-tap central differences), computed during the march and written to G-buffer.
-4. **Trilinear interpolation of the opacity field.** Never nearest-neighbor — creates grid artifacts. The trilinear field IS the smooth representation.
-5. **G-buffer compatible with rkf-render.** Same format so all downstream passes (shading, shadows, GI, post-process) work unchanged.
-6. **SplatVoxel wraps VoxelSample.** Zero-cost wrapper — same 8-byte format, same brick pools. Opacity reinterprets the distance field. Materials use rkf-core's palette system unchanged.
-7. **WorldPosition everywhere.** Same as RKIField — never raw Vec3 for world-space positions.
-7. **Test-driven development.** Write tests first, same as RKIField.
-8. **MCP-native.** Every feature ships with MCP tools. If MCP is broken, fix it first.
-9. **Ask questions, don't assume.** Same as RKIField — stop and ask when requirements are ambiguous.
-10. **We value correctness over speed of implementation.** In any choice between the "simple way" and the "correct way", the correct way always wins. We don't take shortcuts. We don't defer dificult implementations.
+1. **Mesh is the only render path.** No per-pixel ray-marching primary visibility, no splat raster, no `RKP_PRIMARY` env var.
+2. **Deferred rendering.** Mesh raster writes a visibility buffer; resolve compute fills the rest; shade reads the unified G-buffer.
+3. **Prefiltered octahedral normals.** No gradient reconstruction at shade time. The normal is in `LeafAttr.normal_oct`.
+4. **`.rkp` v6 ships baked mesh + clusters + DAG.** Loading is a deserialize + relocate, not a re-extract. v5 files fall back to extract + DAG-build at load time.
+5. **Procedurals bake to proxy mesh.** No voxelization of procedural objects — `BakeMode` is gone. If you need paintable/sculptable geometry, import a `.rkp`.
+6. **G-buffer compatible with rkf-render.** Same format so all downstream passes (shading, shadows, post-process) work unchanged.
+7. **WorldPosition everywhere.** Never raw Vec3 for world-space positions.
+8. **Test-driven development.** Write tests first.
+9. **MCP-native.** Every feature ships with MCP tools. If MCP is broken, fix it first.
+10. **Ask questions, don't assume.** Stop and ask when requirements are ambiguous.
+11. **We value correctness over speed of implementation.** In any choice between the "simple way" and the "correct way", the correct way always wins. We don't take shortcuts. We don't defer difficult implementations.
 
 ## Build Commands
 

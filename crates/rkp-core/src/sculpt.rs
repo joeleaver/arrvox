@@ -2657,7 +2657,7 @@ mod tests {
         // Strength = 0 → max_k = 0 → kernel returns empty delta
         // without doing any brushfire work. Verifies the early bail.
         let mut t = SparseOctree::new(4, 1.0);
-        let mut pool = fresh_pool();
+        let pool = fresh_pool();
         for y in 0..16 { for x in 0..16 { t.insert(UVec3::new(x, y, 0), 0); } }
         let op = BrushOp {
             center: Vec3::new(8.0, 8.0, 1.0),
@@ -2682,7 +2682,7 @@ mod tests {
         // gets ~strength voxels of new material and rim columns get
         // 0-1 voxels.
         let mut t = SparseOctree::new(5, 1.0);
-        let mut pool = fresh_pool();
+        let pool = fresh_pool();
         let mut slot = 0u32;
         for y in 0..32 {
             for x in 0..32 {
@@ -2736,7 +2736,7 @@ mod tests {
         // floating Add would mean the kernel grew material across a
         // void, which would produce a disconnected ghost shell.
         let mut t = SparseOctree::new(5, 1.0);
-        let mut pool = fresh_pool();
+        let pool = fresh_pool();
         let mut slot = 0u32;
         for y in 0..32 {
             for x in 0..32 {
@@ -2790,7 +2790,7 @@ mod tests {
     #[test]
     fn deflate_zero_strength_is_noop() {
         let mut t = SparseOctree::new(4, 1.0);
-        let mut pool = fresh_pool();
+        let pool = fresh_pool();
         for z in 0..16 { for y in 0..16 { for x in 0..16 {
             t.insert_interior(UVec3::new(x, y, z));
         }}}
@@ -2815,7 +2815,7 @@ mod tests {
         // brushfire downward into the bulk). Falloff curve makes the
         // pit deepest at center and shallowest at rim.
         let mut t = SparseOctree::new(4, 1.0);
-        let mut pool = fresh_pool();
+        let pool = fresh_pool();
         for z in 0..16 { for y in 0..16 { for x in 0..16 {
             t.insert_interior(UVec3::new(x, y, z));
         }}}

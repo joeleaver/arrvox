@@ -50,7 +50,7 @@ fn paint_writes_to_overlay_not_pool() {
     let pool_baseline = sm.leaf_attr_pool.as_slice().to_vec();
 
     let mut overlay_a = LeafAttrOverlay::new();
-    let mut overlay_b = LeafAttrOverlay::new();
+    let overlay_b = LeafAttrOverlay::new();
     let written = sm.apply_paint_sphere(
         &asset_info,
         Affine3A::IDENTITY,

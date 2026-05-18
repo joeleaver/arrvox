@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use glam::{IVec3, Vec3};
+use glam::Vec3;
 use rapier3d::prelude::*;
 use rkp_physics::rapier_world::{PhysicsConfig, PhysicsWorld, to_rapier_vec3, from_rapier_vec3, from_rapier_quat};
 use rkp_physics::rigid_body::BodyType;

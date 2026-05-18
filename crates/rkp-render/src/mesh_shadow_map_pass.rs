@@ -23,7 +23,6 @@
 //!  · render `g1` — per-instance uniform (SHARED with `SplatPass.g1_layout`).
 //!  · blit `g0` — depth texture (read) + shadow_buffer (write).
 
-use crate::shadow_map_pass::types::SHADOW_MAP_DEFAULT_SIZE;
 
 use rkp_core::mesh_extract::MeshVertex;
 
