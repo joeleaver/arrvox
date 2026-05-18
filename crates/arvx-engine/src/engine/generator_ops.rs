@@ -335,6 +335,11 @@ impl EngineState {
         self.scene_dirty.mark_entity(entity);
         if verbose {
             self.console.info(format!("Spawned generator '{name}'"));
+            // User-committed spawn — auto-select. verbose=false is the
+            // drag-preview ghost (no entity yet for generators; see
+            // DragPreviewCommit) so this branch only fires on real
+            // user creations.
+            self.selected_entity = Some(entity);
         }
         Some(entity)
     }
@@ -412,6 +417,8 @@ impl EngineState {
                 "Spawned preset '{}' ({}) with {} override(s)",
                 display_name, cfg.generator, cfg.params.len(),
             ));
+            // User-committed spawn — auto-select.
+            self.selected_entity = Some(entity);
         }
         Some(entity)
     }

@@ -147,6 +147,7 @@ impl EngineState {
                 ));
                 self.assign_entity_uuid(entity);
                 self.scene_dirty.mark_entity(entity);
+                self.selected_entity = Some(entity);
                 self.console.info(format!("Spawned procedural '{name}' (baking…)"));
             }
 

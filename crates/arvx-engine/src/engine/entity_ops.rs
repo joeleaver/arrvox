@@ -109,6 +109,13 @@ impl EngineState {
                 self.gpu_objects_dirty.mark_all();
                 if verbose {
                     self.console.info(format!("Loaded '{name}': {} voxels", info.voxel_count));
+                    // User-committed spawn — auto-select so the
+                    // Properties / Inspector panel reflects the new
+                    // object without an extra click. The verbose=false
+                    // path (drag-preview ghost) deliberately skips this
+                    // to avoid the selection flicker; the drop site in
+                    // DragPreviewCommit selects the final entity there.
+                    self.selected_entity = Some(entity);
                 }
                 Some((entity, info.aabb.min.y))
             }

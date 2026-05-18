@@ -146,6 +146,7 @@ impl EngineState {
                 ));
                 self.assign_entity_uuid(new_entity);
                 self.scene_dirty.mark_entity(new_entity);
+                self.selected_entity = Some(new_entity);
 
                 // Enqueue a ProceduralVoxelize bake on the new entity.
                 // Worker writes the artifact to `target` (including
@@ -189,6 +190,7 @@ impl EngineState {
                 ));
                 self.assign_entity_uuid(entity);
                 self.scene_dirty.mark_entity(entity);
+                self.selected_entity = Some(entity);
                 self.console.info(format!("Spawned '{name}'"));
             }
 
@@ -204,6 +206,7 @@ impl EngineState {
                 ));
                 self.assign_entity_uuid(entity);
                 self.scene_dirty.mark_entity(entity);
+                self.selected_entity = Some(entity);
                 self.console.info(format!("Spawned '{name}'"));
             }
 
@@ -219,6 +222,7 @@ impl EngineState {
                 ));
                 self.assign_entity_uuid(entity);
                 self.scene_dirty.mark_entity(entity);
+                self.selected_entity = Some(entity);
                 self.console.info(format!("Spawned '{name}'"));
             }
 
@@ -350,7 +354,12 @@ impl EngineState {
                         // Models: entity is already live at the final
                         // position. Just retire the preview state —
                         // subsequent pick results won't touch it.
-                        DragPreviewKind::Model { .. } => {}
+                        // Select on commit (the preview spawn used
+                        // verbose=false and deliberately skipped the
+                        // selection, so it lands here at drop).
+                        DragPreviewKind::Model { entity, .. } => {
+                            self.selected_entity = Some(entity);
+                        }
                         // Generators: now spawn the real source at the
                         // last-known surface position. Falls back to a
                         // ground-plane cast at the final cursor pixel

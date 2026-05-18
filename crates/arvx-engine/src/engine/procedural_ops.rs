@@ -593,13 +593,43 @@ impl EngineState {
             return;
         }
 
-        // Update last_evaluated_root_scale so the preview-multiplier
-        // path zeroes back out (procedural now matches the latest
-        // scale).
+        // Recompute `Transform.scale` as `current_root / baked_root`
+        // so the visual size stays equal to the user's latest intent
+        // across the integrate:
+        //     visual = Transform.scale × baked_mesh_world_scale
+        //            = (current_root / baked_root) × baked_root
+        //            = current_root
+        // If no mid-bake edit happened, current_root == baked_root
+        // and `Transform.scale` collapses to 1 — without this reset,
+        // `Transform.scale` would stay at the preview multiplier set
+        // by `redirect_transform_scale_to_root` and double-multiply
+        // the freshly-baked mesh (grow → ends up larger than the
+        // preview was, shrink → ends up smaller). Mirrors
+        // `apply_bake_result` for the octree-voxelize path.
+        let current_root_scale = self
+            .world
+            .get::<&ProceduralGeometry>(entity)
+            .ok()
+            .and_then(|pg| {
+                pg.tree
+                    .get(pg.tree.root())
+                    .map(|n| n.transform.to_scale_rotation_translation().0)
+            })
+            .unwrap_or(baked_root_scale);
+        let safe = |a: f32, b: f32| if b.abs() > 1e-6 { a / b } else { 1.0 };
+        let new_transform_scale = glam::Vec3::new(
+            safe(current_root_scale.x, baked_root_scale.x),
+            safe(current_root_scale.y, baked_root_scale.y),
+            safe(current_root_scale.z, baked_root_scale.z),
+        );
+
         if let Ok(mut proc_geo) = self.world.get::<&mut ProceduralGeometry>(entity) {
             proc_geo.dirty = false;
             proc_geo.pending_bake = false;
             proc_geo.last_evaluated_root_scale = baked_root_scale;
+        }
+        if let Ok(mut t) = self.world.get::<&mut Transform>(entity) {
+            t.scale = new_transform_scale;
         }
 
         // PERF_DEBT B2+C3: this entity's geometry handle changed

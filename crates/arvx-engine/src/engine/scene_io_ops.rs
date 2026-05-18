@@ -132,6 +132,27 @@ impl EngineState {
                         }));
                         self.geometry_dirty.mark_all();
                         Some(e)
+                    } else if obj.primitive.as_deref() == Some("procedural") {
+                        // Procedural without an on-disk bake cache.
+                        // The proxy-mesh bake path (the only bake
+                        // procedurals take today) doesn't persist its
+                        // output to .arvx — the cache branch above only
+                        // fires for generator children — so this is the
+                        // common case for any saved procedural. Spawn
+                        // an empty entity here; the third pass attaches
+                        // ProceduralGeometry from `obj.components`, and
+                        // the fifth pass marks it `pending_bake` so the
+                        // proxy mesh regenerates on the next tick.
+                        let e = self.world.spawn((transform, meta, Renderable {
+                            primitive: Some("procedural".to_string()),
+                            material_id: obj.material_id,
+                            voxel_count: 0,
+                            spatial: None,
+                            asset_handle: None,
+                            material_overrides: obj.material_overrides.clone(),
+                            ..Default::default()
+                        }));
+                        Some(e)
                     } else if let Some(ref prim_name) = obj.primitive {
                         let primitive = match prim_name.as_str() {
                             "box" => arvx_core::scene_node::SdfPrimitive::Box {
@@ -296,16 +317,15 @@ impl EngineState {
                 // to `false` on entities whose Renderable has a spatial
                 // — otherwise the properties panel would mislead the
                 // user into thinking a freshly-restored procedural
-                // needed rebaking. Entities without a loaded spatial
-                // stay dirty so the UI's unbaked chip is accurate.
-                let proc_entities: Vec<hecs::Entity> = self
+                // needed rebaking.
+                let proc_entities_with_spatial: Vec<hecs::Entity> = self
                     .world
                     .query::<(&ProceduralGeometry, &Renderable)>()
                     .iter()
                     .filter(|(_, (_, r))| r.spatial.is_some())
                     .map(|(e, _)| e)
                     .collect();
-                for entity in proc_entities {
+                for entity in proc_entities_with_spatial {
                     if let Ok(mut pg) = self.world.get::<&mut ProceduralGeometry>(entity) {
                         pg.dirty = false;
                         // Seed `last_evaluated_root_scale` from the
@@ -317,6 +337,36 @@ impl EngineState {
                             let (s, _, _) = root.transform.to_scale_rotation_translation();
                             pg.last_evaluated_root_scale = s;
                         }
+                    }
+                }
+
+                // Procedurals without a loaded spatial — the common
+                // case, since the proxy-mesh bake path doesn't write
+                // cache files. Schedule them for an auto-bake on the
+                // next tick (same flags `SpawnProceduralObject` uses).
+                // Without this they'd render invisible until the user
+                // manually nudges a parameter or hits Bake.
+                let proc_entities_without_spatial: Vec<hecs::Entity> = self
+                    .world
+                    .query::<(&ProceduralGeometry, &Renderable)>()
+                    .iter()
+                    .filter(|(_, (_, r))| r.spatial.is_none())
+                    .map(|(e, _)| e)
+                    .collect();
+                let now = std::time::Instant::now();
+                for entity in proc_entities_without_spatial {
+                    if let Ok(mut pg) = self.world.get::<&mut ProceduralGeometry>(entity) {
+                        // Seed `last_evaluated_root_scale` too — needed
+                        // before the first interaction even if no
+                        // spatial is loaded yet.
+                        let root_id = pg.tree.root();
+                        if let Some(root) = pg.tree.get(root_id) {
+                            let (s, _, _) = root.transform.to_scale_rotation_translation();
+                            pg.last_evaluated_root_scale = s;
+                        }
+                        pg.dirty = false;
+                        pg.pending_bake = true;
+                        pg.bake_dirty_at = Some(now);
                     }
                 }
 
