@@ -6,7 +6,6 @@
 
 use crate::command::EngineCommand;
 
-use super::model_scan::spatial_from_handle;
 use super::procedural_params::{apply_procedural_param, parse_node_kind};
 use super::state::EngineState;
 
@@ -421,20 +420,6 @@ impl EngineState {
                     );
                     return Ok(());
                 };
-                let Some(cache_path) = self.procedural_cache_path(entity) else {
-                    self.console.warn(
-                        "Convert: save the scene first — the bake cache is keyed off the scene path.".to_string(),
-                    );
-                    return Ok(());
-                };
-                if !cache_path.exists() {
-                    self.console.warn(format!(
-                        "Convert: bake cache '{}' missing — re-bake first.",
-                        cache_path.display(),
-                    ));
-                    return Ok(());
-                }
-
                 let name = self
                     .world
                     .get::<&EditorMetadata>(entity)
@@ -480,78 +465,70 @@ impl EngineState {
                     suffix += 1;
                 }
 
-                if let Err(e) = std::fs::copy(&cache_path, &target) {
-                    self.console.error(format!(
-                        "Convert: failed to write asset '{}': {e}",
-                        target.display(),
-                    ));
+                // Enqueue an async voxelize bake that writes the
+                // resulting artifact to `target` on the worker thread
+                // (via `cache_output_path`). The drain handler reads
+                // `pending_conversions[entity]` on completion, acquires
+                // the new .arvx as a regular asset, swaps the entity's
+                // Renderable from the scene-pool spatial to the asset-
+                // cache spatial, and removes `ProceduralGeometry`.
+                let (tree_clone, base_voxel_size, root_scale) = {
+                    let proc_geo = match self.world.get::<&ProceduralGeometry>(entity) {
+                        Ok(pg) => pg,
+                        Err(_) => return Ok(()),
+                    };
+                    let root_scale = proc_geo
+                        .tree
+                        .get(proc_geo.tree.root())
+                        .map(|n| n.transform.to_scale_rotation_translation().0)
+                        .unwrap_or(glam::Vec3::ONE);
+                    (proc_geo.tree.clone(), proc_geo.voxel_size, root_scale)
+                };
+                let generation = if let Ok(mut pg) =
+                    self.world.get::<&mut ProceduralGeometry>(entity)
+                {
+                    pg.bake_generation = pg.bake_generation.wrapping_add(1);
+                    pg.dirty = false;
+                    pg.pending_bake = false;
+                    pg.bake_dirty_at = None;
+                    pg.bake_in_flight = true;
+                    pg.bake_generation
+                } else {
+                    return Ok(());
+                };
+                let prev_spatial = self
+                    .world
+                    .get::<&Renderable>(entity)
+                    .ok()
+                    .and_then(|r| r.spatial.clone())
+                    .and_then(|g| g.into_octree());
+                let (aabb, voxel_size) = super::procedural_ops::procedural_voxel_params(
+                    &tree_clone,
+                    base_voxel_size,
+                );
+                let instructions = arvx_procedural::flatten_tree(&tree_clone);
+                let req = crate::bake_worker::BakeRequest {
+                    entity,
+                    generation,
+                    input: crate::bake_worker::BakeInput::ProceduralVoxelize(instructions),
+                    aabb,
+                    voxel_size,
+                    root_scale,
+                    prev_spatial,
+                    cache_output_path: Some(target.clone()),
+                    generator_child: None,
+                };
+                if self.bake_worker.tx_request.send(req).is_err() {
+                    self.console.warn("Convert: bake worker channel closed".to_string());
+                    if let Ok(mut pg) = self.world.get::<&mut ProceduralGeometry>(entity) {
+                        pg.bake_in_flight = false;
+                    }
                     return Ok(());
                 }
-
-                // Acquire the new file as a regular asset. This
-                // gives us a fresh OctreeHandle living in the asset
-                // cache; the procedural's previous scene-pool
-                // allocation still exists and is now orphaned (a
-                // small bounded leak — bake_worker would have
-                // re-used it on the next bake, but there isn't
-                // going to be a next bake). We accept the leak
-                // rather than risk freeing a slot the renderer or
-                // a stale snapshot is mid-read of.
-                let acquired = self
-                    .scene_mgr
-                    .lock()
-                    .unwrap()
-                    .acquire_asset(&target.to_string_lossy());
-                let (handle, info) = match acquired {
-                    Ok(t) => t,
-                    Err(e) => {
-                        self.console.error(format!(
-                            "Convert: failed to load new asset '{}': {e}",
-                            target.display(),
-                        ));
-                        return Ok(());
-                    }
-                };
-                let new_spatial = spatial_from_handle(
-                    &info.spatial,
-                    info.voxel_size,
-                    &info.aabb,
-                    info.grid_origin,
-                    info.leaf_attr_slot_start,
-                    info.leaf_attr_slot_count,
-                    Vec::new(),
-                );
-                // Path stored in the scene file is relative to the
-                // project's assets/ directory — same convention as
-                // imported meshes. e.g. "converted/sphere_1.arvx".
-                let rel_path = target
-                    .strip_prefix(project_dir.join("assets"))
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| target.to_string_lossy().to_string());
-
-                if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
-                    renderable.primitive = None;
-                    renderable.spatial = Some(crate::components::RenderGeometry::Octree(new_spatial));
-                    renderable.asset_handle = Some(handle);
-                    renderable.asset_path = Some(rel_path.clone());
-                    renderable.voxel_count = info.voxel_count;
-                }
-                let _ = self.world.remove_one::<ProceduralGeometry>(entity);
-                if self.selected_entity == Some(entity) {
-                    self.selected_procedural_node = None;
-                }
-                // Convert mutates the same entity in place — Renderable
-                // swapped from ProceduralGeometry to an Octree-backed
-                // asset. The other entities in the scene are unchanged.
-                self.scene_dirty.mark_entity(entity);
-                self.geometry_dirty.mark_all();
-                self.gpu_objects_dirty.mark_all();
-                // Surface the new asset in the Models panel right
-                // away so it can be re-spawned later.
-                self.scan_models();
+                self.pending_conversions.insert(entity, target.clone());
                 self.console.info(format!(
-                    "Converted '{name}' to voxel asset → assets/{rel_path} ({} voxels).",
-                    info.voxel_count,
+                    "Converting '{name}' to voxel asset → assets/converted/{} (voxelizing…)",
+                    target.file_name().and_then(|s| s.to_str()).unwrap_or(""),
                 ));
             }
             EngineCommand::Paint { position, normal, radius, color, strength, mode } => {

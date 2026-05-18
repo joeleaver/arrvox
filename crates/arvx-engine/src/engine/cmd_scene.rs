@@ -82,10 +82,58 @@ impl EngineState {
                     )
                 };
 
+                // Copy must produce an asset-backed voxel object —
+                // the mesh-raster renderer needs the triangle mesh
+                // sections that `write_artifact_rkp` extracts when it
+                // writes a `.arvx` file. A bare `integrate_artifact`
+                // leaves the octree in scene pools without any mesh
+                // data, so the entity would render invisible. Same
+                // async write-then-acquire flow as Convert (just
+                // different post-bake handling — new entity, not
+                // replace-in-place).
+                let Some(project_dir) = self.project_dir.clone() else {
+                    self.console.warn(
+                        "Copy: open or save a project first so the copy has somewhere to live."
+                            .to_string(),
+                    );
+                    return Ok(());
+                };
+                let new_name = self.unique_name(&format!("{src_name} (copy)"));
+                // Filename slug — same sanitiser pattern as Convert.
+                let mut slug: String = new_name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '-' {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                while slug.contains("__") {
+                    slug = slug.replace("__", "_");
+                }
+                let slug = slug.trim_matches('_').to_string();
+                let slug = if slug.is_empty() { "copied".to_string() } else { slug };
+                let target_dir = project_dir.join("assets").join("converted");
+                if let Err(e) = std::fs::create_dir_all(&target_dir) {
+                    self.console.error(format!(
+                        "Copy: failed to create '{}': {e}",
+                        target_dir.display(),
+                    ));
+                    return Ok(());
+                }
+                let mut target = target_dir.join(format!("{slug}.arvx"));
+                let mut suffix = 1u32;
+                while target.exists() {
+                    target = target_dir.join(format!("{slug}_{suffix}.arvx"));
+                    suffix += 1;
+                }
+
                 // Spawn the destination entity. No ProceduralGeometry —
                 // this is the static voxel copy. Starts with
-                // spatial=None; the bake we enqueue below fills it.
-                let new_name = self.unique_name(&format!("{src_name} (copy)"));
+                // spatial=None; the post-bake `finalize_conversion`
+                // installs the asset spatial.
                 let new_entity = self.world.spawn((
                     src_transform,
                     EditorMetadata { name: new_name.clone() },
@@ -99,37 +147,33 @@ impl EngineState {
                 self.assign_entity_uuid(new_entity);
                 self.scene_dirty.mark_entity(new_entity);
 
-                // Enqueue a bake for the copy. We're reusing the
-                // async bake pipeline but the target entity has no
-                // ProceduralGeometry — so `enqueue_bake` won't
-                // accept it. Build the request by hand.
+                // Enqueue a ProceduralVoxelize bake on the new entity.
+                // Worker writes the artifact to `target` (including
+                // the surface-mesh sections the renderer needs);
+                // drain_bake_results sees `pending_conversions[new_entity]`
+                // and runs the asset-acquire swap. The new entity has
+                // no ProceduralGeometry, so `apply_bake_result`'s
+                // PG-conditional blocks are no-ops on it.
                 let (aabb, voxel_size) = procedural_voxel_params(&src_tree, src_voxel_size);
                 let instructions = arvx_procedural::flatten_tree(&src_tree);
-                // `generation: 0` so the staleness check in
-                // `drain_bake_results` (which reads the target
-                // entity's current generation and defaults to 0 when
-                // the entity has no ProceduralGeometry) matches and
-                // we actually apply the result. Copy targets never
-                // re-bake, so a single-shot value is fine.
                 let req = crate::bake_worker::BakeRequest {
                     entity: new_entity,
                     generation: 0,
-                    input: crate::bake_worker::BakeInput::Procedural(instructions),
+                    input: crate::bake_worker::BakeInput::ProceduralVoxelize(instructions),
                     aabb,
                     voxel_size,
                     root_scale: src_scale_for_bake,
                     prev_spatial: None,
-                    // Copy targets have no ProceduralGeometry, so no
-                    // scene reload would look for a sidecar here.
-                    cache_output_path: None,
+                    cache_output_path: Some(target.clone()),
                     generator_child: None,
                 };
                 if self.bake_worker.tx_request.send(req).is_err() {
                     self.console.warn("Copy: bake worker channel closed".to_string());
                     return Ok(());
                 }
+                self.pending_conversions.insert(new_entity, target);
                 self.console.info(format!(
-                    "Copied '{src_name}' → '{new_name}' (baking…)",
+                    "Copying '{src_name}' → '{new_name}' (voxelizing…)",
                 ));
             }
 

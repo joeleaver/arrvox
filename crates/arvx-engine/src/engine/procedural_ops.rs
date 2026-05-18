@@ -417,6 +417,19 @@ impl EngineState {
                         spatial,
                         voxel_count,
                     );
+                    // Convert-to-Voxel-Object follow-up: the bake
+                    // worker also wrote the artifact to disk at the
+                    // path we stashed in `pending_conversions`. Swap
+                    // the Renderable from the just-integrated scene-
+                    // pool spatial to an asset-cache spatial backed
+                    // by the new `.arvx`, then drop ProceduralGeometry
+                    // so the entity is a regular voxel asset like an
+                    // imported `.glb`. The just-integrated scene-pool
+                    // slot is left orphaned (matches the historic
+                    // Convert path's accepted leak).
+                    if let Some(target) = self.pending_conversions.remove(&entity) {
+                        self.finalize_conversion(entity, &target);
+                    }
                 }
                 BakeOutcome::ProxyMeshOk { surface_mesh, cluster } => {
                     self.apply_proxy_mesh_result(
@@ -435,9 +448,84 @@ impl EngineState {
                         result.voxel_size,
                         (result.aabb.max - result.aabb.min).length(),
                     ));
+                    // If this was a conversion attempt, drop the
+                    // pending entry — staying in the map would block
+                    // future bakes from completing on this entity.
+                    self.pending_conversions.remove(&entity);
                 }
             }
         }
+    }
+
+    /// Convert-to-Voxel-Object post-step. Called from
+    /// `drain_bake_results` after the bake worker has written the
+    /// `.arvx` artifact to disk and the scene-pool spatial has been
+    /// installed. Acquires the new file as a regular asset, swaps the
+    /// entity's Renderable to the asset-cache spatial, removes
+    /// `ProceduralGeometry`, and refreshes the Models panel.
+    pub(crate) fn finalize_conversion(
+        &mut self,
+        entity: hecs::Entity,
+        target: &std::path::Path,
+    ) {
+        use crate::components::*;
+        use super::model_scan::spatial_from_handle;
+
+        let acquired = self
+            .scene_mgr
+            .lock()
+            .unwrap()
+            .acquire_asset(&target.to_string_lossy());
+        let (handle, info) = match acquired {
+            Ok(t) => t,
+            Err(e) => {
+                self.console.error(format!(
+                    "Convert: failed to load new asset '{}': {e}",
+                    target.display(),
+                ));
+                return;
+            }
+        };
+        let new_spatial = spatial_from_handle(
+            &info.spatial,
+            info.voxel_size,
+            &info.aabb,
+            info.grid_origin,
+            info.leaf_attr_slot_start,
+            info.leaf_attr_slot_count,
+            Vec::new(),
+        );
+        let rel_path = self
+            .project_dir
+            .as_ref()
+            .and_then(|d| target.strip_prefix(d.join("assets")).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| target.to_string_lossy().to_string());
+
+        if let Ok(mut renderable) = self.world.get::<&mut Renderable>(entity) {
+            renderable.primitive = None;
+            renderable.spatial = Some(crate::components::RenderGeometry::Octree(new_spatial));
+            renderable.asset_handle = Some(handle);
+            renderable.asset_path = Some(rel_path.clone());
+            renderable.voxel_count = info.voxel_count;
+        }
+        let _ = self.world.remove_one::<ProceduralGeometry>(entity);
+        if self.selected_entity == Some(entity) {
+            self.selected_procedural_node = None;
+        }
+        self.scene_dirty.mark_entity(entity);
+        self.geometry_dirty.mark_all();
+        self.gpu_objects_dirty.mark_all();
+        self.scan_models();
+        let name = self
+            .world
+            .get::<&EditorMetadata>(entity)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|_| "procedural".into());
+        self.console.info(format!(
+            "Converted '{name}' to voxel asset → assets/{rel_path} ({} voxels).",
+            info.voxel_count,
+        ));
     }
 
     /// Apply a completed proxy-mesh bake. Releases any previous

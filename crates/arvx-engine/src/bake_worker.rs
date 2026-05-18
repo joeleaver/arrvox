@@ -45,9 +45,19 @@ use crate::generator::{GenerateFn, GeneratorError};
 /// What the worker will voxelize into a `BakeArtifact`, or skip past if
 /// already done.
 pub enum BakeInput {
-    /// Flattened procedural opcode stream — the worker voxelizes via
-    /// the GPU evaluator. Cheap to clone, tree-free.
+    /// Flattened procedural opcode stream — the worker runs surface-
+    /// nets-from-SDF and ships a triangle proxy mesh back. This is the
+    /// live editing path: cheap, fast, but the result isn't paintable
+    /// or sculptable (no octree, no leaf attrs).
     Procedural(Vec<arvx_procedural::flatten::ProcInstruction>),
+    /// Flattened procedural opcode stream — the worker GPU-evaluates
+    /// the tree at every octree voxel cell and emits a true
+    /// `BakeArtifact`. Used by Copy/Convert when the user wants a
+    /// paintable / sculptable static voxel object from a procedural.
+    /// Heavier than `Procedural` (full voxelization + integrate
+    /// instead of surface-nets), so reserved for user-triggered
+    /// one-shots.
+    ProceduralVoxelize(Vec<arvx_procedural::flatten::ProcInstruction>),
     /// Pre-voxelized by the caller. Worker skips straight to integrate.
     /// Used for "other means" generators (CPU-sampled SDFs, mesh
     /// voxelization, etc.) that don't want to route through the
@@ -304,15 +314,17 @@ fn run_bake(
     req: BakeRequest,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    _evaluator: &mut GpuEvaluator,
+    evaluator: &mut GpuEvaluator,
     surface_nets: &mut Option<GpuSurfaceNets>,
     scene_mgr: &Arc<Mutex<ArvxSceneManager>>,
 ) -> BakeResult {
     let t_start = std::time::Instant::now();
 
-    // Procedural inputs always produce a triangle proxy mesh via
-    // GPU surface-nets-from-SDF. Artifact inputs (already-voxelized
-    // `.arvx` loads) take the voxelize/integrate path below.
+    // Procedural inputs split by intent: live-edit `Procedural`
+    // produces a proxy mesh via surface-nets (no octree). One-shot
+    // `ProceduralVoxelize` runs the SDF through the GPU evaluator and
+    // emits a full `BakeArtifact` — same shape Artifact inputs take —
+    // so it falls through to the integrate/write path below.
     if let BakeInput::Procedural(instructions) = req.input {
         let sn = surface_nets.get_or_insert_with(|| GpuSurfaceNets::new(device));
         // Cell size matches the procedural's chosen voxel size, so
@@ -357,9 +369,28 @@ fn run_bake(
 
     // Artifact-input voxelize/integrate path — used by imported
     // `.arvx` loads (which carry pre-voxelized data the file format
-    // ships with).
+    // ships with) AND by `ProceduralVoxelize` (one-shot user-
+    // triggered escape hatch that turns a procedural SDF into a
+    // paintable/sculptable octree).
     let artifact = match req.input {
         BakeInput::Procedural(_) => unreachable!("handled above"),
+        BakeInput::ProceduralVoxelize(instructions) => {
+            // GPU-evaluate the SDF at every cell the octree
+            // classifier asks about. `voxelize_to_artifact` is
+            // pool-private (fresh `LeafAttrPool` / `BrickPool`), so
+            // we don't need the scene_mgr lock yet — that's only
+            // taken below for the integrate step. Returns `None` on
+            // an empty tree or zero-voxel result, which propagates
+            // to `BakeOutcome::Failed`.
+            let mut closure = |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+                evaluator
+                    .evaluate(device, queue, positions, &instructions)
+                    .into_iter()
+                    .map(|s| s.into_tuple())
+                    .collect()
+            };
+            arvx_core::voxelize_to_artifact(&mut closure, &req.aabb, req.voxel_size)
+        }
         BakeInput::Artifact(a) => Some(a),
     };
     let t_after_voxelize = t_start.elapsed();

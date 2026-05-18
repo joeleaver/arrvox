@@ -694,6 +694,14 @@ pub(crate) struct EngineState {
     /// geometry change implies a collider rebuild for the affected
     /// entity.
     pub(crate) geometry_dirty: super::geometry_dirty::GeometryDirty,
+    /// Entities whose async `ConvertProceduralToVoxel` bake is in
+    /// flight. When the bake's `BakeOutcome::Ok` result lands, the
+    /// drain handler reads the target `.arvx` path here, acquires it
+    /// as a regular asset, and swaps the entity's Renderable from the
+    /// scene-pool spatial to the asset-cache spatial — same shape as
+    /// an imported `.glb`/`.fbx`. Cleared after the swap. Empty in
+    /// steady state; one entry per active conversion (typically 0-1).
+    pub(crate) pending_conversions: std::collections::HashMap<hecs::Entity, std::path::PathBuf>,
     /// Scene structure changed — push objects list to UI. Per-entity
     /// dirty set + sticky-all bit; see [`super::scene_dirty::SceneDirty`]
     /// and `docs/PERF_DEBT.md` B3. Today's consumer in
