@@ -54,7 +54,7 @@ use arvx_render::{
     arvx_scene::CameraUniforms,
     arvx_shade::{GpuLight, GpuMaterial, ShadeParams},
     arvx_volumetric::{CloudParams, VolumetricParams},
-    BuildPreviewMode, LineVertex, RenderMode,
+    LineVertex, RenderMode,
 };
 
 use crate::viewport::ViewportId;
@@ -259,7 +259,6 @@ pub struct RenderViewport {
     pub width: u32,
     pub height: u32,
     pub mode: RenderMode,
-    pub preview_mode: BuildPreviewMode,
     pub camera: CameraUniforms,
 
     /// Cached `view_proj * world` cull plane data, packed for the
@@ -311,9 +310,10 @@ pub struct RenderViewport {
     /// wireframe draw on this.
     pub show_editor_overlays: bool,
 
-    /// Procedural raymarch preview state, present only when
-    /// `preview_mode == Raymarch` and an entity with
-    /// `ProceduralGeometry` is selected.
+    /// Procedural raymarch preview state, present only for the BUILD
+    /// viewport when an entity with `ProceduralGeometry` is selected
+    /// (raymarch is BUILD-only — every other viewport renders the
+    /// proxy mesh via the standard mesh raster).
     pub proc_raymarch: Option<RenderProcRaymarch>,
 
     /// Cursor pixel for the brush-state probe pass — `Some((x, y))`
@@ -461,8 +461,6 @@ pub enum RenderCommand {
     SetViewportVisible { id: ViewportId, visible: bool },
     /// Replace a viewport's render mode (InSitu vs. Isolation).
     SetViewportMode { id: ViewportId, mode: RenderMode },
-    /// Replace BUILD viewport's preview mode (Voxel vs. Raymarch).
-    SetBuildPreviewMode(BuildPreviewMode),
     /// Upload a procedural's proxy-mesh GPU buffers under a fresh
     /// asset handle. Sent by `drain_bake_results` after a
     /// `BakeMode::ProxyMesh` bake completes; the render thread

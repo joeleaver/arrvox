@@ -16,22 +16,6 @@ impl EngineState {
     /// state, casts rays through BUILD's camera, and writes to the
     /// node's Affine3A instead of an entity Transform.
     pub(crate) fn update_procedural_gizmo(&mut self) {
-        // Voxel preview mode: the gizmo would edit the tree without
-        // any live visual update in the build viewport, so disable
-        // it entirely. Clear any in-flight drag and reset hover so a
-        // mode flip mid-interaction doesn't leave stale state.
-        let raymarch = self.viewports
-            .get(crate::viewport::ViewportId::BUILD)
-            .map(|v| matches!(v.preview_mode, arvx_render::BuildPreviewMode::Raymarch))
-            .unwrap_or(false);
-        if !raymarch {
-            self.proc_gizmo.hovered_axis = crate::gizmo::GizmoAxis::None;
-            if self.proc_gizmo.dragging {
-                self.proc_gizmo.end_drag();
-            }
-            return;
-        }
-
         let (node_id, entity) = match (self.selected_procedural_node, self.selected_entity) {
             (Some(n), Some(e)) => (n, e),
             _ => {

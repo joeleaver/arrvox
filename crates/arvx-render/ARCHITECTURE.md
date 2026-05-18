@@ -33,7 +33,7 @@ tone_map              compute   HDR → LDR
 wireframe / grid      render    overlays (gizmo, isolation grid)
 ```
 
-Build viewport in `Raymarch` preview mode replaces the mesh raster with `proc_raymarch` (compute, one thread/pixel, sphere-traces the flattened RPN tree). Everything downstream is unchanged.
+The build viewport replaces the mesh raster with `proc_raymarch` (compute, one thread/pixel, sphere-traces the flattened RPN tree). Everything downstream is unchanged.
 
 ---
 

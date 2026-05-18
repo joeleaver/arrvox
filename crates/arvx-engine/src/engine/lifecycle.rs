@@ -1062,14 +1062,15 @@ impl EngineState {
                 }
             };
 
-            let (vp_mode, vp_preview_mode) = self
+            let vp_mode = self
                 .viewports
                 .get(viewport_id)
-                .map(|v| (v.mode, v.preview_mode))
-                .unwrap_or((
-                    arvx_render::RenderMode::InSitu,
-                    arvx_render::BuildPreviewMode::Baked,
-                ));
+                .map(|v| v.mode)
+                .unwrap_or(arvx_render::RenderMode::InSitu);
+            // Raymarch is BUILD-only — every other viewport uses the
+            // mesh raster. Single-viewport check, no per-frame mode
+            // field needed.
+            let vp_raymarch = viewport_id == crate::viewport::ViewportId::BUILD;
 
             // The procedural being previewed in raymarch mode is
             // always the currently-selected entity — keeps the
@@ -1146,12 +1147,13 @@ impl EngineState {
                 self.environment.bloom_intensity
             };
 
-            // Procedural raymarch state — only when this VR is in
-            // raymarch preview mode AND a procedural entity is
-            // selected. Sim flattens the tree, builds the AABB, and
-            // pre-filters ghost primitives; render uploads + binds.
+            // Procedural raymarch state — only on the BUILD viewport
+            // (the only one that runs the raymarch pass) and only when
+            // a procedural entity is selected. Sim flattens the tree,
+            // builds the AABB, and pre-filters ghost primitives;
+            // render uploads + binds.
             let proc_raymarch =
-                if matches!(vp_preview_mode, arvx_render::BuildPreviewMode::Raymarch) {
+                if vp_raymarch {
                     let entity = vp_preview_entity.and_then(|uuid| {
                         self.entity_uuids
                             .iter()
@@ -1239,14 +1241,12 @@ impl EngineState {
 
             // Wireframe verts: gizmo on MAIN, procedural-node gizmo
             // on BUILD when in raymarch preview. The procedural-node
-            // gizmo is only meaningful in raymarch mode — in voxel
-            // mode the user sees the baked result and any drag would
-            // silently edit the tree without visual feedback.
+            // The procedural-node gizmo lives on the BUILD viewport
+            // (which always raymarches). MAIN gets the standard
+            // entity gizmo; everything else gets nothing.
             let wireframe_verts = if viewport_id == ViewportId::MAIN {
                 gizmo_verts_main.clone()
-            } else if viewport_id == ViewportId::BUILD
-                && matches!(vp_preview_mode, arvx_render::BuildPreviewMode::Raymarch)
-            {
+            } else if viewport_id == ViewportId::BUILD {
                 let cam_pos = glam::Vec3::new(
                     cam_uniforms.position[0],
                     cam_uniforms.position[1],
@@ -1292,7 +1292,6 @@ impl EngineState {
                 width: vp_w,
                 height: vp_h,
                 mode: vp_mode,
-                preview_mode: vp_preview_mode,
                 camera: cam_uniforms,
                 screen_aabbs_bytes,
                 tile_offsets_bytes,
@@ -1342,13 +1341,7 @@ impl EngineState {
             // the gbuf_pick texture for procedural NodeIds; everything
             // else (MAIN voxel, BUILD voxel) decodes gbuf_material for
             // the entity scene_id.
-            let kind = if pp.viewport == ViewportId::BUILD
-                && self
-                    .viewports
-                    .get(ViewportId::BUILD)
-                    .map(|v| matches!(v.preview_mode, arvx_render::BuildPreviewMode::Raymarch))
-                    .unwrap_or(false)
-            {
+            let kind = if pp.viewport == ViewportId::BUILD {
                 crate::render_frame::PickKind::ProceduralNode
             } else {
                 crate::render_frame::PickKind::Material

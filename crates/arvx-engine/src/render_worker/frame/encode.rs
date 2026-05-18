@@ -90,7 +90,11 @@ pub(super) fn encode_viewports(
         // charge.
         let mut shade_params = vp.shade_params;
         let in_situ = matches!(vp.mode, arvx_render::RenderMode::InSitu);
-        let raymarch = matches!(vp.preview_mode, arvx_render::BuildPreviewMode::Raymarch);
+        // Raymarch is the BUILD viewport's only primary-visibility
+        // pass — every other viewport (MAIN, play, future) uses the
+        // standard mesh raster. Single-viewport check is cheaper than
+        // a per-frame enum field.
+        let raymarch = vp.id == crate::viewport::ViewportId::BUILD;
         // Mesh path renders its directional shadow map into
         // `shadow_buffer` — gated by `pre.shadow_map_enabled`,
         // which is true whenever a directional caster is live.
@@ -191,7 +195,7 @@ pub(super) fn encode_viewports(
             pre.shadow_map_enabled,
             &vp.atmo_frame,
             vp.mode,
-            vp.preview_mode,
+            raymarch,
             // Mesh-raster instance list built in `update_scene_gpu`
             // from `Renderable.asset_handle`. Procedural entities
             // without an `AssetHandle` ride `proxy_draws` instead.

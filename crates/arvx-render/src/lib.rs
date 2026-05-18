@@ -153,30 +153,6 @@ pub enum RenderMode {
     Isolation,
 }
 
-/// What primary-visibility pass runs for the build viewport. Orthogonal
-/// to `RenderMode` (Isolation/InSitu) — lighting look is separate from
-/// "what geometry are we showing."
-///
-/// * `Baked` — render whatever's baked into the scene (mesh raster of
-///   imported assets + procedural proxy meshes). What every other
-///   viewport uses.
-/// * `Raymarch` — the procedural CSG raymarcher. Evaluates the tree
-///   analytically per pixel, so edits are live — no bake required.
-///   Cheap (microseconds per frame for small trees) because there's no
-///   voxelization and no brick bookkeeping.
-///
-/// The main viewport and play mode are always `Baked`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuildPreviewMode {
-    Baked,
-    Raymarch,
-}
-
-impl Default for BuildPreviewMode {
-    fn default() -> Self {
-        Self::Baked
-    }
-}
 
 /// Validate WGSL source with naga at startup.
 ///

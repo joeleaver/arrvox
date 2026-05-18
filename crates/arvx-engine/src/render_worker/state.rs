@@ -442,10 +442,9 @@ impl RenderState {
                 // do here today; left as a hook for future allocator
                 // work (free a hidden VR's gbuffer to reclaim VRAM).
             }
-            RenderCommand::SetViewportMode { .. }
-            | RenderCommand::SetBuildPreviewMode(_) => {
-                // Same: per-frame snapshot carries `mode` + `preview_mode`
-                // for every viewport. Render reads from there.
+            RenderCommand::SetViewportMode { .. } => {
+                // Per-frame snapshot carries `mode` for every viewport.
+                // Render reads from there.
             }
             RenderCommand::UploadProxyMesh {
                 handle_raw,

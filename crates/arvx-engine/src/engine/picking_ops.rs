@@ -308,9 +308,6 @@ impl EngineState {
             return None;
         }
         let build_vp = self.viewports.get(viewport_id)?;
-        if !matches!(build_vp.preview_mode, arvx_render::BuildPreviewMode::Raymarch) {
-            return None;
-        }
 
         // Resolve the procedural entity: either the viewport's focus
         // target (the build viewport pins focus to whatever procedural

@@ -213,15 +213,6 @@ pub struct Viewport {
     /// pass gating in `ArvxRenderer::render_to`.
     pub mode: arvx_render::RenderMode,
 
-    /// Primary-visibility source for this viewport — voxel octree march
-    /// (default, what every viewport except the build one uses) or the
-    /// procedural CSG raymarcher (live preview of the tree without a
-    /// voxel bake). Only the build viewport should ever flip this to
-    /// `Raymarch`; main and any play-mode viewport stay on `Voxel`.
-    /// The procedural entity being previewed is pulled from the engine's
-    /// current selection at render time — nothing to track here.
-    pub preview_mode: arvx_render::BuildPreviewMode,
-
     /// Whether to overlay editor gizmos. Gated to "no runtime override
     /// active" in higher layers.
     pub show_gizmos: bool,
@@ -252,7 +243,6 @@ impl Viewport {
             },
             background: BackgroundMode::Environment,
             mode: arvx_render::RenderMode::InSitu,
-            preview_mode: arvx_render::BuildPreviewMode::Baked,
             show_gizmos: true,
             prev_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
         }
@@ -276,12 +266,6 @@ impl Viewport {
             },
             background: BackgroundMode::Neutral,
             mode: arvx_render::RenderMode::Isolation,
-            // Live CSG raymarch is the authoring default — the build
-            // viewport exists for interactive tree editing and the
-            // raymarch is what makes edits visible without a bake.
-            // Users can flip to Voxel from the panel toggle to inspect
-            // the last-baked result.
-            preview_mode: arvx_render::BuildPreviewMode::Raymarch,
             show_gizmos: false,
             prev_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
         }

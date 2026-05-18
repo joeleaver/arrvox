@@ -49,7 +49,7 @@ pub struct ViewportRenderer {
     /// Live CSG preview for the build viewport. Writes the same
     /// G-buffer as the mesh raster, so downstream passes don't care
     /// which path ran — only one of the two executes per frame, chosen
-    /// by the host via `render_to`'s `preview_mode` parameter.
+    /// by the host via `render_to`'s `raymarch` parameter.
     pub proc_raymarch: ProcRaymarchPass,
     /// Selected-primitive outline overlay for the procedural raymarch
     /// preview. Reads the NodeId channel the raymarch writes and

@@ -133,15 +133,6 @@ impl EngineState {
                 ));
             }
 
-            EngineCommand::SetBuildPreviewMode { mode } => {
-                if let Some(vp) = self.viewports.get_mut(crate::viewport::ViewportId::BUILD) {
-                    vp.preview_mode = mode;
-                    eprintln!("[preview] build viewport preview_mode -> {mode:?}");
-                } else {
-                    eprintln!("[preview] SetBuildPreviewMode but no BUILD viewport registered");
-                }
-            }
-
             EngineCommand::SpawnPointLight => {
                 use crate::components::*;
                 let name = self.unique_name("Point Light");
@@ -363,22 +354,8 @@ impl EngineState {
             }
 
             EngineCommand::Pick { id, x, y } => {
-                // BUILD + Voxel: picking doesn't make sense. The G-buffer
-                // slot the raymarch uses for NodeId is occupied by
-                // secondary_material_id in voxel mode, so decoding
-                // would return arbitrary node ids. Skip entirely —
-                // the user selects tree nodes via the build panel
-                // in voxel mode.
-                if id == crate::viewport::ViewportId::BUILD {
-                    let is_raymarch = self
-                        .viewports
-                        .get(crate::viewport::ViewportId::BUILD)
-                        .map(|v| matches!(v.preview_mode, arvx_render::BuildPreviewMode::Raymarch))
-                        .unwrap_or(false);
-                    if !is_raymarch {
-                        return Ok(());
-                    }
-                }
+                // BUILD viewport always raymarches — `gbuf_pick` carries
+                // the per-pixel NodeId, so a click decodes directly.
 
                 // Route the pick by viewport — MAIN picks scene entities
                 // (old path), BUILD picks procedural primitives when in

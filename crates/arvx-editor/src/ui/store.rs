@@ -265,12 +265,6 @@ pub struct EditorStore {
     pub play_mode: Signal<bool>,
 
     // ── View settings ────────────────────────────────────────────
-    /// Which primary-visibility pass the build viewport dispatches —
-    /// `Voxel` (default, shows the baked octree) or `Raymarch` (live CSG
-    /// preview of the procedural tree, no bake required). Updated by the
-    /// build panel's preview toggle and echoed back to the engine via
-    /// `EngineCommand::SetBuildPreviewMode`.
-    pub build_preview_mode: Signal<arvx_render::BuildPreviewMode>,
     /// Skeletal skinning master switch. `false` → the scatter pass is
     /// skipped and the march shader falls back to rigid-mesh rendering
     /// for every skinned entity. Defaults `true`.
@@ -409,7 +403,6 @@ impl EditorStore {
             environment: Signal::new(EnvironmentSettings::default()),
             console_entries: Signal::new(Vec::new()),
             play_mode: Signal::new(false),
-            build_preview_mode: Signal::new(arvx_render::BuildPreviewMode::Raymarch),
             skinning_enabled: Signal::new(true),
             dqs_enabled: Signal::new(false),
 

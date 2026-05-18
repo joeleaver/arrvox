@@ -1901,10 +1901,11 @@ impl ArvxRenderer {
     /// volumetric / god_rays / bloom passes are skipped to give a
     /// clean studio look.
     ///
-    /// `preview_mode` selects the primary-visibility pass: `Voxel`
-    /// runs the surface-mesh raster; `Raymarch` runs the procedural
-    /// CSG raymarcher instead. Only the build viewport uses
-    /// `Raymarch`; everywhere else passes `Voxel` (the default).
+    /// `raymarch` selects the primary-visibility pass: `false` runs
+    /// the surface-mesh raster; `true` runs the procedural CSG
+    /// raymarcher instead. Only the build viewport sets `raymarch =
+    /// true`; everywhere else (main, play, future viewports) is
+    /// always `false`.
     pub fn render_to(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1917,7 +1918,7 @@ impl ArvxRenderer {
         shadow_map_enabled: bool,
         atmo_frame_params: &crate::arvx_atmosphere::AtmosphereFrameParams,
         mode: crate::RenderMode,
-        preview_mode: crate::BuildPreviewMode,
+        raymarch: bool,
         // Mesh-raster instance list. One entry per visible
         // scene-instance whose asset has mesh data (i.e. came from
         // `acquire_asset`); procedural objects without baked meshes
@@ -1942,7 +1943,6 @@ impl ArvxRenderer {
         brush_pixel: Option<(u32, u32)>,
     ) {
         let in_situ = matches!(mode, crate::RenderMode::InSitu);
-        let raymarch = matches!(preview_mode, crate::BuildPreviewMode::Raymarch);
 
         // 0. Atmosphere LUTs (in-situ only — isolation uses a flat sky).
         if in_situ {

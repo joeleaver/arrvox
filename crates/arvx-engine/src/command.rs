@@ -223,14 +223,6 @@ pub enum EngineCommand {
         entity_id: Uuid,
     },
 
-    /// Switch the build viewport's primary-visibility source between
-    /// the voxel march (shows the baked result) and the procedural
-    /// CSG raymarcher (shows the live tree, no bake required). The
-    /// procedural being previewed is the currently-selected entity.
-    SetBuildPreviewMode {
-        mode: arvx_render::BuildPreviewMode,
-    },
-
     // ── Transforms ───────────────────────────────────────────────────
 
     /// Set an object's local position.

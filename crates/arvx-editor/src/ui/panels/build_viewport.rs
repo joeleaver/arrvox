@@ -15,7 +15,6 @@ use rinch::render_surface::{RenderSurface, SurfaceEvent, SurfaceMouseButton};
 
 use arvx_engine::procedural_snapshot::ProceduralSnapshot;
 use arvx_engine::viewport::ViewportId;
-use arvx_render::BuildPreviewMode;
 
 use crate::{BuildSurface, CommandSender};
 use crate::ui::store::EditorStore;
@@ -224,13 +223,10 @@ pub fn BuildViewport() -> NodeHandle {
                     button: map_btn(button),
                     pressed: true,
                 });
-                // Left click → pick. In raymarch preview mode the
-                // engine decodes the hit pixel as a procedural
-                // NodeId; in voxel mode the pick is a no-op on the
-                // build viewport (there's only the one selected
-                // procedural entity to "pick" and it's already
-                // selected). Sent unconditionally to keep the event
-                // path simple; the engine filters on preview_mode.
+                // Left click → pick. The BUILD viewport always
+                // raymarches the selected procedural; `gbuf_pick`
+                // carries the per-pixel NodeId so the engine decodes
+                // the click directly into a tree-node selection.
                 if button == SurfaceMouseButton::Left {
                     let _ = cmd_tx.send(arvx_engine::EngineCommand::Pick {
                         id: PANEL_VIEWPORT,
@@ -323,9 +319,9 @@ pub fn BuildViewport() -> NodeHandle {
                         )}
                     }
                 }
-                // Top-right: preview-mode toggle + Bake action + resolution.
-                // Floats as a single compact overlay over the 3D view so
-                // the tools live next to the thing they modify. Gated on
+                // Top-right: Bake action + resolution. Floats as a
+                // single compact overlay over the 3D view so the tools
+                // live next to the thing they modify. Gated on
                 // `has_procedural` — same as the tree panel.
                 if has_procedural.get() {
                     div {
@@ -336,7 +332,6 @@ pub fn BuildViewport() -> NodeHandle {
                                 backdrop-filter:blur(4px);z-index:15;\
                                 display:flex;flex-direction:column;gap:6px;\
                                 min-width:240px;",
-                        {render_preview_toggle(__scope, store.clone(), tree_cmd_tx)}
                         {render_resolution(__scope, tree_snapshot, tree_cmd_tx)}
                         {render_bake_action(__scope, tree_snapshot, tree_cmd_tx)}
                     }
@@ -349,64 +344,6 @@ pub fn BuildViewport() -> NodeHandle {
                                 font-size:12px;",
                         "Select a procedural object to build"
                     }
-                }
-            }
-        }
-    }
-}
-
-/// Two-button segmented control for the build viewport's primary-
-/// visibility source. `Voxel` shows the baked octree result; `Procedural`
-/// evaluates the analytical CSG tree per pixel so edits are live. The
-/// pair is the expected editing loop: edit with Procedural, Bake, confirm
-/// with Voxel. Rendered as the left half of the top-right overlay.
-fn render_preview_toggle(
-    __scope: &mut rinch::core::dom::RenderScope,
-    store: EditorStore,
-    cmd_tx: Signal<crossbeam::channel::Sender<arvx_engine::EngineCommand>>,
-) -> rinch::core::dom::NodeHandle {
-    let mode = store.build_preview_mode;
-
-    let set_voxel = move || {
-        mode.set(BuildPreviewMode::Baked);
-        let _ = cmd_tx.get().send(arvx_engine::EngineCommand::SetBuildPreviewMode {
-            mode: BuildPreviewMode::Baked,
-        });
-    };
-    let set_raymarch = move || {
-        mode.set(BuildPreviewMode::Raymarch);
-        let _ = cmd_tx.get().send(arvx_engine::EngineCommand::SetBuildPreviewMode {
-            mode: BuildPreviewMode::Raymarch,
-        });
-    };
-
-    let btn_style = |active: bool| -> &'static str {
-        if active {
-            "flex:1;padding:3px 10px;background:#3c5a8a;color:#dde7f5;\
-             border:1px solid #4a78b0;border-radius:3px;cursor:pointer;\
-             font-size:11px;font-weight:600;"
-        } else {
-            "flex:1;padding:3px 10px;background:#2a2a2a;color:#a0a0a0;\
-             border:1px solid #3c3c3c;border-radius:3px;cursor:pointer;\
-             font-size:11px;"
-        }
-    };
-
-    rsx! {
-        div {
-            style: "display:flex;align-items:center;gap:6px;",
-            span { style: "color:#888;font-size:11px;", "Preview:" }
-            div {
-                style: "display:flex;flex:1;gap:4px;",
-                button {
-                    style: {move || btn_style(matches!(mode.get(), BuildPreviewMode::Raymarch))},
-                    onclick: set_raymarch,
-                    "Procedural"
-                }
-                button {
-                    style: {move || btn_style(matches!(mode.get(), BuildPreviewMode::Baked))},
-                    onclick: set_voxel,
-                    "Voxel"
                 }
             }
         }
