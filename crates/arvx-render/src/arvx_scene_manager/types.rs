@@ -221,6 +221,17 @@ pub(super) struct AssetEntry {
     /// Stored as a `HashSet<u32>` so freed-then-reallocated slots
     /// don't accumulate duplicates that would double-free on release.
     pub(super) sculpt_extra_slots: std::collections::HashSet<u32>,
+    /// Phase 4.2b: leaf-attr slots allocated specifically for new
+    /// halo cells discovered during cross-tile halo refresh. The
+    /// bake-time halo's slots live inside the asset's contiguous
+    /// `[slot_start, +slot_count)` range; cells that flipped
+    /// empty→solid on the neighbour AFTER bake need fresh slots
+    /// allocated from the pool's general `allocate()`, which can
+    /// land anywhere. Tracked here so `release_asset` frees them
+    /// individually (the contiguous deallocate only covers the
+    /// bake range). HashSet because the same slot can be freed and
+    /// re-allocated within a session.
+    pub(super) halo_extra_slots: std::collections::HashSet<u32>,
     /// Terrain Phase 4: per-cell halo data carried from the original
     /// bake.
     ///
@@ -799,6 +810,7 @@ mod slab_tests {
             cluster_spatial_index:
                 crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
             sculpt_extra_slots: std::collections::HashSet::new(),
+            halo_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
         }
     }
@@ -1001,6 +1013,7 @@ mod slab_tests {
             cluster_spatial_index:
                 crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
             sculpt_extra_slots: std::collections::HashSet::new(),
+            halo_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
         };
         let grid_origin = entry.grid_origin();

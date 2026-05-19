@@ -1472,6 +1472,7 @@ mod tests {
             dag_produced: Vec::new(),
             cpu_octree: SparseOctree::new(depth, base_vs),
             sculpt_extra_slots: std::collections::HashSet::new(),
+            halo_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
             mesh_dirty: false,
             clusters_dirty: false,

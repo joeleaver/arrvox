@@ -257,6 +257,172 @@ impl EngineState {
 }
 
 impl EngineState {
+    /// Phase 4.2b helper — for each touched tile, refresh the halo
+    /// data on any neighbour tile across a face the brush reached
+    /// within `halo * voxel_size` of, then re-mesh the neighbour.
+    ///
+    /// Conservative: triggers on brush-AABB-overlap with the band,
+    /// not on actual edits at boundary cells. False positives just
+    /// cost an extra (no-op) refresh + re-mesh; false negatives
+    /// would leave a visible seam tear.
+    pub(crate) fn maybe_refresh_neighbour_halos(
+        &mut self,
+        world_pos: glam::Vec3,
+        radius: f32,
+        touched_keys: &[arvx_terrain::TileKey],
+    ) {
+        if touched_keys.is_empty() || radius <= 0.0 {
+            return;
+        }
+        // Match `arvx_terrain::bake::TILE_HALO_VOXELS`.
+        const TILE_HALO_VOXELS: f32 = 2.0;
+        let tile_size = arvx_terrain::TILE_SIZE_M;
+
+        // Snapshot the runtime's tile_keys map (handle lookup) so we
+        // don't hold a borrow across the scene_mgr lock + mutation.
+        let live_handles: std::collections::HashMap<
+            arvx_terrain::TileKey,
+            arvx_render::AssetHandle,
+        > = match self.terrain.as_ref() {
+            Some(rt) => rt
+                .tile_keys
+                .iter()
+                .map(|(k, (_e, h))| (*k, *h))
+                .collect(),
+            None => return,
+        };
+
+        // Resolve voxel size for the touched tiles (V1 assumes all
+        // tiles share one level / voxel size). Fall back to default
+        // tier if no Terrain entity is reachable.
+        let voxel_size = self
+            .world
+            .query::<&arvx_terrain::Terrain>()
+            .iter()
+            .next()
+            .map(|(_, t)| t.voxel_size_for_level(0))
+            .unwrap_or(
+                arvx_core::constants::RESOLUTION_TIERS
+                    [arvx_core::constants::DEFAULT_TERRAIN_TIER]
+                    .voxel_size,
+            );
+        let halo_world = TILE_HALO_VOXELS * voxel_size;
+        let brush_min = world_pos - glam::Vec3::splat(radius);
+        let brush_max = world_pos + glam::Vec3::splat(radius);
+
+        let mut ops: Vec<arvx_render::HaloRefresh> = Vec::new();
+        for &k in touched_keys {
+            let Some(&source_handle) = live_handles.get(&k) else { continue };
+            let tile_origin = glam::Vec3::new(
+                k.x as f32 * tile_size,
+                k.y as f32 * tile_size,
+                k.z as f32 * tile_size,
+            );
+            let tile_max = tile_origin + glam::Vec3::splat(tile_size);
+
+            // For each of the 6 faces, test whether the brush reaches
+            // into the halo band on that side. The neighbour tile
+            // across the face owns a halo whose data must be
+            // refreshed to match A's post-sculpt boundary cells.
+            //
+            // Convention: the neighbour's facing-A face is the
+            // OPPOSITE of A's face. For A's -X face, the neighbour
+            // is A.x-1; the neighbour's relevant face is +X (which
+            // it labels as the side facing A).
+            //
+            // Face index follows `FACE_DIRS` order from arvx-core:
+            // 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z.
+            let face_checks: [
+                (glam::Vec3, glam::Vec3, arvx_terrain::TileKey, u8); 6
+            ] = [
+                // A's +X band touches → neighbour at +X has stale
+                // halo on its -X face.
+                (
+                    glam::Vec3::new(tile_max.x - halo_world, tile_origin.y, tile_origin.z),
+                    glam::Vec3::new(tile_max.x, tile_max.y, tile_max.z),
+                    arvx_terrain::TileKey { level: k.level, x: k.x + 1, y: k.y, z: k.z },
+                    arvx_render::FACE_NX,
+                ),
+                (
+                    glam::Vec3::new(tile_origin.x, tile_origin.y, tile_origin.z),
+                    glam::Vec3::new(tile_origin.x + halo_world, tile_max.y, tile_max.z),
+                    arvx_terrain::TileKey { level: k.level, x: k.x - 1, y: k.y, z: k.z },
+                    arvx_render::FACE_PX,
+                ),
+                (
+                    glam::Vec3::new(tile_origin.x, tile_max.y - halo_world, tile_origin.z),
+                    glam::Vec3::new(tile_max.x, tile_max.y, tile_max.z),
+                    arvx_terrain::TileKey { level: k.level, x: k.x, y: k.y + 1, z: k.z },
+                    arvx_render::FACE_NY,
+                ),
+                (
+                    glam::Vec3::new(tile_origin.x, tile_origin.y, tile_origin.z),
+                    glam::Vec3::new(tile_max.x, tile_origin.y + halo_world, tile_max.z),
+                    arvx_terrain::TileKey { level: k.level, x: k.x, y: k.y - 1, z: k.z },
+                    arvx_render::FACE_PY,
+                ),
+                (
+                    glam::Vec3::new(tile_origin.x, tile_origin.y, tile_max.z - halo_world),
+                    glam::Vec3::new(tile_max.x, tile_max.y, tile_max.z),
+                    arvx_terrain::TileKey { level: k.level, x: k.x, y: k.y, z: k.z + 1 },
+                    arvx_render::FACE_NZ,
+                ),
+                (
+                    glam::Vec3::new(tile_origin.x, tile_origin.y, tile_origin.z),
+                    glam::Vec3::new(tile_max.x, tile_max.y, tile_origin.z + halo_world),
+                    arvx_terrain::TileKey { level: k.level, x: k.x, y: k.y, z: k.z - 1 },
+                    arvx_render::FACE_PZ,
+                ),
+            ];
+            for (band_min, band_max, neighbour_key, neighbour_face) in face_checks {
+                // AABB-vs-AABB overlap between brush and band:
+                if brush_max.x <= band_min.x
+                    || brush_min.x >= band_max.x
+                    || brush_max.y <= band_min.y
+                    || brush_min.y >= band_max.y
+                    || brush_max.z <= band_min.z
+                    || brush_min.z >= band_max.z
+                {
+                    continue;
+                }
+                let Some(&target_handle) = live_handles.get(&neighbour_key) else {
+                    continue;
+                };
+                ops.push(arvx_render::HaloRefresh {
+                    target: target_handle,
+                    target_face: neighbour_face,
+                    source: source_handle,
+                });
+            }
+        }
+        if ops.is_empty() {
+            return;
+        }
+        // Apply each refresh op + re-mesh under a single scene_mgr lock.
+        let mut total_changed: usize = 0;
+        {
+            let mut scene = self.scene_mgr.lock().expect("scene_mgr poisoned");
+            for op in &ops {
+                if let Some(n) = scene.apply_halo_refresh(*op) {
+                    total_changed += n;
+                }
+            }
+        }
+        if total_changed > 0 {
+            // The re-mesh inside apply_halo_refresh marks mesh_dirty +
+            // clusters_dirty on the target asset; mark the rendering
+            // path so the next frame uploads the rebuilt mesh.
+            self.gpu_objects_dirty.mark_all();
+        }
+        if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
+            eprintln!(
+                "[halo-refresh] ops={} total_changed={}",
+                ops.len(),
+                total_changed,
+            );
+        }
+    }
+
     /// Phase 4 brush dispatch: apply a single sculpt brush stamp to
     /// every live terrain tile whose AABB intersects the world-space
     /// brush AABB. Bypasses the selection / procedural / skeleton
@@ -403,6 +569,17 @@ impl EngineState {
                 runtime.dirty_tiles.insert(*k);
             }
         }
+
+        // Phase 4.2b: cross-tile halo refresh. For each touched
+        // tile A, check whether the brush reached within
+        // `TILE_HALO_VOXELS * voxel_size` of A's six face planes.
+        // For each dirty face, find the neighbour across that face;
+        // if the neighbour is live, refresh its halo for the
+        // matching face using A's interior boundary data and re-mesh.
+        //
+        // Skips the refresh when the brush stayed away from every
+        // face — the common interior-stroke case pays nothing.
+        self.maybe_refresh_neighbour_halos(world_pos, radius, &touched_keys);
 
         if total_removed > 0 {
             eprintln!(

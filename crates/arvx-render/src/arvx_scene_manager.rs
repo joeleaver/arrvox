@@ -26,6 +26,7 @@ mod cluster_spatial_index;
 mod manager;
 mod paint;
 mod sculpt;
+mod terrain_halo_refresh;
 mod terrain_integrate;
 mod terrain_save;
 mod types;
@@ -34,6 +35,9 @@ mod voxelize;
 // Public re-exports — keep `arvx_render::arvx_scene_manager::Foo` stable.
 pub use manager::{ms_since_process_ns, ArvxSceneManager, WalkSnapshot};
 pub use sculpt::SculptApplyResult;
+pub use terrain_halo_refresh::{
+    HaloRefresh, FACE_NX, FACE_NY, FACE_NZ, FACE_PX, FACE_PY, FACE_PZ,
+};
 pub use types::{
     AssetHandle, AssetInfo, FaceInstance, ReloadResult, SkinningAssetData,
     VoxelizeResult,

@@ -134,7 +134,10 @@ pub mod shadow_map_pass;
 pub mod paint;
 
 pub use octree_gpu::OctreeGpu;
-pub use arvx_scene_manager::{AssetHandle, AssetInfo, ReloadResult, ArvxSceneManager, SkinningAssetData};
+pub use arvx_scene_manager::{
+    AssetHandle, AssetInfo, ArvxSceneManager, HaloRefresh, ReloadResult,
+    SkinningAssetData, FACE_NX, FACE_NY, FACE_NZ, FACE_PX, FACE_PY, FACE_PZ,
+};
 pub use viewport_renderer::ViewportRenderer;
 
 /// What a viewport's render pipeline should look like.

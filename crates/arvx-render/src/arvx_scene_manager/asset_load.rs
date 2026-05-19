@@ -121,6 +121,13 @@ impl ArvxSceneManager {
         for &slot in &entry.sculpt_extra_slots {
             self.leaf_attr_pool.deallocate_range(slot, 1);
         }
+        // Same for halo-extra slots (Phase 4.2b cross-tile halo
+        // refresh): empty→solid transitions on a neighbour tile may
+        // have allocated new halo slots outside this asset's bake
+        // range. Free them here.
+        for &slot in &entry.halo_extra_slots {
+            self.leaf_attr_pool.deallocate_range(slot, 1);
+        }
         for id in entry.brick_start..(entry.brick_start + entry.brick_count) {
             self.brick_pool.deallocate(id);
         }
@@ -848,6 +855,7 @@ impl ArvxSceneManager {
             clusters_dirty: true,
             cluster_spatial_index,
             sculpt_extra_slots: std::collections::HashSet::new(),
+            halo_extra_slots: std::collections::HashSet::new(),
             // Disk-loaded non-terrain assets have no halo by
             // construction; the slice stays empty. Terrain tiles
             // populate this through `integrate_baked_tile`. Phase 4.4
