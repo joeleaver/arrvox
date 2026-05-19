@@ -36,6 +36,13 @@ pub enum EngineCommand {
     /// Spawn a spot light.
     SpawnSpotLight,
 
+    /// Spawn the Terrain singleton. If a Terrain entity already
+    /// exists in the scene the command is rejected (logs to console);
+    /// to replace, delete the existing one first. Phase 2 spawns with
+    /// defaults (FBM `TerrainFn`, 16×16×4 bounded grid, Tier-2 voxels,
+    /// 192 m render radius); Phase 9 adds Inspector / preset support.
+    SpawnTerrain,
+
     /// Spawn a generator-driven entity. `generator_name` must match a
     /// registered generator from the gameplay dylib. The entity gets a
     /// Transform, EditorMetadata, GeneratorState, and a default instance

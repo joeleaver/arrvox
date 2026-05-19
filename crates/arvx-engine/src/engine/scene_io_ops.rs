@@ -318,6 +318,17 @@ impl EngineState {
                             continue; // handled in the fourth pass below
                         }
                         if let Some(entry) = self.registry.get(comp_name) {
+                            // Diagnostic: a registered component whose
+                            // hecs layout has gone insane (huge size,
+                            // bad align) panics inside `insert_one`
+                            // with a `LayoutError` and no context.
+                            // Log the about-to-insert name so a crash
+                            // report tells us which component to
+                            // investigate. Stays in place — cheap.
+                            eprintln!(
+                                "[scene-load] restoring component '{}' on '{}'",
+                                comp_name, obj.name,
+                            );
                             if let Err(e) = (entry.deserialize_insert)(&mut self.world, entity, json) {
                                 self.console.warn(format!(
                                     "Failed to restore component '{comp_name}' on '{}': {e}",
@@ -466,6 +477,18 @@ impl EngineState {
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf());
         for (entity, (transform, meta)) in self.world.query::<(&Transform, &EditorMetadata)>().iter() {
+            // Skip runtime-spawned terrain tile entities. Phase 2
+            // doesn't persist tiles — they regenerate from the
+            // Terrain entity's `TerrainFn` on next load. The Terrain
+            // entity itself has no `TerrainTile` component, so the
+            // singleton still flows through normal save.
+            if self
+                .world
+                .get::<&arvx_terrain::TerrainTile>(entity)
+                .is_ok()
+            {
+                continue;
+            }
             let renderable = self.world.get::<&Renderable>(entity).ok();
             let parent = self.world.get::<&Parent>(entity).ok();
             let point_light = self.world.get::<&PointLight>(entity).ok();

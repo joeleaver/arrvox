@@ -13,3 +13,4 @@ hecs = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+crossbeam = { workspace = true }

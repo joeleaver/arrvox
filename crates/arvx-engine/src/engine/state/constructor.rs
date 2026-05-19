@@ -240,6 +240,7 @@ impl EngineState {
             // the shader uses the smoothed baked normal via its
             // existing 1-fetch path.
             surfacenet_enabled: false,
+            terrain: None,
         }
     }
 }

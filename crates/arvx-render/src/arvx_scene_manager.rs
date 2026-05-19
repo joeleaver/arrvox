@@ -26,6 +26,7 @@ mod cluster_spatial_index;
 mod manager;
 mod paint;
 mod sculpt;
+mod terrain_integrate;
 mod types;
 mod voxelize;
 

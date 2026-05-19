@@ -351,6 +351,7 @@ dependencies = [
  "arvx-procedural",
  "arvx-render",
  "arvx-runtime",
+ "arvx-terrain",
  "bytemuck",
  "crossbeam",
  "dirs",
@@ -469,6 +470,7 @@ version = "0.1.0"
 dependencies = [
  "arvx-core",
  "bytemuck",
+ "crossbeam",
  "glam 0.29.3",
  "hecs",
  "log",

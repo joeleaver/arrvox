@@ -39,6 +39,7 @@ pub mod scene_io;
 pub mod snapshot;
 pub mod engine;
 pub mod scene_sync;
+pub mod terrain_state;
 pub mod viewport;
 pub mod wireframe_builders;
 

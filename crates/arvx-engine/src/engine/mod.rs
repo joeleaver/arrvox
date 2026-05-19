@@ -39,6 +39,7 @@ mod scene_gpu;
 mod scene_io_ops;
 mod scene_tree_ops;
 mod state_update;
+mod terrain_ops;
 mod tick;
 mod viewport_ops;
 

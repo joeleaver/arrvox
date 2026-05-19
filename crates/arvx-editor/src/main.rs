@@ -153,6 +153,11 @@ fn build_menus(
         .item(MenuItem::new("Camera").on_click({
             let tx = tx.clone();
             move || { let _ = tx.send(arvx_engine::EngineCommand::SpawnCamera); }
+        }))
+        .separator()
+        .item(MenuItem::new("Terrain").on_click({
+            let tx = tx.clone();
+            move || { let _ = tx.send(arvx_engine::EngineCommand::SpawnTerrain); }
         }));
     // Generators live in the Models panel — they're assets, not spawn-
     // menu items. See `ui/panels/models_panel.rs`.

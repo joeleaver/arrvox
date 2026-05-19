@@ -839,6 +839,12 @@ pub(crate) struct EngineState {
     /// Surface-Nets render-time normal reconstruction (POC). Off by
     /// default — flip on via `set_surfacenet_enabled` for A/B.
     pub(crate) surfacenet_enabled: bool,
+
+    /// Per-scene Terrain runtime state. `None` until the user spawns
+    /// a Terrain via `SpawnTerrain`; reset to `None` when the Terrain
+    /// is removed. Phase 2 ships exactly one Terrain per scene
+    /// (singleton enforced in the `SpawnTerrain` handler).
+    pub(crate) terrain: Option<Box<crate::terrain_state::TerrainRuntime>>,
 }
 
 impl EngineState {

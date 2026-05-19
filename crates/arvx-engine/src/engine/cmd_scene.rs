@@ -203,6 +203,45 @@ impl EngineState {
                 self.console.info(format!("Spawned '{name}'"));
             }
 
+            EngineCommand::SpawnTerrain => {
+                use crate::components::*;
+                use arvx_terrain::Terrain;
+                // Phase 2 singleton enforcement: reject if a Terrain
+                // component is already present anywhere in the world.
+                let existing: Option<hecs::Entity> = self
+                    .world
+                    .query::<&Terrain>()
+                    .iter()
+                    .next()
+                    .map(|(e, _)| e);
+                if let Some(_e) = existing {
+                    self.console.warn(
+                        "Terrain already exists in this scene — delete the existing Terrain first.".to_string(),
+                    );
+                    return Ok(());
+                }
+                let name = self.unique_name("Terrain");
+                // Terrain authors place tiles at the world origin; the
+                // node's own transform stays at identity. Tile entities
+                // get their world transforms from their `TileKey::origin_world`,
+                // not from the Terrain node's Transform.
+                let transform = Transform::default();
+                let entity = self.world.spawn((
+                    transform,
+                    EditorMetadata { name: name.clone() },
+                    Terrain::default(),
+                ));
+                self.assign_entity_uuid(entity);
+                self.scene_dirty.mark_entity(entity);
+                self.selected_entity = Some(entity);
+                self.terrain = Some(Box::new(
+                    crate::terrain_state::TerrainRuntime::new(entity),
+                ));
+                self.console.info(format!(
+                    "Spawned '{name}' — streamer running with 2 workers, render radius 192 m"
+                ));
+            }
+
             EngineCommand::SpawnCamera => {
                 use crate::components::*;
                 let name = self.unique_name("Camera");
@@ -557,8 +596,7 @@ impl EngineState {
                                 self.publish_phase(Some(mk(ProjectLoadPhase::ScaffoldGameplay, None)));
                                 self.build_gameplay_crate(&crate_dir);
                             }
-                            super::gameplay_ops::ScaffoldOutcome::UpToDate
-                            | super::gameplay_ops::ScaffoldOutcome::Failed => {}
+                            super::gameplay_ops::ScaffoldOutcome::Failed => {}
                         }
 
                         self.publish_phase(Some(mk(ProjectLoadPhase::ImportingMeshes, None)));
@@ -627,8 +665,7 @@ impl EngineState {
                                 self.publish_phase(Some(mk(ProjectLoadPhase::ScaffoldGameplay, None)));
                                 self.build_gameplay_crate(&crate_dir);
                             }
-                            super::gameplay_ops::ScaffoldOutcome::UpToDate
-                            | super::gameplay_ops::ScaffoldOutcome::Failed => {}
+                            super::gameplay_ops::ScaffoldOutcome::Failed => {}
                         }
 
                         // `scene_path` must be set BEFORE loading so

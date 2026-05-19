@@ -1,17 +1,25 @@
 //! `Terrain` ECS component — singleton per scene.
 //!
 //! Phase 1: just the struct, not yet wired into any scene/inspector.
+//! Phase 2: gains `terrain_fn` + `render_radius_m`, consumed by the
+//! `TileStreamer` to materialise tiles around the camera.
 //! Phase 9 (editor integration) registers it with the editor and wires
 //! the Inspector / viewport toolbar / save-scene path.
 
 use crate::bounds::TerrainBounds;
+use crate::fbm::FbmTerrainFn;
+use crate::terrain_fn::TerrainFn;
+use std::sync::Arc;
 
 /// Per-scene terrain feature. Singleton enforced by the editor.
 ///
 /// Carries the configuration that determines tile materialisation:
-/// world bounds, base voxel-size tier, and (in later phases) the
-/// `TerrainFn`, stamps, and streaming policies.
-#[derive(Debug, Clone, Copy)]
+/// world bounds, base voxel-size tier, the procedural `TerrainFn`
+/// source, and (in later phases) stamps and streaming policies.
+///
+/// Phase 2 dropped `Copy` in favour of `Clone`; `Arc<dyn TerrainFn>`
+/// makes clones cheap.
+#[derive(Clone)]
 pub struct Terrain {
     /// World extent. Defaults to a 16 × 16 × 4 bounded grid; toggle to
     /// `Unbounded` for true infinite procedural worlds.
@@ -21,6 +29,29 @@ pub struct Terrain {
     /// the unified pow2 table). The V2 LOD pyramid walks one tier
     /// coarser per LOD level (`base_tier + level`).
     pub base_tier: usize,
+    /// Procedural source. Defaults to a vanilla [`FbmTerrainFn`].
+    /// Phase 9 will swap this from the Inspector; Phase 5 swaps it on
+    /// stamps-change. `Arc` makes job submission cheap.
+    pub terrain_fn: Arc<dyn TerrainFn>,
+    /// Camera-centric residency radius in metres. Tiles whose centre
+    /// is within this distance from the camera (and inside bounds)
+    /// are materialised; tiles beyond are evicted.
+    ///
+    /// Default 192 m ≈ a 3-tile radius around the camera. Small enough
+    /// to make tile streaming visible in a normal editor session,
+    /// large enough that motion doesn't constantly trip eviction.
+    pub render_radius_m: f32,
+}
+
+impl std::fmt::Debug for Terrain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Terrain")
+            .field("bounds", &self.bounds)
+            .field("base_tier", &self.base_tier)
+            .field("render_radius_m", &self.render_radius_m)
+            .field("terrain_fn", &"<Arc<dyn TerrainFn>>")
+            .finish()
+    }
 }
 
 impl Default for Terrain {
@@ -28,6 +59,8 @@ impl Default for Terrain {
         Self {
             bounds: TerrainBounds::default(),
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
+            terrain_fn: Arc::new(FbmTerrainFn::default()),
+            render_radius_m: 192.0,
         }
     }
 }

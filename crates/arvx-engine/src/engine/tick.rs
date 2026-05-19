@@ -80,6 +80,11 @@ pub(crate) fn tick_loop(
         // bake pump because both flow through the same worker.
         state.tick_generators();
 
+        // 1b4. Terrain streamer — materialise tiles around the camera,
+        // integrate completed bakes, evict tiles outside the radius.
+        // No-op when no Terrain is spawned.
+        state.tick_terrain_streamer();
+
         // 1c. Step gameplay systems + physics if in play mode.
         //
         // Frame order: Update → flush → FixedUpdate → flush → Physics → LateUpdate → flush
