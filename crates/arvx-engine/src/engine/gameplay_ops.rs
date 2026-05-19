@@ -13,13 +13,15 @@ use super::state::EngineState;
 /// "Building gameplay scripts" loading-panel phase on a clean re-open
 /// where nothing actually compiles.
 pub(crate) enum ScaffoldOutcome {
-    /// Scaffolding succeeded and a `cargo build` is required (either a
-    /// source file changed, the dylib is missing, or this is the first
-    /// build of the project).
+    /// Scaffolding succeeded and a `cargo build` is required. Today
+    /// this is always returned on success — `arvx-engine` source
+    /// changes invalidate the dylib's ABI but never touch the
+    /// scaffold-written files, so the "skip cargo when no scaffold
+    /// drift" path was unsafe (the load would attempt to use an
+    /// ABI-mismatched dylib's `ComponentEntry`s, panicking inside
+    /// hecs with a `LayoutError`). Cargo's own fingerprint check
+    /// handles the actual no-op case fast (~100 ms).
     BuildNeeded(std::path::PathBuf),
-    /// Scaffolding succeeded; the existing dylib is up to date and was
-    /// loaded directly. No cargo invocation occurred.
-    UpToDate,
     /// Scaffolding itself failed — the error has been logged to the
     /// console. Callers treat this like "no gameplay" and continue.
     Failed,
@@ -46,17 +48,22 @@ impl EngineState {
         let _ = std::fs::create_dir_all(scripts_dir.join("systems"));
 
         match crate::scaffold::generate_gameplay_crate(&project_dir) {
-            Ok((crate_dir, any_changed)) => {
-                let dylib_path = crate::scaffold::gameplay_dylib_path(&project_dir);
-                if any_changed || !dylib_path.exists() {
-                    ScaffoldOutcome::BuildNeeded(crate_dir)
-                } else {
-                    // Dylib already present and no source drift — load
-                    // it directly. Keeps the loading panel from
-                    // flashing the cargo phase on every project re-open.
-                    self.load_gameplay_dylib(&dylib_path);
-                    ScaffoldOutcome::UpToDate
-                }
+            Ok((crate_dir, _any_changed)) => {
+                // Always invoke cargo. The old "skip cargo if no
+                // scaffold drift and dylib exists" optimization was
+                // only correct when the gameplay source was the sole
+                // dylib input — but the dylib also depends on
+                // arvx-engine + arvx-macros via path-deps, and a
+                // change to *those* must trigger a rebuild. Cargo's
+                // own fingerprinting handles the no-op case fast
+                // (~100 ms when truly up-to-date); the cost of
+                // loading a stale dylib is much worse — the dylib's
+                // `ComponentEntry`s carry layout info from the build
+                // ABI, and a mismatch with the host's hecs typing
+                // poisons the World on first `insert_one` (see
+                // hecs::archetype::grow LayoutError; the failure
+                // mode is a hard abort with no recovery).
+                ScaffoldOutcome::BuildNeeded(crate_dir)
             }
             Err(e) => {
                 self.console.error(format!("Scaffold failed: {e}"));
@@ -75,19 +82,26 @@ impl EngineState {
             ScaffoldOutcome::BuildNeeded(crate_dir) => {
                 self.build_gameplay_crate(&crate_dir);
             }
-            ScaffoldOutcome::UpToDate | ScaffoldOutcome::Failed => {}
+            ScaffoldOutcome::Failed => {}
         }
     }
 
     /// Build the scaffolded gameplay crate and load the resulting dylib.
+    ///
+    /// Profile-matches the host: a debug-built editor builds the dylib
+    /// in debug too. Hecs's internal layout (Archetype, TypeInfo)
+    /// differs between cargo profiles; loading a release dylib into a
+    /// debug host (or vice versa) corrupts archetype state on first
+    /// `insert_one<T>` and abort the engine thread with `LayoutError`.
     pub(crate) fn build_gameplay_crate(&mut self, crate_dir: &std::path::Path) {
         self.console.info("Building gameplay scripts...");
-        let output = std::process::Command::new("cargo")
-            .arg("build")
-            .arg("--release")
-            .arg("--manifest-path")
-            .arg(crate_dir.join("Cargo.toml"))
-            .output();
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.arg("build");
+        if !cfg!(debug_assertions) {
+            cmd.arg("--release");
+        }
+        cmd.arg("--manifest-path").arg(crate_dir.join("Cargo.toml"));
+        let output = cmd.output();
 
         match output {
             Ok(out) if out.status.success() => {

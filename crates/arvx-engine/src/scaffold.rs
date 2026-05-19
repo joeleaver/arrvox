@@ -45,10 +45,22 @@ pub fn gameplay_crate_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(CACHE_DIR).join(GAMEPLAY_CRATE)
 }
 
-/// Path to the built dylib for a project.
+/// Cargo target subdirectory for the dylib, matching the host's
+/// current build profile. **Must** track the host because hecs
+/// changes its internal `Archetype` / `TypeInfo` field layout
+/// between profiles — a debug host loading a release dylib (or vice
+/// versa) lets the dylib's monomorphized `World::insert_one<T>`
+/// write through layouts the host's hecs disagrees with, corrupting
+/// archetype state and panicking with `LayoutError` deep in
+/// `Archetype::grow`.
+pub fn gameplay_target_subdir() -> &'static str {
+    if cfg!(debug_assertions) { "debug" } else { "release" }
+}
+
+/// Path to the built dylib for a project, profile-matched to the host.
 pub fn gameplay_dylib_path(project_dir: &Path) -> PathBuf {
     let crate_dir = gameplay_crate_dir(project_dir);
-    let target_dir = crate_dir.join("target/release");
+    let target_dir = crate_dir.join("target").join(gameplay_target_subdir());
     if cfg!(target_os = "linux") {
         target_dir.join("libgameplay.so")
     } else if cfg!(target_os = "macos") {
@@ -233,9 +245,12 @@ hecs = "0.10"
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 
-# Must match editor's release profile — hecs layout changes between debug/release.
-[profile.release]
-opt-level = 1
+# Do NOT override [profile.*] here. The dylib must use cargo's default
+# settings for whichever profile the host runs under, so its hecs
+# `Archetype` / `TypeInfo` field layout matches the host's. An
+# opt-level override on the dylib while the host uses cargo defaults
+# (debug=0, release=3) produces a silent ABI mismatch — symptom is
+# `LayoutError` in `Archetype::grow` deep inside `insert_one<T>`.
 "#,
         procedural = procedural_path.display(),
     )
