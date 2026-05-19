@@ -49,5 +49,5 @@ pub use scene_node::{SdfPrimitive, SpatialHandle, Transform};
 pub use sdf_primitive::evaluate_primitive;
 pub use sparse_octree::SparseOctree;
 pub use voxel::VoxelSample;
-pub use voxelize_octree::{voxelize_to_artifact, BakeArtifact};
+pub use voxelize_octree::{pad_to_pow2_cubic, validate_pow2_cubic, voxelize_to_artifact, BakeArtifact};
 pub use world_position::WorldPosition;

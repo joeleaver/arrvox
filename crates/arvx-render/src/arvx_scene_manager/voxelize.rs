@@ -39,10 +39,12 @@ impl ArvxSceneManager {
 
         let half_extents = primitive_half_extents(primitive) * bake_scale;
         let margin = voxel_size * 8.0 * 1.8 + voxel_size;
-        let aabb = arvx_core::Aabb::new(
+        let natural_aabb = arvx_core::Aabb::new(
             -half_extents - glam::Vec3::splat(margin),
             half_extents + glam::Vec3::splat(margin),
         );
+        // voxelize_octree requires a pow2-cubic-aligned AABB. Pad up.
+        let aabb = arvx_core::pad_to_pow2_cubic(&natural_aabb, voxel_size);
 
         // SDF closure passed directly to the voxelizer. Negative = inside.
         let sdf_fn: Box<dyn Fn(glam::Vec3) -> f32> = match primitive {
@@ -92,11 +94,13 @@ impl ArvxSceneManager {
             base_voxel_size: handle.base_voxel_size,
         };
 
-        let geometry_aabb = arvx_core::Aabb::new(-half_extents, half_extents);
+        // Asset's reported AABB is the padded octree footprint, not
+        // the primitive's tight bounds. Renderer culling / spatial
+        // index queries depend on this matching the octree extent.
         Some(VoxelizeResult {
             spatial,
             voxel_size,
-            aabb: geometry_aabb,
+            aabb,
             grid_origin: r.grid_origin,
             voxel_count: r.voxel_count,
             leaf_attr_slot_start: r.leaf_attr_slot_start,

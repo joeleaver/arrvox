@@ -1,0 +1,15 @@
+[package]
+name = "arvx-terrain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Streamed editable voxel terrain for the Arrvox engine: tile-octree, halo seams, sculpt/paint integration"
+
+[dependencies]
+arvx-core = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+hecs = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }

@@ -90,8 +90,16 @@ pub struct VoxelizeOctreeResult {
 /// a float blend (`0.0..1.0`) should quantize via
 /// `(b * 15.0).round().clamp(0.0, 15.0) as u8`.
 ///
-/// `aabb`: world-space bounding box of the object.
-/// `base_voxel_size`: voxel size at the finest level.
+/// `aabb`: world-space bounding box of the object. **Must be cubic
+/// (all three axes equal extent) AND `extent / base_voxel_size` must
+/// be a power of 2.** The function returns `None` and logs an error
+/// otherwise. Callers with arbitrary mesh bounds should pre-align via
+/// [`pad_to_pow2_cubic`]. See `arvx_core::constants::RESOLUTION_TIERS`
+/// for the engine-wide pow2-aligned voxel-size table.
+///
+/// `base_voxel_size`: voxel size at the finest level. Should come from
+/// the unified tier table for grid-snap compatibility, though any
+/// value that makes the AABB pow2-cubic-aligned is accepted.
 pub fn voxelize_octree<F>(
     mut sdf_fn: F,
     aabb: &Aabb,
@@ -102,15 +110,25 @@ pub fn voxelize_octree<F>(
 where
     F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
 {
-    let aabb_size = aabb.max - aabb.min;
-    let max_dim = aabb_size.x.max(aabb_size.y).max(aabb_size.z);
-
-    // Depth is the smallest power of 2 that covers the AABB in voxels.
-    let voxels_needed = (max_dim / base_voxel_size).ceil().max(1.0) as u32;
-    let depth = if voxels_needed <= 1 {
-        1
-    } else {
-        (32 - (voxels_needed - 1).leading_zeros()) as u8
+    // Strict contract: AABB must be a cube whose extent equals
+    // `(2^depth) * base_voxel_size` for some `depth`. This was loosened
+    // pre-unification (the function silently rounded extent up to a
+    // power-of-2 of voxels and re-centred the octree on the AABB), but
+    // the resulting hidden padding broke voxel-aligned grid-snap and
+    // any system that expected the octree extent to match the asset's
+    // declared AABB. Now the caller MUST pre-align. See
+    // `arvx_core::constants::RESOLUTION_TIERS` for the engine-wide
+    // pow2-aligned tier table.
+    let depth = match validate_pow2_cubic(aabb, base_voxel_size) {
+        Some(d) => d,
+        None => {
+            log::error!(
+                "voxelize_octree: AABB not pow2-cubic-aligned to voxel_size={base_voxel_size}: \
+                 extent={:?}. Callers must pre-pad — see `arvx_core::constants::RESOLUTION_TIERS`.",
+                aabb.max - aabb.min,
+            );
+            return None;
+        }
     };
 
     let t_start = std::time::Instant::now();
@@ -131,10 +149,10 @@ where
     let leaf_attr_slot_start = leaf_attr_pool.allocated_count();
     let mut brick_ids: Vec<u32> = Vec::new();
 
-    // Center the octree on the AABB.
-    let extent = octree.extent_world();
-    let aabb_center = (aabb.min + aabb.max) * 0.5;
-    let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
+    // Post-validation, octree extent equals AABB extent exactly —
+    // no centring math, no hidden padding. The octree's lo corner
+    // is the AABB's lo corner.
+    let grid_origin = aabb.min;
 
     // Bricks terminate the octree `BRICK_LEVELS` levels above
     // max_depth. For a tree at or below that depth, the entire octree
@@ -358,9 +376,56 @@ fn push_cell_samples(out: &mut Vec<Vec3>, cell_center: Vec3, eps: f32) {
 
 
 
-/// Convenience: voxelize a sphere into a sparse octree. Wraps the
-/// per-point SDF in a trivial batching adapter so we keep the one
-/// canonical voxelize_octree signature.
+/// Returns the octree depth for an AABB that satisfies the pow2-cubic
+/// contract, or `None` if it doesn't. Pure validation — no side effects.
+pub fn validate_pow2_cubic(aabb: &Aabb, voxel_size: f32) -> Option<u8> {
+    let extent = aabb.max - aabb.min;
+    // Cubic: x == y == z within voxel-tolerance.
+    let tol = voxel_size * 0.01;
+    if (extent.x - extent.y).abs() > tol || (extent.x - extent.z).abs() > tol {
+        return None;
+    }
+    let cells = extent.x / voxel_size;
+    let cells_int = cells.round() as i64;
+    if cells_int < 1 || (cells - cells_int as f32).abs() > 0.01 {
+        return None;
+    }
+    let cells_u32 = cells_int as u32;
+    if !cells_u32.is_power_of_two() {
+        return None;
+    }
+    Some(cells_u32.trailing_zeros() as u8)
+}
+
+/// Round an arbitrary AABB up to a pow2-cubic AABB aligned to
+/// `voxel_size`. The returned AABB always contains the input, is
+/// cubic, and has `extent / voxel_size` equal to a power of 2 — i.e.,
+/// the contract `voxelize_octree` requires. `aabb.min` snaps to the
+/// nearest lower multiple of `voxel_size` so adjacent assets / tiles
+/// with the same voxel size land on a shared world grid.
+///
+/// Use this when you have a natural mesh AABB and need to feed it to
+/// [`voxelize_octree`]. Terrain doesn't need it — terrain tile AABBs
+/// are pow2-cubic-aligned by construction.
+pub fn pad_to_pow2_cubic(aabb: &Aabb, voxel_size: f32) -> Aabb {
+    // Snap min down to the nearest voxel-grid line for shared-grid
+    // alignment across assets.
+    let snap = |v: f32| (v / voxel_size).floor() * voxel_size;
+    let min = Vec3::new(snap(aabb.min.x), snap(aabb.min.y), snap(aabb.min.z));
+
+    let raw_extent = aabb.max - min;
+    let max_dim = raw_extent.x.max(raw_extent.y).max(raw_extent.z);
+    let cells_needed = (max_dim / voxel_size).ceil().max(1.0) as u32;
+    let pow2_cells = cells_needed.next_power_of_two();
+    let cubic_extent = pow2_cells as f32 * voxel_size;
+    Aabb {
+        min,
+        max: min + Vec3::splat(cubic_extent),
+    }
+}
+
+/// Convenience: voxelize a sphere into a sparse octree. Pre-aligns the
+/// AABB to satisfy `voxelize_octree`'s pow2-cubic contract.
 pub fn voxelize_sphere_octree(
     center: Vec3,
     radius: f32,
@@ -370,10 +435,11 @@ pub fn voxelize_sphere_octree(
     brick_pool: &mut BrickPool,
 ) -> Option<VoxelizeOctreeResult> {
     let padding = voxel_size * 2.0;
-    let aabb = Aabb {
+    let natural = Aabb {
         min: center - Vec3::splat(radius + padding),
         max: center + Vec3::splat(radius + padding),
     };
+    let aabb = pad_to_pow2_cubic(&natural, voxel_size);
 
     let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
         positions

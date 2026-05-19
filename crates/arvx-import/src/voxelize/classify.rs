@@ -28,20 +28,28 @@ use crate::sample::texture::sample_texture_at_triangle;
 use crate::skeleton::VertexSkinning;
 
 /// Tier-based auto voxel-size picker. Chooses the coarsest tier that
-/// still resolves the longest axis with at least 8 bricks. Matches
-/// the editor's tier table so auto + manual imports stay in sync.
+/// still resolves the longest axis with at least 8 bricks. Sourced
+/// from the unified `arvx_core::constants::RESOLUTION_TIERS` so auto
+/// + manual imports stay in sync with terrain and any future
+/// voxel-grid-snap features. Iterates fine-to-coarse and returns the
+/// finest tier that meets the brick budget (or the finest tier
+/// available if nothing does).
 pub fn auto_voxel_size(aabb: &Aabb) -> f32 {
-    const TIERS: [f32; 4] = [0.005, 0.02, 0.08, 0.32];
+    use arvx_core::constants::RESOLUTION_TIERS;
     let extent = aabb.max - aabb.min;
     let longest = extent.x.max(extent.y).max(extent.z);
-    for &vs in &TIERS {
-        let brick_world = vs * BRICK_DIM as f32;
+    // Walk coarse → fine; return the first (coarsest) tier whose
+    // bricks-on-longest-axis count satisfies the budget.
+    for tier in RESOLUTION_TIERS.iter().rev() {
+        let brick_world = tier.voxel_size * BRICK_DIM as f32;
         let bricks_on_longest = (longest / brick_world).ceil() as u32;
         if bricks_on_longest >= 8 {
-            return vs;
+            return tier.voxel_size;
         }
     }
-    TIERS[0]
+    // Nothing in the table satisfied 8-brick min (tiny mesh) — fall
+    // back to the finest available tier so detail is preserved.
+    RESOLUTION_TIERS[RESOLUTION_TIERS.len() - 1].voxel_size
 }
 
 /// A brick scheduled for per-voxel sampling. `brick_min` is the

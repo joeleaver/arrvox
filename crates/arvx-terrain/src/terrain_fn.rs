@@ -1,0 +1,93 @@
+//! Procedural source for terrain — Layer 1 of the three-layer model.
+//!
+//! `TerrainFn::sample` takes a `(TileKey, local, voxel_size)` triple
+//! and returns a `TerrainSample`. The integer tile key seeds any noise
+//! lookups deterministically across the whole world; the local f32
+//! stays bounded inside one tile so noise inputs never collapse
+//! precision at large world coords.
+
+use crate::tile_key::TileKey;
+use glam::Vec3;
+
+/// One sample of the procedural terrain source at a leaf cell.
+///
+/// `sd` follows the engine SDF convention: negative inside the
+/// surface, positive outside, zero on the surface. The 1-Lipschitz
+/// property of a true SDF is what makes the voxelizer's coarse-level
+/// Empty/Interior classifier provably correct — implementations must
+/// return a real signed distance, not just a sign-correct field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerrainSample {
+    /// Signed distance to the terrain surface.
+    pub sd: f32,
+    /// Primary material id (16-bit; matches `arvx-core`'s palette).
+    pub primary_mat: u16,
+    /// Secondary material id for dual-material blending. Same value as
+    /// `primary_mat` when no blend is wanted.
+    pub secondary_mat: u16,
+    /// Blend weight in `[0, 1]` between primary (0.0) and secondary
+    /// (1.0). Quantised to 4 bits inside the voxelizer; pass `0.0` for
+    /// single-material output.
+    pub blend: f32,
+}
+
+/// Procedural terrain source. Implementations are user-supplied.
+///
+/// Sampled in tile-local coordinates so noise impls can seed on the
+/// integer `TileKey` and never collapse f32 precision at large world
+/// coordinates — see `docs/TERRAIN.md`'s "Floating-point handling"
+/// section.
+pub trait TerrainFn: Send + Sync {
+    /// Evaluate the source at one leaf cell.
+    ///
+    /// * `tile` — the key for the tile this sample is inside. Stable
+    ///   integer across the world; seed noise lookups on this.
+    /// * `local` — the sample's position relative to the tile's lo
+    ///   corner, in metres. Always in `[0, tile.extent_m())` plus the
+    ///   gradient-tap epsilon, regardless of how far the tile is from
+    ///   the world origin.
+    /// * `voxel_size_m` — the voxel size used for this tile's
+    ///   voxelization, in metres. Implementations can use it to pick
+    ///   an appropriate noise frequency for the resolution.
+    fn sample(&self, tile: TileKey, local: Vec3, voxel_size_m: f32) -> TerrainSample;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FlatPlane;
+
+    impl TerrainFn for FlatPlane {
+        fn sample(&self, _tile: TileKey, local: Vec3, _voxel_size_m: f32) -> TerrainSample {
+            TerrainSample {
+                sd: local.y - 5.0,
+                primary_mat: 1,
+                secondary_mat: 1,
+                blend: 0.0,
+            }
+        }
+    }
+
+    #[test]
+    fn flat_plane_returns_expected_sd() {
+        let f = FlatPlane;
+        let s_below = f.sample(TileKey::level0(0, 0, 0), Vec3::new(0.0, 0.0, 0.0), 0.08);
+        let s_above = f.sample(TileKey::level0(0, 0, 0), Vec3::new(0.0, 10.0, 0.0), 0.08);
+        assert!(s_below.sd < 0.0, "below surface should be negative; got {}", s_below.sd);
+        assert!(s_above.sd > 0.0, "above surface should be positive; got {}", s_above.sd);
+        assert_eq!(s_below.primary_mat, 1);
+    }
+
+    /// Returning the same value for the same input is the determinism
+    /// contract for noise impls.
+    #[test]
+    fn flat_plane_is_deterministic() {
+        let f = FlatPlane;
+        let p = Vec3::new(3.0, 7.0, 11.0);
+        let k = TileKey::level0(42, -7, 13);
+        let a = f.sample(k, p, 0.08);
+        let b = f.sample(k, p, 0.08);
+        assert_eq!(a, b);
+    }
+}

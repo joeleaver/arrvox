@@ -464,6 +464,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "arvx-terrain"
+version = "0.1.0"
+dependencies = [
+ "arvx-core",
+ "bytemuck",
+ "glam 0.29.3",
+ "hecs",
+ "log",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "arvx-testbed"
 version = "0.1.0"
 dependencies = [

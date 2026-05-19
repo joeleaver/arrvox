@@ -392,11 +392,12 @@ fn voxelize_octree_gpu_runs_end_to_end() {
     );
     obj.set_transform(b, Affine3A::from_translation(Vec3::new(-0.25, 0.0, 0.0)));
 
-    let aabb = arvx_core::Aabb {
-        min: Vec3::splat(-0.8),
-        max: Vec3::splat(0.8),
-    };
     let voxel_size = 0.04;
+    // voxelize_octree now requires a pow2-cubic-aligned AABB.
+    let aabb = arvx_core::pad_to_pow2_cubic(
+        &arvx_core::Aabb { min: Vec3::splat(-0.8), max: Vec3::splat(0.8) },
+        voxel_size,
+    );
 
     let mut evaluator = GpuEvaluator::new(&device);
     let instructions = flatten_tree(&obj);
@@ -465,11 +466,11 @@ fn artifact_roundtrip_matches_direct_voxelize() {
         }),
     );
 
-    let aabb = arvx_core::Aabb {
-        min: Vec3::splat(-0.6),
-        max: Vec3::splat(0.6),
-    };
     let voxel_size = 0.04;
+    let aabb = arvx_core::pad_to_pow2_cubic(
+        &arvx_core::Aabb { min: Vec3::splat(-0.6), max: Vec3::splat(0.6) },
+        voxel_size,
+    );
 
     let mut evaluator = GpuEvaluator::new(&device);
     let instructions = flatten_tree(&obj);

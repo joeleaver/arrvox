@@ -130,7 +130,8 @@ fn write_artifact_rkp_roundtrip() {
     use glam::Vec3;
 
     let voxel_size = 0.05;
-    let half = Vec3::splat(0.3);
+    // AABB extent must be pow2 * voxel_size — 0.8 / 0.05 = 16.
+    let half = Vec3::splat(0.4);
     let aabb = crate::Aabb::new(-half, half);
     let radius: f32 = 0.25;
     let sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
