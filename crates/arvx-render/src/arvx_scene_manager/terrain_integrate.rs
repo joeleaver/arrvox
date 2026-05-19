@@ -251,6 +251,26 @@ impl ArvxSceneManager {
             }
         }
 
+        // ── Halo cells ─────────────────────────────────────────────────
+        // Phase 3 baked halo cell coords + their file-local
+        // leaf_attr_id slots. Relocate the slot ids by
+        // `leaf_attr_slot_start` (same shift the leaf/brick nodes get
+        // above) so the stored map references the asset's scene-pool
+        // slots. `CELL_INTERIOR` halo cells stay as-is — they're a
+        // sentinel, not an index.
+        let halo_cells: Vec<(glam::IVec3, u32)> = artifact
+            .halo_cells
+            .iter()
+            .map(|&(coord, slot)| {
+                let relocated = if slot == arvx_core::mesh_extract::CELL_INTERIOR {
+                    slot
+                } else {
+                    leaf_attr_slot_start + slot
+                };
+                (coord, relocated)
+            })
+            .collect();
+
         // ── Cluster spatial index ──────────────────────────────────────
         let mut cluster_spatial_index =
             super::cluster_spatial_index::ClusterSpatialIndex::new();
@@ -308,6 +328,7 @@ impl ArvxSceneManager {
             mesh_dirty: true,
             clusters_dirty: true,
             cluster_spatial_index,
+            halo_cells,
         };
 
         let info = entry.info();

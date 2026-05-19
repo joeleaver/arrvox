@@ -840,6 +840,12 @@ impl ArvxSceneManager {
             mesh_dirty: true,
             clusters_dirty: true,
             cluster_spatial_index,
+            // Disk-loaded non-terrain assets have no halo by
+            // construction; the slice stays empty. Terrain tiles
+            // populate this through `integrate_baked_tile`. Phase 4.4
+            // (.arvxtile load) will revisit this for tiles loaded
+            // from disk.
+            halo_cells: Vec::new(),
         })
     }
 

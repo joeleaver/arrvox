@@ -199,6 +199,24 @@ pub(super) struct AssetEntry {
     /// mesh re-extract + incrementally updated on patch-cluster
     /// append. See `cluster_spatial_index.rs`.
     pub(super) cluster_spatial_index: super::cluster_spatial_index::ClusterSpatialIndex,
+    /// Terrain Phase 4: per-cell halo data carried from the original
+    /// bake.
+    ///
+    /// Each entry maps an octree-frame coord OUTSIDE the nominal
+    /// `[0, S)³` cube to a `leaf_attr_id` (or [`CELL_INTERIOR`] for
+    /// halo cells classified bulk-solid). For terrain tiles this is
+    /// populated by `integrate_baked_tile` (the slot ids are scene-
+    /// pool-relocated to match the asset's leaf-attr range). For
+    /// disk-loaded non-terrain assets the vec is empty — they have
+    /// no halo by construction.
+    ///
+    /// **Used by sculpt:** the per-cluster re-extract folds these
+    /// cells into the local cell grid so SN-cubes at a tile boundary
+    /// see valid 8-corner classification. Without this, sculpting a
+    /// boundary cluster regresses its seam quads — the original bake
+    /// had halo data, the re-extract didn't, the new cluster's
+    /// boundary cubes diverge from the neighbour's.
+    pub(super) halo_cells: Vec<(glam::IVec3, u32)>,
 }
 
 impl AssetEntry {
@@ -747,6 +765,7 @@ mod slab_tests {
             clusters_dirty: false,
             cluster_spatial_index:
                 crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
+            halo_cells: Vec::new(),
         }
     }
 
@@ -947,6 +966,7 @@ mod slab_tests {
             clusters_dirty: false,
             cluster_spatial_index:
                 crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
+            halo_cells: Vec::new(),
         };
         let grid_origin = entry.grid_origin();
         let base_vs = entry.spatial_handle.base_voxel_size;

@@ -751,6 +751,56 @@ pub fn extract_mesh_region_from_cells_pooled(
     leaf_attr_pool: &[LeafAttr],
     bone_voxel_pool: &[BoneVoxel],
 ) -> (Vec<MeshVertex>, Vec<u32>) {
+    extract_mesh_region_from_cells_pooled_haloed(
+        scratch,
+        cells,
+        region_min,
+        region_max,
+        octree_nodes,
+        octree_depth,
+        base_voxel_size,
+        grid_origin,
+        brick_cells,
+        leaf_attr_pool,
+        bone_voxel_pool,
+        &[],
+    )
+}
+
+/// Halo-aware variant of [`extract_mesh_region_from_cells_pooled`].
+///
+/// `halo_cells` supplies cells whose coords lie OUTSIDE the asset's
+/// nominal `[0, S)³` cube but still need to participate in SN-cube
+/// corner classification at the tile boundary. Phase 4 terrain sculpt
+/// passes the asset's stored halo cells through here so per-cluster
+/// re-extract at a tile face preserves the watertight seam quads
+/// established at bake time.
+///
+/// The halo cells are folded into the local `cells_grid` exactly like
+/// interior cells (with the same `CELL_INTERIOR → CELL_INTERIOR_GRID`
+/// remap) but never added to `solid_cells` — the boundary cube on the
+/// halo side of the seam is emitted from the interior cell on the
+/// owning side, and the halo cell's role is purely 8-corner data.
+/// This matches the "halo cells iterate as corner data only" rule
+/// from [`extract_surface_mesh_haloed`].
+///
+/// When `halo_cells` is empty this function is bit-identical to
+/// [`extract_mesh_region_from_cells_pooled`].
+#[allow(clippy::too_many_arguments)]
+pub fn extract_mesh_region_from_cells_pooled_haloed(
+    scratch: &mut SculptExtractScratch,
+    cells: &CellMap,
+    region_min: IVec3,
+    region_max: IVec3,
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: Vec3,
+    brick_cells: &[u32],
+    leaf_attr_pool: &[LeafAttr],
+    bone_voxel_pool: &[BoneVoxel],
+    halo_cells: &[(IVec3, u32)],
+) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     if cells.is_empty() {
@@ -834,6 +884,22 @@ pub fn extract_mesh_region_from_cells_pooled(
         }
     }
 
+    // Fold halo cells into the local `cells_grid` for 8-corner data
+    // at the tile boundary. Halo cells whose coords fall outside the
+    // grid bounds are silently dropped by `CellGrid::set` — they
+    // don't influence cubes this region produces. Crucially, halo
+    // cells are NOT added to `solid_cells`: they never iterate as a
+    // quad-emit-from cell. See `extract_surface_mesh_haloed` for the
+    // watertight-seam protocol.
+    for &(coord, slot) in halo_cells {
+        let stored = if slot == CELL_INTERIOR {
+            CELL_INTERIOR_GRID
+        } else {
+            slot
+        };
+        cells_grid.set(coord, stored);
+    }
+
     for &cell in solid_cells.iter() {
         for face in 0..6 {
             let dir = FACE_DIRS[face];
@@ -857,11 +923,38 @@ pub fn extract_mesh_region_from_cells_pooled(
                 quad[i] = match cube_vertex_grid.get(cube) {
                     Some(v) => v,
                     None => {
+                        // Corner-cell lookup: `cells_grid` first; for
+                        // cells outside the grid AND not present as
+                        // halo, fall back to `is_solid_lookup` so
+                        // INTERIOR_NODE-region cells (coarse octree
+                        // branches classified bulk-solid by the BFS,
+                        // never enumerated into the cell map) get
+                        // recognized as solid. Without this fallback,
+                        // terrain re-extract near a surface-vs-bulk
+                        // boundary misclassifies INTERIOR_NODE
+                        // corners as empty and emits a spurious shelf
+                        // a few voxels below the actual surface — the
+                        // same latent bug Phase 3 fixed in the global
+                        // `extract_surface_mesh_haloed` corner
+                        // lookup.
                         let vertex = build_cube_vertex(
                             cube,
                             |c| match cells_grid.get(c) {
                                 Some(CELL_INTERIOR_GRID) => Some(CELL_INTERIOR),
-                                other => other,
+                                Some(v) => Some(v),
+                                None => {
+                                    if is_solid_lookup(
+                                        octree_nodes,
+                                        brick_cells,
+                                        octree_depth,
+                                        c,
+                                        extent,
+                                    ) {
+                                        Some(CELL_INTERIOR)
+                                    } else {
+                                        None
+                                    }
+                                }
                             },
                             base_voxel_size,
                             grid_origin,

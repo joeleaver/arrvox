@@ -29,7 +29,8 @@ use glam::{Affine3A, IVec3, Vec3};
 use arvx_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aabb};
 use arvx_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use arvx_core::mesh_extract::{
-    collect_cell_map_in_region, extract_mesh_region_from_cells_pooled, extract_surface_mesh,
+    collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
+    extract_surface_mesh,
 };
 use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sculpt::{
@@ -998,7 +999,12 @@ impl ArvxSceneManager {
 
         let (brush_verts, brush_indices) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
-            extract_mesh_region_from_cells_pooled(
+            // Halo-aware variant: for terrain tiles the entry carries
+            // halo cells from the original bake, so boundary cubes in
+            // the re-extract see the same 8-corner classification the
+            // initial mesh did. Non-terrain assets pass an empty slice
+            // → bit-identical to the pre-Phase-4 non-halo path.
+            extract_mesh_region_from_cells_pooled_haloed(
                 &mut self.sculpt_extract_scratch,
                 &cells,
                 brush_lo,
@@ -1010,6 +1016,7 @@ impl ArvxSceneManager {
                 self.brick_pool.as_slice(),
                 self.leaf_attr_pool.as_slice(),
                 self.leaf_attr_pool.bones_as_slice(),
+                &entry.halo_cells,
             )
         };
         let _p_extract_mesh_ms = _ph_t3b.elapsed().as_secs_f64() * 1000.0;
@@ -1441,6 +1448,7 @@ mod tests {
             dag_consumed: Vec::new(),
             dag_produced: Vec::new(),
             cpu_octree: SparseOctree::new(depth, base_vs),
+            halo_cells: Vec::new(),
             mesh_dirty: false,
             clusters_dirty: false,
             cluster_spatial_index,
