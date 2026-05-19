@@ -506,12 +506,29 @@ impl ArvxSceneManager {
         // Write LeafAttrs for newly-allocated slots. The brush picks
         // the material; the normal is the post-stamp 6-tap gradient
         // computed in apply_delta.
+        //
+        // Track slots that landed OUTSIDE the asset's bake-time
+        // `[leaf_attr_slot_start, +leaf_attr_slot_count)` range. The
+        // pool's `allocate()` may return slots from anywhere in the
+        // global pool's free-list, and on a fresh asset (no prior
+        // frees from this asset) it allocates from the bump pointer
+        // — past the asset's tail. Without this tracking, paint's
+        // slot-range check silently drops every sculpt-extended cell
+        // (the bug "paint stops working after sculpt"), and
+        // `release_asset` leaks these slots since it only
+        // deallocates the contiguous bake range.
         for (slot, attrs) in &applied.allocated_slots {
             *self.leaf_attr_pool.get_mut(*slot) = attrs.to_leaf_attr();
             // Default color (0) — sculpt-added cells fall back to the
             // material's base_color, same convention as paint's "no
             // override".
             self.leaf_attr_pool.set_color(*slot, 0);
+            let entry = self.asset_cache.get_mut(handle)?;
+            let base_lo = entry.leaf_attr_slot_start;
+            let base_hi = base_lo + entry.leaf_attr_slot_count;
+            if *slot < base_lo || *slot >= base_hi {
+                entry.sculpt_extra_slots.insert(*slot);
+            }
         }
         // Renormalize pre-existing neighbour slots whose post-stamp
         // gradient differs from the stored normal. Patches only the
@@ -526,9 +543,15 @@ impl ArvxSceneManager {
         }
         // Release slots vacated by Remove / displaced-by-Add edits.
         // Done one-at-a-time since the slots aren't contiguous; the
-        // pool's free-list absorbs them.
+        // pool's free-list absorbs them. Also drop any matching
+        // entry from `sculpt_extra_slots` so release_asset doesn't
+        // double-free a slot that was extra-allocated and later
+        // freed in the same session.
         for slot in &applied.freed_slots {
             self.leaf_attr_pool.deallocate_range(*slot, 1);
+            if let Some(entry) = self.asset_cache.get_mut(handle) {
+                entry.sculpt_extra_slots.remove(slot);
+            }
         }
         _p_leaf_attr_ms = _ph_t5.elapsed().as_secs_f64() * 1000.0;
         let _ph_t6 = std::time::Instant::now();
@@ -1448,6 +1471,7 @@ mod tests {
             dag_consumed: Vec::new(),
             dag_produced: Vec::new(),
             cpu_octree: SparseOctree::new(depth, base_vs),
+            sculpt_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
             mesh_dirty: false,
             clusters_dirty: false,

@@ -144,8 +144,29 @@ impl ArvxSceneManager {
         // packed buffer's leaves carry scene-global slot ids, so a
         // corrupted octree could in theory produce ids outside the
         // asset's range. Clamp defensively.
+        //
+        // Sculpt-added slots (the asset's `sculpt_extra_slots`) live
+        // OUTSIDE the bake-time contiguous range — they came from
+        // the pool's general `allocate()`. Look them up on the asset
+        // entry by `grid_origin` matching `asset.grid_origin`. The
+        // closure below treats a hit as in-range if either the slot
+        // is in `[slot_lo, slot_hi)` OR it's a sculpt extra of the
+        // asset whose `aabb`/`grid_origin` matches the brush's
+        // current target.
         let slot_lo = asset.leaf_attr_slot_start;
         let slot_hi = slot_lo + asset.leaf_attr_slot_count;
+        let extra_slots: Option<&std::collections::HashSet<u32>> = self
+            .asset_cache
+            .iter()
+            .find_map(|(_h, entry)| {
+                if entry.leaf_attr_slot_start == slot_lo
+                    && entry.leaf_attr_slot_count == asset.leaf_attr_slot_count
+                {
+                    Some(&entry.sculpt_extra_slots)
+                } else {
+                    None
+                }
+            });
 
         // Accumulate new/updated entries into a batch and commit at the
         // end via `upsert_batch`. Per-entry `upsert` is O(N) on the
@@ -155,7 +176,11 @@ impl ArvxSceneManager {
         // O(N + K log K).
         let mut batch: Vec<arvx_core::OverlayEntry> = Vec::with_capacity(hits.len());
         for hit in &hits {
-            if hit.leaf_slot < slot_lo || hit.leaf_slot >= slot_hi {
+            let in_base = hit.leaf_slot >= slot_lo && hit.leaf_slot < slot_hi;
+            let in_extra = extra_slots
+                .map(|e| e.contains(&hit.leaf_slot))
+                .unwrap_or(false);
+            if !in_base && !in_extra {
                 continue;
             }
             let weight = crate::paint::brush_weight(

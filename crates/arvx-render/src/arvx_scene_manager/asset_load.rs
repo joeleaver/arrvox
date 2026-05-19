@@ -114,6 +114,13 @@ impl ArvxSceneManager {
         let entry = self.asset_cache.remove(handle).expect("just looked up");
         self.octree.deallocate(entry.spatial_handle);
         self.leaf_attr_pool.deallocate_range(entry.leaf_attr_slot_start, entry.leaf_attr_slot_count);
+        // Free any sculpt-allocated slots outside the bake range so
+        // they don't leak. The HashSet guarantees no double-frees
+        // even if a slot was freed-then-realloc'd during the
+        // session (sculpt's free path removes the entry).
+        for &slot in &entry.sculpt_extra_slots {
+            self.leaf_attr_pool.deallocate_range(slot, 1);
+        }
         for id in entry.brick_start..(entry.brick_start + entry.brick_count) {
             self.brick_pool.deallocate(id);
         }
@@ -840,6 +847,7 @@ impl ArvxSceneManager {
             mesh_dirty: true,
             clusters_dirty: true,
             cluster_spatial_index,
+            sculpt_extra_slots: std::collections::HashSet::new(),
             // Disk-loaded non-terrain assets have no halo by
             // construction; the slice stays empty. Terrain tiles
             // populate this through `integrate_baked_tile`. Phase 4.4

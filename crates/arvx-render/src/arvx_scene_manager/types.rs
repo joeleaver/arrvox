@@ -199,6 +199,28 @@ pub(super) struct AssetEntry {
     /// mesh re-extract + incrementally updated on patch-cluster
     /// append. See `cluster_spatial_index.rs`.
     pub(super) cluster_spatial_index: super::cluster_spatial_index::ClusterSpatialIndex,
+    /// Leaf-attr slots allocated for this asset by sculpt **after**
+    /// integration — i.e., not part of the contiguous bump range at
+    /// `[leaf_attr_slot_start, leaf_attr_slot_start + leaf_attr_slot_count)`.
+    ///
+    /// Sculpt's Add edits (Raise / Inflate / Deflate cavity walls /
+    /// material-replace) request fresh slots via the pool's general
+    /// `allocate()`, which can land anywhere in the global pool. The
+    /// asset's static range can't grow, so we track these here. Two
+    /// consumers care:
+    ///
+    /// 1. `apply_paint_sphere`'s slot validation — paint after sculpt
+    ///    on a tile (or any asset) was silently dropping every hit
+    ///    whose `leaf_slot` was outside the base range. Phase 4
+    ///    flushed this out on terrain ("paint stops working after
+    ///    sculpt") but the underlying bug pre-dates terrain.
+    /// 2. `release_asset` — bake-range slots get freed by
+    ///    `deallocate_range(slot_start, slot_count)`; these need
+    ///    individual `deallocate_range(slot, 1)` calls.
+    ///
+    /// Stored as a `HashSet<u32>` so freed-then-reallocated slots
+    /// don't accumulate duplicates that would double-free on release.
+    pub(super) sculpt_extra_slots: std::collections::HashSet<u32>,
     /// Terrain Phase 4: per-cell halo data carried from the original
     /// bake.
     ///
@@ -616,6 +638,17 @@ impl AssetCache {
         self.entries.get_mut(handle.0 as usize).and_then(|e| e.as_mut())
     }
 
+    /// Iterate every populated `(handle, &entry)` pair. Used by
+    /// paint's slot-range relaxation (Phase 4 fix): paint needs to
+    /// consult the entry's `sculpt_extra_slots` HashSet, but is
+    /// called with `&AssetInfo` rather than `&AssetEntry`, so we
+    /// look up the entry via its `grid_origin` / slot range.
+    pub(super) fn iter(&self) -> impl Iterator<Item = (AssetHandle, &AssetEntry)> {
+        self.entries.iter().enumerate().filter_map(|(i, e)| {
+            e.as_ref().map(|entry| (AssetHandle(i as u32), entry))
+        })
+    }
+
     pub(super) fn remove(&mut self, handle: AssetHandle) -> Option<AssetEntry> {
         let slot = handle.0 as usize;
         let taken = self.entries.get_mut(slot)?.take()?;
@@ -765,6 +798,7 @@ mod slab_tests {
             clusters_dirty: false,
             cluster_spatial_index:
                 crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
+            sculpt_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
         }
     }
@@ -966,6 +1000,7 @@ mod slab_tests {
             clusters_dirty: false,
             cluster_spatial_index:
                 crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
+            sculpt_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
         };
         let grid_origin = entry.grid_origin();
