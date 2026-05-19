@@ -7,7 +7,7 @@
 use arvx_core::LeafAttr;
 
 use super::manager::ArvxSceneManager;
-use super::types::AssetInfo;
+use super::types::{AssetHandle, AssetInfo};
 
 impl ArvxSceneManager {
     pub fn paint_epoch(&self) -> u64 {
@@ -99,16 +99,66 @@ impl ArvxSceneManager {
         stamp: crate::paint::PaintStamp,
         overlay: &mut arvx_core::LeafAttrOverlay,
     ) -> usize {
+        self.apply_paint_sphere_for_handle(
+            None,
+            asset,
+            entity_world,
+            brush_center_world,
+            radius,
+            strength,
+            falloff,
+            stamp,
+            overlay,
+        )
+    }
+
+    /// Like [`apply_paint_sphere`] but resolves the asset's current
+    /// `(root_offset, len)` from the supplied `handle` rather than
+    /// the (possibly stale) snapshot in `asset`. Required because
+    /// sculpt can re-allocate the asset's octree storage when its
+    /// reserved slack runs out, which moves `root_offset`; the
+    /// entity-side `Renderable.spatial` mirror isn't auto-refreshed,
+    /// so the legacy `apply_paint_sphere` walks the wrong region
+    /// after a sculpt-grow.
+    ///
+    /// Pass `Some(handle)` from any call site that has it. `None`
+    /// keeps the legacy behaviour (used by the few non-asset
+    /// callers — currently none, kept for forward compatibility).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_paint_sphere_for_handle(
+        &mut self,
+        handle: Option<AssetHandle>,
+        asset: &AssetInfo,
+        entity_world: glam::Affine3A,
+        brush_center_world: glam::Vec3,
+        radius: f32,
+        strength: f32,
+        falloff: f32,
+        stamp: crate::paint::PaintStamp,
+        overlay: &mut arvx_core::LeafAttrOverlay,
+    ) -> usize {
         use arvx_core::scene_node::SpatialHandle;
         if radius <= 0.0 || strength <= 0.0 {
             return 0;
         }
 
-        let SpatialHandle::Octree { root_offset, depth, base_voxel_size, .. } =
-            asset.spatial
-        else {
-            // Non-octree spatial handles don't have leaf_attr data to paint.
-            return 0;
+        // Resolve the live spatial. Sculpt's re-allocate-on-slack-
+        // exhaustion path moves `root_offset`; the entity's
+        // `Renderable.spatial` doesn't track that, so we re-fetch
+        // from the asset cache when the caller hands us a handle.
+        let live_entry = handle.and_then(|h| self.asset_cache.get(h));
+        let (root_offset, depth, base_voxel_size) = match live_entry {
+            Some(entry) => (
+                entry.spatial_handle.root_offset,
+                entry.spatial_handle.depth,
+                entry.spatial_handle.base_voxel_size,
+            ),
+            None => match asset.spatial {
+                SpatialHandle::Octree { root_offset, depth, base_voxel_size, .. } => {
+                    (root_offset, depth, base_voxel_size)
+                }
+                _ => return 0,
+            },
         };
 
         // World → object-local. Use the affine inverse so non-uniform
@@ -140,33 +190,23 @@ impl ArvxSceneManager {
             return 0;
         }
 
-        // Validate slots against this asset's allocated range — the
-        // packed buffer's leaves carry scene-global slot ids, so a
-        // corrupted octree could in theory produce ids outside the
-        // asset's range. Clamp defensively.
-        //
-        // Sculpt-added slots (the asset's `sculpt_extra_slots`) live
-        // OUTSIDE the bake-time contiguous range — they came from
-        // the pool's general `allocate()`. Look them up on the asset
-        // entry by `grid_origin` matching `asset.grid_origin`. The
-        // closure below treats a hit as in-range if either the slot
-        // is in `[slot_lo, slot_hi)` OR it's a sculpt extra of the
-        // asset whose `aabb`/`grid_origin` matches the brush's
-        // current target.
-        let slot_lo = asset.leaf_attr_slot_start;
-        let slot_hi = slot_lo + asset.leaf_attr_slot_count;
-        let extra_slots: Option<&std::collections::HashSet<u32>> = self
-            .asset_cache
-            .iter()
-            .find_map(|(_h, entry)| {
-                if entry.leaf_attr_slot_start == slot_lo
-                    && entry.leaf_attr_slot_count == asset.leaf_attr_slot_count
-                {
-                    Some(&entry.sculpt_extra_slots)
-                } else {
-                    None
-                }
-            });
+        // Validate slots against the live asset's allocated range +
+        // any sculpt-extended slots (kept in `entry.sculpt_extra_slots`
+        // — sculpt allocations whose IDs landed outside the bake-time
+        // contiguous range). When `handle` is `None` we fall back to
+        // the stale `asset` snapshot's range only.
+        let (slot_lo, slot_hi, extra_slots) = match live_entry {
+            Some(entry) => (
+                entry.leaf_attr_slot_start,
+                entry.leaf_attr_slot_start + entry.leaf_attr_slot_count,
+                Some(&entry.sculpt_extra_slots),
+            ),
+            None => (
+                asset.leaf_attr_slot_start,
+                asset.leaf_attr_slot_start + asset.leaf_attr_slot_count,
+                None,
+            ),
+        };
 
         // Accumulate new/updated entries into a batch and commit at the
         // end via `upsert_batch`. Per-entry `upsert` is O(N) on the

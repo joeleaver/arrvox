@@ -134,6 +134,11 @@ impl EngineState {
         if profile {
             self.last_paint_stamp_at = Some(t0);
         }
+        let asset_handle = self
+            .world
+            .get::<&Renderable>(entity)
+            .ok()
+            .and_then(|r| r.asset_handle);
         let (written, overlay_len_after) = {
             // Take the per-entity overlay first so its `&mut`
             // borrow into `self.paint_overlays` doesn't fight the
@@ -141,7 +146,8 @@ impl EngineState {
             // the overlay on the first stamp into this entity.
             let overlay = self.paint_overlays.entry(entity).or_default();
             let mut scene = self.scene_mgr.lock().expect("scene_mgr poisoned");
-            let w = scene.apply_paint_sphere(
+            let w = scene.apply_paint_sphere_for_handle(
+                asset_handle,
                 &asset_info,
                 entity_world,
                 world_pos,
@@ -340,11 +346,12 @@ impl EngineState {
             world_pos - Vec3::splat(radius),
             world_pos + Vec3::splat(radius),
         );
-        let mut targets: Vec<(arvx_terrain::TileKey, hecs::Entity)> = Vec::new();
+        let mut targets: Vec<(arvx_terrain::TileKey, hecs::Entity, arvx_render::AssetHandle)> =
+            Vec::new();
         if let Some(runtime) = self.terrain.as_ref() {
             for key in &candidate_keys {
-                if let Some(&(entity, _handle)) = runtime.tile_keys.get(key) {
-                    targets.push((*key, entity));
+                if let Some(&(entity, handle)) = runtime.tile_keys.get(key) {
+                    targets.push((*key, entity, handle));
                 }
             }
         }
@@ -367,7 +374,7 @@ impl EngineState {
 
         let mut total_written: usize = 0;
         let mut touched_keys: Vec<arvx_terrain::TileKey> = Vec::new();
-        for (key, entity) in targets {
+        for (key, entity, asset_handle) in targets {
             // Resolve the per-tile `AssetInfo`. Tile entities carry the
             // octree handle in their `Renderable.spatial`; identity
             // world transform is correct (tile-origin lives in
@@ -379,7 +386,8 @@ impl EngineState {
             let written = {
                 let overlay = self.paint_overlays.entry(entity).or_default();
                 let mut scene = self.scene_mgr.lock().expect("scene_mgr poisoned");
-                scene.apply_paint_sphere(
+                scene.apply_paint_sphere_for_handle(
+                    Some(asset_handle),
                     &asset_info,
                     identity_world,
                     world_pos,
@@ -416,6 +424,19 @@ impl EngineState {
             for k in &touched_keys {
                 runtime.dirty_tiles.insert(*k);
             }
+        }
+        // Diagnostic: fire only when paint had candidates but wrote
+        // nothing. Phase 4 regression triage — silent on the happy
+        // path, surfaces any "click landed on a tile but no leaf was
+        // written" cases (typically the asset's spatial drifted
+        // out of sync, slot range mismatched, etc.).
+        if total_written == 0 && !candidate_keys.is_empty() {
+            eprintln!(
+                "[paint-terrain] no writes — mode={:?} candidate_tiles={} radius={}",
+                mode,
+                candidate_keys.len(),
+                radius,
+            );
         }
         total_written
     }
