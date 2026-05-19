@@ -376,7 +376,12 @@ const _: () = {
 /// Sentinel marking INTERIOR cells in the dense cell map. INTERIOR
 /// cells count as "solid" for SN sign purposes but carry no per-cell
 /// `leaf_attr_id`, so we can't store a real slot here.
-const CELL_INTERIOR: u32 = u32::MAX;
+///
+/// Also used by `voxelize_octree`'s halo-sampling pass to flag halo
+/// cells that landed strictly inside the neighbouring solid — these
+/// contribute solidity for SN cube classification but don't need their
+/// own `LeafAttr` allocation.
+pub const CELL_INTERIOR: u32 = u32::MAX;
 
 /// In-grid encoding of [`CELL_INTERIOR`]. [`CellGrid`] reserves
 /// [`CELL_GRID_EMPTY`] (= `u32::MAX`) as the "no entry" sentinel,
@@ -421,6 +426,71 @@ pub fn extract_surface_mesh(
     leaf_attr_pool: &[LeafAttr],
     bone_voxel_pool: &[BoneVoxel],
 ) -> (Vec<MeshVertex>, Vec<u32>) {
+    extract_surface_mesh_haloed(
+        octree_nodes,
+        octree_depth,
+        base_voxel_size,
+        grid_origin,
+        brick_cells,
+        leaf_attr_pool,
+        bone_voxel_pool,
+        &[],
+        0,
+    )
+}
+
+/// Halo-aware variant of [`extract_surface_mesh`]. Folds `halo_cells`
+/// into the cell-occupancy map before the surface walk so SN cubes at
+/// the AABB boundary get valid 8-corner data, and restricts the
+/// iteration domain to the nominal interior so adjacent tiles don't
+/// emit duplicated boundary geometry.
+///
+/// ### Watertight-seam protocol
+///
+/// With `halo > 0` (terrain Phase 3):
+///
+/// 1. Halo cells appear in the cell-occupancy map exactly like
+///    interior cells, supplying SDF sign + `leaf_attr` data to any
+///    SN cube that straddles the AABB boundary. Boundary cubes thus
+///    get a full 8-corner classification and produce vertex
+///    positions that agree on both sides — the LO neighbour's
+///    rightmost cube and this tile's leftmost-halo cube live at the
+///    same world position, with the same solid/empty pattern, and
+///    therefore the same surface-nets centroid.
+///
+/// 2. The outer face-emit loop iterates only solid cells whose lo
+///    coord lies in `[0, N)` on every axis (`N = 1 << octree_depth`).
+///    Halo cells never iterate, so we never emit quads from cells
+///    whose `+axis` neighbour is unknown (beyond halo). Quads
+///    emitted from a boundary interior cell may reach one cube into
+///    the halo — that's the cube the LO/HI neighbour was always
+///    going to emit too, just on the other side of its own
+///    boundary, with the same vertex position. The neighbour's
+///    interior-side cell is empty in this scenario (otherwise the
+///    quad wouldn't fire), so the neighbour does not double-emit.
+///
+/// In other words: each (solid, empty) sample-edge is uniquely owned
+/// by the tile whose solid side falls in nominal-interior cells.
+/// Halo data covers the corner-classification side, no quad is
+/// double-emitted, and adjacent tile meshes meet at coincident
+/// vertex positions.
+///
+/// `halo_cells` carry `leaf_attr_id`s that are valid indices into
+/// `leaf_attr_pool` (or [`CELL_INTERIOR`] for halo cells strictly
+/// inside the neighbouring solid). When `halo = 0` this function is
+/// bit-identical to [`extract_surface_mesh`] regardless of the slice.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_surface_mesh_haloed(
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: Vec3,
+    brick_cells: &[u32],
+    leaf_attr_pool: &[LeafAttr],
+    bone_voxel_pool: &[BoneVoxel],
+    halo_cells: &[(IVec3, u32)],
+    halo: u32,
+) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     if octree_nodes.is_empty() {
@@ -443,6 +513,12 @@ pub fn extract_surface_mesh(
         octree_depth,
         &mut cells,
     );
+    // Fold halo cells into the map. Coords with axes in `[-halo, 0)` or
+    // `[N, N+halo)` are by construction outside the octree's interior
+    // range, so there's no collision with `walk_collect_cells`'s output.
+    for &(coord, slot) in halo_cells {
+        cells.insert(coord, slot);
+    }
     if cells.is_empty() {
         return (vertices, indices);
     }
@@ -453,8 +529,32 @@ pub fn extract_surface_mesh(
     // every grid edge) keeps us proportional to surface area.
     let mut cube_vertex: CellMap = CellMap::default();
     let extent = 1i32 << octree_depth;
+    let halo_active = halo > 0;
+    // With `halo > 0`, iterate every cell in the inner halo ring
+    // (`coord in [-1, N+1)`) in addition to the interior. The outer
+    // halo ring (`coord in [-halo, -1) ∪ [N+1, N+halo)`) provides
+    // 8-corner data for cubes referenced from the inner halo's
+    // emissions but never iterates as a quad-emit-from cell. This
+    // gives every tile-boundary cell two iterating tiles (the
+    // tile that owns it as interior + the neighbour that owns it
+    // as halo) so each boundary cube is emitted by both sides —
+    // overdraw at the seam, no see-through cracks from asymmetric
+    // iteration when the surface slopes across the boundary.
+    let iter_lo = if halo_active { -1 } else { 0 };
+    let iter_hi = if halo_active { extent + 1 } else { extent };
 
     for &cell in cells.keys() {
+        if halo_active {
+            if cell.x < iter_lo
+                || cell.x >= iter_hi
+                || cell.y < iter_lo
+                || cell.y >= iter_hi
+                || cell.z < iter_lo
+                || cell.z >= iter_hi
+            {
+                continue;
+            }
+        }
         for face in 0..6 {
             let dir = FACE_DIRS[face];
             let neighbor = cell + dir;
@@ -483,9 +583,38 @@ pub fn extract_surface_mesh(
                 quad[i] = match cube_vertex.get(&cube) {
                     Some(&v) => v,
                     None => {
+                        // Corner-cell lookup: CellMap first; for cells
+                        // that aren't there, fall back to walking the
+                        // octree (catches the INTERIOR_NODE-region case
+                        // — coarse octree branches classified bulk-
+                        // solid by the BFS contribute no per-cell
+                        // entry, but their cells are still solid for
+                        // SN classification). Without this fallback
+                        // the boundary cube on the halo side of the
+                        // seam — which gets its non-halo corners via
+                        // `is_solid_lookup` rather than CellMap when
+                        // those corners land in an `INTERIOR_NODE`
+                        // region — would misclassify them as empty
+                        // and emit a spurious vertex with no match in
+                        // the neighbouring tile.
                         let vertex = build_cube_vertex(
                             cube,
-                            |c| cells.get(&c).copied(),
+                            |c| match cells.get(&c) {
+                                Some(&v) => Some(v),
+                                None => {
+                                    if is_solid_lookup(
+                                        octree_nodes,
+                                        brick_cells,
+                                        octree_depth,
+                                        c,
+                                        extent,
+                                    ) {
+                                        Some(CELL_INTERIOR)
+                                    } else {
+                                        None
+                                    }
+                                }
+                            },
                             base_voxel_size,
                             grid_origin,
                             leaf_attr_pool,

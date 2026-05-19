@@ -79,7 +79,7 @@ impl ArvxSceneManager {
         };
 
         let r = arvx_core::voxelize_octree::voxelize_octree(
-            sdf_batch, &aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool,
+            sdf_batch, &aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool, 0,
         )?;
 
         emit_faces(&r.octree, object_id, &mut self.pending_faces);
@@ -131,7 +131,7 @@ impl ArvxSceneManager {
     {
         self.bump_geometry_epoch();
         let r = arvx_core::voxelize_octree::voxelize_octree(
-            sdf_fn, aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool,
+            sdf_fn, aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool, 0,
         )?;
 
         emit_faces(&r.octree, object_id, &mut self.pending_faces);

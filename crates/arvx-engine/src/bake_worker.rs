@@ -420,7 +420,7 @@ fn run_bake(
                     .map(|s| s.into_tuple())
                     .collect()
             };
-            arvx_core::voxelize_to_artifact(&mut closure, &req.aabb, req.voxel_size)
+            arvx_core::voxelize_to_artifact(&mut closure, &req.aabb, req.voxel_size, 0)
         }
         BakeInput::Artifact(a) => Some(a),
     };

@@ -434,10 +434,7 @@ pub fn build_mesh_sections_blob(
     leaf_attrs: &[crate::leaf_attr::LeafAttr],
     bone_voxels: &[crate::companion::BoneVoxel],
 ) -> MeshSectionsBlob {
-    if octree_nodes.is_empty() || leaf_attrs.is_empty() {
-        return MeshSectionsBlob::default();
-    }
-    let (vertices, indices_unclustered) = crate::mesh_extract::extract_surface_mesh(
+    build_mesh_sections_blob_haloed(
         octree_nodes,
         octree_depth,
         base_voxel_size,
@@ -445,6 +442,40 @@ pub fn build_mesh_sections_blob(
         brick_pool,
         leaf_attrs,
         bone_voxels,
+        &[],
+        0,
+    )
+}
+
+/// Halo-aware variant of [`build_mesh_sections_blob`]. See
+/// [`crate::mesh_extract::extract_surface_mesh_haloed`] for the
+/// ownership rule that turns the halo data into watertight tile
+/// seams. With `halo = 0` this is bit-identical to the non-halo entry.
+#[allow(clippy::too_many_arguments)]
+pub fn build_mesh_sections_blob_haloed(
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: glam::Vec3,
+    brick_pool: &[u32],
+    leaf_attrs: &[crate::leaf_attr::LeafAttr],
+    bone_voxels: &[crate::companion::BoneVoxel],
+    halo_cells: &[(glam::IVec3, u32)],
+    halo: u32,
+) -> MeshSectionsBlob {
+    if octree_nodes.is_empty() || leaf_attrs.is_empty() {
+        return MeshSectionsBlob::default();
+    }
+    let (vertices, indices_unclustered) = crate::mesh_extract::extract_surface_mesh_haloed(
+        octree_nodes,
+        octree_depth,
+        base_voxel_size,
+        grid_origin,
+        brick_pool,
+        leaf_attrs,
+        bone_voxels,
+        halo_cells,
+        halo,
     );
     if vertices.is_empty() || indices_unclustered.is_empty() {
         return MeshSectionsBlob::default();

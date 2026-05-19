@@ -141,7 +141,7 @@ fn write_artifact_rkp_roundtrip() {
             .collect()
     };
 
-    let mut artifact = crate::voxelize_to_artifact(sdf, &aabb, voxel_size)
+    let mut artifact = crate::voxelize_to_artifact(sdf, &aabb, voxel_size, 0)
         .expect("voxelize sphere");
     assert!(artifact.voxel_count > 0, "sphere must produce voxels");
     // Spike a non-zero color on the first leaf so the color

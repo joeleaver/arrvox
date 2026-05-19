@@ -410,7 +410,7 @@ fn voxelize_octree_gpu_runs_end_to_end() {
             .map(|r| r.into_tuple())
             .collect()
     };
-    let result = voxelize_octree(gpu_sdf, &aabb, voxel_size, &mut attrs, &mut bricks)
+    let result = voxelize_octree(gpu_sdf, &aabb, voxel_size, &mut attrs, &mut bricks, 0)
         .expect("gpu bake");
 
     assert!(
@@ -483,7 +483,7 @@ fn artifact_roundtrip_matches_direct_voxelize() {
             .map(|r| r.into_tuple())
             .collect()
     };
-    let artifact = voxelize_to_artifact(sdf_a, &aabb, voxel_size)
+    let artifact = voxelize_to_artifact(sdf_a, &aabb, voxel_size, 0)
         .expect("artifact voxelize");
     let artifact_voxels = artifact.voxel_count;
     let artifact_attrs = artifact.leaf_attrs.len();
@@ -572,7 +572,7 @@ fn bake_perf_sweep() {
                 .collect()
         };
         let t = std::time::Instant::now();
-        let r = voxelize_octree(gpu_sdf, &aabb, voxel_size, &mut attrs, &mut bricks)
+        let r = voxelize_octree(gpu_sdf, &aabb, voxel_size, &mut attrs, &mut bricks, 0)
             .expect("bake");
         eprintln!(
             "[perf_sweep] voxel_size={} voxels={} wall={:.2}ms",

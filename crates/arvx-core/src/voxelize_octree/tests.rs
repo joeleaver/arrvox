@@ -42,7 +42,7 @@ fn empty_region_produces_no_voxels() {
     let mut bricks = BrickPool::new(64);
     // AABB extent must be a power-of-2 multiple of voxel_size — 0.8 / 0.1 = 8.
     let aabb = Aabb { min: Vec3::ZERO, max: Vec3::splat(0.8) };
-    let r = voxelize_octree(batched(|_| (1000.0, 0, 0, 0, 0)), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
+    let r = voxelize_octree(batched(|_| (1000.0, 0, 0, 0, 0)), &aabb, 0.1, &mut attrs, &mut bricks, 0).unwrap();
 
     assert_eq!(r.voxel_count, 0);
     assert_eq!(r.brick_ids.len(), 0);
@@ -55,7 +55,7 @@ fn fully_interior_region_is_interior() {
     let mut bricks = BrickPool::new(64);
     // 0.2 / 0.1 = 2 cells (depth 1, 2x2x2 grid).
     let aabb = Aabb { min: Vec3::ZERO, max: Vec3::splat(0.2) };
-    let r = voxelize_octree(batched(|_| (-1000.0, 0, 0, 0, 0)), &aabb, 0.1, &mut attrs, &mut bricks).unwrap();
+    let r = voxelize_octree(batched(|_| (-1000.0, 0, 0, 0, 0)), &aabb, 0.1, &mut attrs, &mut bricks, 0).unwrap();
 
     assert_eq!(r.voxel_count, 0, "fully inside should collapse to INTERIOR");
     assert_eq!(r.brick_ids.len(), 0);

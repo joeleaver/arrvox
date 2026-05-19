@@ -29,7 +29,7 @@
 //! The SDF convention matches rkf-core: negative = inside the surface,
 //! positive = outside, zero = on the surface.
 
-use glam::{UVec3, Vec3};
+use glam::{IVec3, UVec3, Vec3};
 use crate::Aabb;
 
 use crate::brick_pool::{BrickPool, BRICK_CELLS, BRICK_LEVELS};
@@ -65,6 +65,21 @@ pub struct VoxelizeOctreeResult {
     /// Length is `max_brick_id + 1`. Empty if the tree has no bricks.
     pub brick_face_links: Vec<[u32; 6]>,
     pub grid_origin: Vec3,
+    /// Halo cells sampled outside the nominal AABB on all 6 faces (and
+    /// 12 edges + 8 corners) when `voxelize_octree` was called with
+    /// `halo > 0`. Each entry is `(cell_coord, leaf_attr_id)` where
+    /// `cell_coord` is a signed offset in finest-grid integer units
+    /// relative to `grid_origin` — i.e., coords with any axis in
+    /// `[-halo, 0) ∪ [N, N + halo)` where `N = 1 << depth`. Interior
+    /// halo cells (deep inside the solid neighbour) use the
+    /// [`CELL_INTERIOR`](crate::mesh_extract::CELL_INTERIOR) sentinel;
+    /// surface halo cells carry a real `leaf_attr_id` allocated
+    /// contiguously alongside the interior cells (so `unique_count`
+    /// covers both). Empty when `halo = 0`. Phase 3 of the terrain
+    /// system uses this to give the surface-mesh extractor enough
+    /// boundary data to produce watertight seams between adjacent
+    /// tiles — see `docs/TERRAIN.md`.
+    pub halo_cells: Vec<(IVec3, u32)>,
 }
 
 /// Voxelize a signed distance function into a sparse octree.
@@ -100,12 +115,22 @@ pub struct VoxelizeOctreeResult {
 /// `base_voxel_size`: voxel size at the finest level. Should come from
 /// the unified tier table for grid-snap compatibility, though any
 /// value that makes the AABB pow2-cubic-aligned is accepted.
+///
+/// `halo`: number of finest-grid voxels to sample OUTSIDE the AABB on
+/// every face, edge, and corner. The octree itself is unchanged
+/// (cells `[0, N)³` only), but `result.halo_cells` is populated with
+/// the solidity / `leaf_attr_id` of every solid cell in
+/// `[-halo, N + halo)³ \ [0, N)³`. Pass `0` (the common case) for
+/// stand-alone assets. Pass `1` from the terrain bake path so the
+/// surface-mesh extractor has the boundary-cell corner data it needs
+/// to produce watertight seams between adjacent tiles.
 pub fn voxelize_octree<F>(
     mut sdf_fn: F,
     aabb: &Aabb,
     base_voxel_size: f32,
     leaf_attr_pool: &mut LeafAttrPool,
     brick_pool: &mut BrickPool,
+    halo: u32,
 ) -> Option<VoxelizeOctreeResult>
 where
     F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
@@ -218,6 +243,26 @@ where
     } else {
         Vec::new()
     };
+
+    // Halo pass — sample SDF at the ring of cells one wider than the
+    // nominal AABB on every face (+ edges + corners). Solid halo cells
+    // get allocated `LeafAttr`s contiguous with the interior allocations
+    // above so the asset's pool range is still a single bump-allocated
+    // run; interior-bulk halo cells get the `CELL_INTERIOR` sentinel
+    // and don't consume a pool slot. `halo = 0` skips this entirely.
+    let halo_cells: Vec<(IVec3, u32)> = if halo > 0 {
+        sample_halo_cells(
+            &mut sdf_fn,
+            grid_origin,
+            depth,
+            base_voxel_size,
+            halo as i32,
+            leaf_attr_pool,
+        )?
+    } else {
+        Vec::new()
+    };
+
     let t_total = t_start.elapsed();
 
     let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
@@ -257,6 +302,7 @@ where
         brick_ids,
         brick_face_links,
         grid_origin,
+        halo_cells,
     })
 }
 
@@ -337,6 +383,238 @@ fn push_classify_positions(out: &mut Vec<Vec3>, world_min: Vec3, extent: f32) {
         }
     }
     out.push(world_min + Vec3::splat(extent * 0.5));
+}
+
+/// Sample SDF at the halo shell of cells in `[-halo, N + halo)³ \
+/// [0, N)³` and return the solid ones as `(cell_coord, leaf_attr_id)`
+/// tuples.
+///
+/// ### Classification must mirror the neighbour's BFS
+///
+/// Naïve per-cell halo classification (a 2-phase center + 6-grad
+/// classifier with cell-level Lipschitz threshold `cell_size · √3 / 2`)
+/// produces a CRACK at every tile seam where the surface band's
+/// Lipschitz radius exceeds one voxel. Reason: the neighbour tile's
+/// BFS prunes branches at coarser scales — bricks classified Empty or
+/// Interior by the lax 9-sample test (`extent / 2` threshold) are
+/// never per-cell sampled, so individual cells inside such a brick get
+/// the brick-level verdict regardless of what cell-level SDF says
+/// about them. If our halo sampled per-cell, it would classify cells
+/// at the band edge differently from the neighbour's interior path
+/// (e.g., a cell with `d = -0.3` inside a `d < -0.5` brick is "Interior"
+/// to the neighbour but "Surface" to a cell-level halo classifier),
+/// and SN cubes straddling the seam would see asymmetric corner
+/// classifications → divergent vertex positions → see-through cracks.
+///
+/// We instead match BFS exactly:
+///
+/// 1. Group halo cells by the world-aligned brick they belong to
+///    (`brick_extent = BRICK_DIM · cell_size`, here 1 m).
+/// 2. For each unique brick, sample 9 BFS-style positions (8 corners
+///    + 1 centre) and classify with the lax `extent / 2` threshold
+///    that `classify_from_samples` uses. (The 9-sample arrangement
+///    makes `extent / 2` Lipschitz-correct — the worst-case interior
+///    point is at most `extent / 2` from its nearest sample.)
+/// 3. Empty brick → halo cells in it are skipped (the neighbour's
+///    octree has nothing here).
+/// 4. Interior brick → all halo cells in it are emitted with
+///    `CELL_INTERIOR` (the neighbour's octree marks the whole region
+///    as `INTERIOR_NODE`).
+/// 5. Mixed brick → per-cell 2-phase classify, matching
+///    `emit_bricks_batched`'s rules verbatim (`cell_size · √3 / 2`
+///    threshold + phase-2 reclassify). Surface cells get a
+///    contiguous-bump `LeafAttr`; interior cells get the
+///    `CELL_INTERIOR` sentinel.
+///
+/// The brick-level decision propagates the neighbour's coarse-level
+/// classification: by Lipschitz, any coarser branch classified
+/// Empty/Interior implies all bricks inside are also Empty/Interior
+/// (the coarse threshold is `coarse_extent / 2 ≥ brick_extent / 2`).
+/// So this 2-level mirror is sufficient — no need to walk the full
+/// BFS up to the root.
+fn sample_halo_cells<F>(
+    sdf_fn: &mut F,
+    grid_origin: Vec3,
+    octree_depth: u8,
+    base_voxel_size: f32,
+    halo: i32,
+    leaf_attr_pool: &mut LeafAttrPool,
+) -> Option<Vec<(IVec3, u32)>>
+where
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+{
+    debug_assert!(halo > 0);
+    let n = 1i32 << octree_depth;
+    let cell_size = base_voxel_size;
+    let eps = cell_size * 0.5;
+    let cell_lipschitz = cell_size * (3.0_f32.sqrt() * 0.5);
+    let brick_dim_cells = crate::brick_pool::BRICK_DIM as i32;
+    let brick_extent_m = brick_dim_cells as f32 * cell_size;
+
+    // ── Group halo cells by their containing brick. ──
+    use std::collections::HashMap;
+    let mut halo_by_brick: HashMap<IVec3, Vec<IVec3>> = HashMap::new();
+    let lo = -halo;
+    let hi = n + halo;
+    for z in lo..hi {
+        for y in lo..hi {
+            for x in lo..hi {
+                let inside = x >= 0 && x < n && y >= 0 && y < n && z >= 0 && z < n;
+                if inside {
+                    continue;
+                }
+                let cell = IVec3::new(x, y, z);
+                let brick = IVec3::new(
+                    cell.x.div_euclid(brick_dim_cells),
+                    cell.y.div_euclid(brick_dim_cells),
+                    cell.z.div_euclid(brick_dim_cells),
+                );
+                halo_by_brick.entry(brick).or_default().push(cell);
+            }
+        }
+    }
+    if halo_by_brick.is_empty() {
+        return Some(Vec::new());
+    }
+
+    // ── Brick-level classify (9 samples per brick). ──
+    let bricks: Vec<IVec3> = halo_by_brick.keys().copied().collect();
+    let mut brick_samples: Vec<Vec3> = Vec::with_capacity(bricks.len() * 9);
+    for &brick in &bricks {
+        let world_min = grid_origin
+            + Vec3::new(brick.x as f32, brick.y as f32, brick.z as f32) * brick_extent_m;
+        push_classify_positions(&mut brick_samples, world_min, brick_extent_m);
+    }
+    let brick_results = sdf_fn(&brick_samples);
+    debug_assert_eq!(brick_results.len(), bricks.len() * 9);
+
+    // ── Decide per brick: Empty (skip), Interior (mark all), Mixed (queue). ──
+    struct HaloSurface {
+        coord: IVec3,
+        primary: u16,
+        secondary: u16,
+        blend: u8,
+        color: u32,
+    }
+    let mut out: Vec<(IVec3, u32)> = Vec::new();
+    let mut mixed_cells: Vec<IVec3> = Vec::new();
+    for (i, &brick) in bricks.iter().enumerate() {
+        let slice = &brick_results[i * 9..i * 9 + 9];
+        let class = classify_from_samples(slice, brick_extent_m);
+        let cells = halo_by_brick.get(&brick).expect("brick groups complete");
+        match class {
+            RegionClass::Empty => {
+                // No entries in CellMap for cells in this brick.
+            }
+            RegionClass::Interior => {
+                for &c in cells {
+                    out.push((c, crate::mesh_extract::CELL_INTERIOR));
+                }
+            }
+            RegionClass::Mixed => {
+                mixed_cells.extend(cells.iter().copied());
+            }
+        }
+    }
+
+    if mixed_cells.is_empty() {
+        return Some(out);
+    }
+
+    // ── Per-cell 2-phase classify for Mixed-brick halo cells. ──
+    let mut phase1_samples: Vec<Vec3> = Vec::with_capacity(mixed_cells.len());
+    for &cell in &mixed_cells {
+        let cell_center = grid_origin
+            + Vec3::new(
+                cell.x as f32 + 0.5,
+                cell.y as f32 + 0.5,
+                cell.z as f32 + 0.5,
+            ) * cell_size;
+        phase1_samples.push(cell_center);
+    }
+    let phase1_results = sdf_fn(&phase1_samples);
+    debug_assert_eq!(phase1_results.len(), mixed_cells.len());
+
+    let mut surface_queue: Vec<HaloSurface> = Vec::new();
+    for (i, &coord) in mixed_cells.iter().enumerate() {
+        let (d, primary, secondary, blend, color) = phase1_results[i];
+        if d > cell_lipschitz {
+            // Empty at cell level — skip (matches `emit_bricks_batched`'s
+            // BRICK_EMPTY-by-default behaviour for cells with d_center
+            // above the per-cell threshold).
+            continue;
+        }
+        if d < -cell_lipschitz {
+            // Cell-level interior — matches `BRICK_INTERIOR`.
+            out.push((coord, crate::mesh_extract::CELL_INTERIOR));
+            continue;
+        }
+        surface_queue.push(HaloSurface {
+            coord,
+            primary,
+            secondary,
+            blend,
+            color,
+        });
+    }
+
+    // ── Phase 2: 6 gradient taps per surface halo cell. ──
+    if !surface_queue.is_empty() {
+        let mut phase2_samples: Vec<Vec3> =
+            Vec::with_capacity(surface_queue.len() * 6);
+        for hs in &surface_queue {
+            let cell_center = grid_origin
+                + Vec3::new(
+                    hs.coord.x as f32 + 0.5,
+                    hs.coord.y as f32 + 0.5,
+                    hs.coord.z as f32 + 0.5,
+                ) * cell_size;
+            phase2_samples.push(cell_center + Vec3::new(eps, 0.0, 0.0));
+            phase2_samples.push(cell_center - Vec3::new(eps, 0.0, 0.0));
+            phase2_samples.push(cell_center + Vec3::new(0.0, eps, 0.0));
+            phase2_samples.push(cell_center - Vec3::new(0.0, eps, 0.0));
+            phase2_samples.push(cell_center + Vec3::new(0.0, 0.0, eps));
+            phase2_samples.push(cell_center - Vec3::new(0.0, 0.0, eps));
+        }
+        let phase2_results = sdf_fn(&phase2_samples);
+        debug_assert_eq!(phase2_results.len(), surface_queue.len() * 6);
+
+        for (i, hs) in surface_queue.iter().enumerate() {
+            let base = i * 6;
+            let d_xp = phase2_results[base    ].0;
+            let d_xm = phase2_results[base + 1].0;
+            let d_yp = phase2_results[base + 2].0;
+            let d_ym = phase2_results[base + 3].0;
+            let d_zp = phase2_results[base + 4].0;
+            let d_zm = phase2_results[base + 5].0;
+            // Second-chance reclassify with the tighter 6-tap set
+            // (matches the interior emit path).
+            let max_tap = d_xp.max(d_xm).max(d_yp).max(d_ym).max(d_zp).max(d_zm);
+            let min_tap = d_xp.min(d_xm).min(d_yp).min(d_ym).min(d_zp).min(d_zm);
+            if min_tap > 0.0 {
+                continue;
+            }
+            if max_tap < 0.0 {
+                out.push((hs.coord, crate::mesh_extract::CELL_INTERIOR));
+                continue;
+            }
+            let grad = Vec3::new(d_xp - d_xm, d_yp - d_ym, d_zp - d_zm);
+            let normal = if grad.length_squared() > 1e-12 {
+                grad.normalize()
+            } else {
+                Vec3::Y
+            };
+            let attr = LeafAttr::new_blended(normal, hs.primary, hs.secondary, hs.blend);
+            let leaf_attr_id = leaf_attr_pool.allocate_contiguous_bump(1)?;
+            *leaf_attr_pool.get_mut(leaf_attr_id) = attr;
+            if hs.color != 0 {
+                leaf_attr_pool.set_color(leaf_attr_id, hs.color);
+            }
+            out.push((hs.coord, leaf_attr_id));
+        }
+    }
+
+    Some(out)
 }
 
 /// Build-time descriptor for a Mixed brick-level node awaiting cell
@@ -455,7 +733,7 @@ pub fn voxelize_sphere_octree(
             .collect()
     };
 
-    voxelize_octree(sdf_fn, &aabb, voxel_size, leaf_attr_pool, brick_pool)
+    voxelize_octree(sdf_fn, &aabb, voxel_size, leaf_attr_pool, brick_pool, 0)
 }
 
 /// Self-contained bake result — everything needed to integrate a
@@ -493,6 +771,15 @@ pub struct BakeArtifact {
     /// brick ID. Length matches `brick_cells`. Contains `FACE_EMPTY`/
     /// `FACE_INTERIOR` sentinels for non-brick neighbors.
     pub brick_face_links: Vec<[u32; 6]>,
+    /// Halo cells sampled outside the nominal AABB on every face when
+    /// [`voxelize_to_artifact`] was called with `halo > 0`. Each entry
+    /// is `(cell_coord, leaf_attr_id)` in finest-grid integer units
+    /// relative to `grid_origin`. `leaf_attr_id` values are
+    /// worker-local indices into the same `leaf_attrs` vec above
+    /// (interior cells use the `mesh_extract::CELL_INTERIOR` sentinel).
+    /// Empty when `halo = 0`. Consumed by `build_mesh_sections_blob`
+    /// to produce watertight tile seams; see `docs/TERRAIN.md` Phase 3.
+    pub halo_cells: Vec<(IVec3, u32)>,
 }
 
 /// `voxelize_octree` against fresh private pools, packaged as a
@@ -503,6 +790,7 @@ pub fn voxelize_to_artifact<F>(
     sdf_fn: F,
     aabb: &Aabb,
     base_voxel_size: f32,
+    halo: u32,
 ) -> Option<BakeArtifact>
 where
     F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
@@ -513,8 +801,14 @@ where
     let mut leaf_attr_pool = LeafAttrPool::new(1024);
     let mut brick_pool = BrickPool::new(256);
 
-    let result =
-        voxelize_octree(sdf_fn, aabb, base_voxel_size, &mut leaf_attr_pool, &mut brick_pool)?;
+    let result = voxelize_octree(
+        sdf_fn,
+        aabb,
+        base_voxel_size,
+        &mut leaf_attr_pool,
+        &mut brick_pool,
+        halo,
+    )?;
 
     let n_attrs = result.leaf_attr_unique_count as usize;
     let mut leaf_attrs: Vec<LeafAttr> = Vec::with_capacity(n_attrs);
@@ -543,6 +837,7 @@ where
         leaf_attr_colors,
         brick_cells,
         brick_face_links: result.brick_face_links,
+        halo_cells: result.halo_cells,
     })
 }
 
