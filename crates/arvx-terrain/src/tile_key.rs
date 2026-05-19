@@ -72,6 +72,34 @@ impl TileKey {
     }
 }
 
+/// Enumerate every level-0 `TileKey` whose tile-cube intersects a
+/// world-space AABB. Used by Phase 4 brush dispatch to find every
+/// tile a single sphere stamp touches.
+///
+/// Inclusive on both ends — a sphere centred on a tile face touches
+/// the two tiles sharing the face; a sphere centred on a corner
+/// touches eight.
+pub fn tile_keys_intersecting_aabb(min: Vec3, max: Vec3) -> Vec<TileKey> {
+    let tile = TILE_SIZE_M;
+    let kx0 = (min.x / tile).floor() as i32;
+    let ky0 = (min.y / tile).floor() as i32;
+    let kz0 = (min.z / tile).floor() as i32;
+    let kx1 = (max.x / tile).floor() as i32;
+    let ky1 = (max.y / tile).floor() as i32;
+    let kz1 = (max.z / tile).floor() as i32;
+    let mut out = Vec::with_capacity(
+        ((kx1 - kx0 + 1).max(0) * (ky1 - ky0 + 1).max(0) * (kz1 - kz0 + 1).max(0)) as usize,
+    );
+    for kx in kx0..=kx1 {
+        for ky in ky0..=ky1 {
+            for kz in kz0..=kz1 {
+                out.push(TileKey::level0(kx, ky, kz));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +161,57 @@ mod tests {
         let k = TileKey { level: 1, x: 1, y: 0, z: 0 };
         // Level-1 tile = 128m = 16 chunks per axis.
         assert_eq!(k.origin_world().chunk, IVec3::new(16, 0, 0));
+    }
+
+    #[test]
+    fn aabb_inside_one_tile_returns_one_key() {
+        // 1 m radius brush centred at (32, 32, 32) — middle of tile (0, 0, 0).
+        let keys = tile_keys_intersecting_aabb(
+            Vec3::new(31.0, 31.0, 31.0),
+            Vec3::new(33.0, 33.0, 33.0),
+        );
+        assert_eq!(keys, vec![TileKey::level0(0, 0, 0)]);
+    }
+
+    #[test]
+    fn aabb_straddling_x_face_returns_two_keys() {
+        // Centred on x=64 (face between tile 0 and tile 1 along x).
+        let keys = tile_keys_intersecting_aabb(
+            Vec3::new(63.0, 30.0, 30.0),
+            Vec3::new(65.0, 32.0, 32.0),
+        );
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&TileKey::level0(0, 0, 0)));
+        assert!(keys.contains(&TileKey::level0(1, 0, 0)));
+    }
+
+    #[test]
+    fn aabb_at_corner_returns_eight_keys() {
+        // Centred on (64, 64, 64) — corner shared by 8 tiles.
+        let keys = tile_keys_intersecting_aabb(
+            Vec3::new(63.5, 63.5, 63.5),
+            Vec3::new(64.5, 64.5, 64.5),
+        );
+        assert_eq!(keys.len(), 8);
+        for kx in 0..=1 {
+            for ky in 0..=1 {
+                for kz in 0..=1 {
+                    assert!(
+                        keys.contains(&TileKey::level0(kx, ky, kz)),
+                        "missing ({kx},{ky},{kz})",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aabb_with_negative_coords_uses_floor() {
+        // Centred on (-32, 32, 32) — middle of tile (-1, 0, 0).
+        let keys = tile_keys_intersecting_aabb(
+            Vec3::new(-33.0, 31.0, 31.0),
+            Vec3::new(-31.0, 33.0, 33.0),
+        );
+        assert_eq!(keys, vec![TileKey::level0(-1, 0, 0)]);
     }
 }

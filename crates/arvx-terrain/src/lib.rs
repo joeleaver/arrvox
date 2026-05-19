@@ -30,6 +30,6 @@ pub use fbm::FbmTerrainFn;
 pub use streamer::{StreamerStats, TileSlot, TileState, TileStreamer};
 pub use terrain::Terrain;
 pub use terrain_fn::{TerrainFn, TerrainSample};
-pub use tile_key::{TileKey, TILE_SIZE_M};
+pub use tile_key::{tile_keys_intersecting_aabb, TileKey, TILE_SIZE_M};
 pub use tile_tag::TerrainTile;
 pub use worker::{BakeJob, BakeJobResult, BakeWorker};

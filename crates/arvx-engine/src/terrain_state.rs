@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use arvx_render::AssetHandle;
-use arvx_terrain::TileStreamer;
+use arvx_terrain::{TileKey, TileStreamer};
 
 /// Engine-side runtime state for the active Terrain.
 ///
@@ -28,6 +28,12 @@ pub struct TerrainRuntime {
     /// `(Entity, AssetHandle)` pairs so the eviction handler can
     /// despawn the entity and release the asset.
     pub live_tiles: HashMap<u64, (hecs::Entity, AssetHandle)>,
+    /// Reverse map for Phase 4 brush dispatch: a world-space brush
+    /// AABB enumerates intersecting `TileKey`s, then looks up each
+    /// live tile's `(Entity, AssetHandle)` here. Mirrors `live_tiles`
+    /// — populated on integrate, depopulated on evict — so all
+    /// reads are O(1).
+    pub tile_keys: HashMap<TileKey, (hecs::Entity, AssetHandle)>,
     /// Monotonic token counter — the streamer doesn't generate these
     /// itself.
     pub next_token: u64,
@@ -41,6 +47,7 @@ impl TerrainRuntime {
             terrain_entity,
             streamer: TileStreamer::new(2, 2),
             live_tiles: HashMap::new(),
+            tile_keys: HashMap::new(),
             next_token: 1,
         }
     }

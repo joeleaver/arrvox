@@ -312,6 +312,107 @@ impl EngineState {
     }
 }
 
+impl EngineState {
+    /// Phase 4 terrain brush dispatch (paint variant). Apply a paint
+    /// stamp to every live terrain tile whose AABB intersects the
+    /// world-space brush AABB. Bypasses the selection-lock that
+    /// `apply_paint_stamp` enforces; tile entities don't participate
+    /// in scene-tree selection and have no procedural / generator
+    /// status to gate on.
+    ///
+    /// Returns total leaves written across all touched tiles.
+    pub(crate) fn apply_paint_stamp_terrain(
+        &mut self,
+        world_pos: Vec3,
+        radius: f32,
+        strength: f32,
+        falloff: f32,
+        color: [f32; 3],
+        mode: PaintMode,
+        material_id: u16,
+    ) -> usize {
+        if radius <= 0.0 {
+            return 0;
+        }
+        // Snapshot intersecting live tiles. See sculpt-terrain counterpart
+        // for the borrow-scope rationale.
+        let candidate_keys = arvx_terrain::tile_keys_intersecting_aabb(
+            world_pos - Vec3::splat(radius),
+            world_pos + Vec3::splat(radius),
+        );
+        let mut targets: Vec<hecs::Entity> = Vec::new();
+        if let Some(runtime) = self.terrain.as_ref() {
+            for key in &candidate_keys {
+                if let Some(&(entity, _handle)) = runtime.tile_keys.get(key) {
+                    targets.push(entity);
+                }
+            }
+        }
+        if targets.is_empty() {
+            return 0;
+        }
+
+        let stamp = match mode {
+            PaintMode::Material => {
+                arvx_render::paint::PaintStamp::Material { material_id }
+            }
+            PaintMode::Color => arvx_render::paint::PaintStamp::Color { rgb: color },
+            PaintMode::Erase => arvx_render::paint::PaintStamp::Erase,
+        };
+        let identity_world = glam::Affine3A::IDENTITY;
+        let brush_aabb = arvx_core::Aabb::from_center_half_extents(
+            world_pos,
+            Vec3::splat(radius),
+        );
+
+        let mut total_written: usize = 0;
+        for entity in targets {
+            // Resolve the per-tile `AssetInfo`. Tile entities carry the
+            // octree handle in their `Renderable.spatial`; identity
+            // world transform is correct (tile-origin lives in
+            // SpatialData.grid_origin).
+            let asset_info = match self.build_paint_context(entity) {
+                Some((info, _)) => info,
+                None => continue,
+            };
+            let written = {
+                let overlay = self.paint_overlays.entry(entity).or_default();
+                let mut scene = self.scene_mgr.lock().expect("scene_mgr poisoned");
+                scene.apply_paint_sphere(
+                    &asset_info,
+                    identity_world,
+                    world_pos,
+                    radius,
+                    strength,
+                    falloff,
+                    stamp,
+                    overlay,
+                )
+            };
+            if written == 0 {
+                continue;
+            }
+            total_written += written;
+            self.last_paint_stamp_at = Some(std::time::Instant::now());
+            self.gpu_instance_overlays_dirty = true;
+            self.gpu_objects_dirty.mark_entity(entity);
+            if matches!(mode, PaintMode::Material) {
+                self.painted_dirty_entities.insert(entity);
+                self.painted_dirty_regions
+                    .entry(entity)
+                    .or_default()
+                    .push(brush_aabb);
+            }
+            self.mutation_log.push(super::mutation_log::MutationEvent::PaintStamp {
+                entity,
+                mode,
+                material_id,
+            });
+        }
+        total_written
+    }
+}
+
 /// Route the `EngineCommand::Paint` arm. Called from `process_cmd_edit`
 /// when the dispatcher's edit chunk pattern-matches. Lives out-of-line
 /// from `cmd_edit.rs` to keep this file the sole owner of paint wiring.

@@ -189,6 +189,7 @@ impl super::state::EngineState {
         let token = runtime.next_token;
         runtime.next_token = runtime.next_token.wrapping_add(1);
         runtime.live_tiles.insert(token, (entity, asset_handle));
+        runtime.tile_keys.insert(key, (entity, asset_handle));
         // Silence "unused import" if EditorMetadata isn't used here.
         let _ = std::any::type_name::<EditorMetadata>();
         Some(token)
@@ -200,9 +201,18 @@ impl super::state::EngineState {
         runtime: &mut TerrainRuntime,
         evictions: &[(arvx_terrain::TileKey, u64)],
     ) {
-        for (_key, token) in evictions {
+        for (key, token) in evictions {
+            // Drop the reverse-map entry up front so brush dispatch
+            // can't pick up a stale handle mid-eviction.
+            runtime.tile_keys.remove(key);
             if let Some((entity, asset_handle)) = runtime.live_tiles.remove(token) {
                 let _ = self.world.despawn(entity);
+                // Drop any per-entity sculpt overlay for this tile —
+                // it points into the leaf_attr pool slots we're about
+                // to release. Leaving it behind would let a stale slot
+                // re-appear in fragment discard if a future tile
+                // reuses the same entity id.
+                self.sculpt_overlays.remove(&entity);
                 let mut sm = match self.scene_mgr.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),

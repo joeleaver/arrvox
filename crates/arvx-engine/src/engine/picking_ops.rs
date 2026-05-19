@@ -44,6 +44,27 @@ impl EngineState {
                 None
             };
 
+            // Phase 4 terrain auto-route: a paint click that lands on
+            // a terrain tile bypasses the selection-lock and routes
+            // through the per-tile dispatcher. Tiles aren't selectable
+            // (no EditorMetadata), so requiring a selection match
+            // would make the brush feel broken on terrain.
+            let hit_is_terrain_tile = hit_entity
+                .is_some_and(|e| self.world.get::<&arvx_terrain::TerrainTile>(e).is_ok());
+            if let (true, Some(world_pos)) = (hit_is_terrain_tile, pr.position) {
+                let _ = self.apply_paint_stamp_terrain(
+                    world_pos,
+                    settings.radius,
+                    settings.strength,
+                    settings.falloff,
+                    settings.color,
+                    settings.mode,
+                    settings.material_id,
+                );
+                self.in_flight_pick_ghost = None;
+                return;
+            }
+
             // Strict lock — must hit the selected entity exactly.
             // Hits on other geometry, sky, or with no selection at
             // all are misses.
@@ -84,6 +105,33 @@ impl EngineState {
             } else {
                 None
             };
+
+            // Phase 4 terrain auto-route: a sculpt click that lands on
+            // a terrain tile bypasses the selection-lock and routes
+            // through the per-tile dispatcher. Same rationale as
+            // paint above.
+            let hit_is_terrain_tile = hit_entity
+                .is_some_and(|e| self.world.get::<&arvx_terrain::TerrainTile>(e).is_ok());
+            if let (true, Some(world_pos)) = (hit_is_terrain_tile, pr.position) {
+                if let Some(t0) = pending_at {
+                    eprintln!(
+                        "[sculpt-latency] click→pick→sculpt_start={:.2}ms (terrain)",
+                        t0.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+                let _ = self.apply_sculpt_stamp_terrain(
+                    world_pos,
+                    settings.radius,
+                    settings.falloff_curve,
+                    settings.strength,
+                    settings.stroke_seq,
+                    settings.mode,
+                    settings.material_id,
+                );
+                self.in_flight_pick_ghost = None;
+                return;
+            }
+
             let target_entity = self
                 .selected_entity
                 .filter(|sel| hit_entity == Some(*sel));

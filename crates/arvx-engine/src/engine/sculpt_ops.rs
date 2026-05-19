@@ -256,6 +256,151 @@ impl EngineState {
     }
 }
 
+impl EngineState {
+    /// Phase 4 brush dispatch: apply a single sculpt brush stamp to
+    /// every live terrain tile whose AABB intersects the world-space
+    /// brush AABB. Bypasses the selection / procedural / skeleton
+    /// gates that `apply_sculpt_stamp` runs — terrain tiles don't
+    /// participate in scene-tree selection (no `EditorMetadata`) and
+    /// can't be procedural / generator-owned / skinned by construction.
+    ///
+    /// Returns the total number of leaves removed across all touched
+    /// tiles. Returns 0 when no terrain runtime is active or no tiles
+    /// intersect the brush.
+    pub(crate) fn apply_sculpt_stamp_terrain(
+        &mut self,
+        world_pos: Vec3,
+        radius: f32,
+        falloff_curve: arvx_core::sculpt::FalloffCurve,
+        strength: f32,
+        stroke_seq: u64,
+        mode: SculptMode,
+        material_id: u16,
+    ) -> usize {
+        if radius <= 0.0 {
+            return 0;
+        }
+        // Engine enum → core enum. Flatten is still deferred to a later
+        // plan phase; everything else routes through.
+        let brush_mode = match mode {
+            SculptMode::Raise => arvx_core::sculpt::BrushMode::Raise,
+            SculptMode::Carve => arvx_core::sculpt::BrushMode::Carve,
+            SculptMode::Inflate => arvx_core::sculpt::BrushMode::Inflate,
+            SculptMode::Deflate => arvx_core::sculpt::BrushMode::Deflate,
+            SculptMode::Smooth => arvx_core::sculpt::BrushMode::Smooth,
+            SculptMode::Flatten => {
+                self.console.warn(format!(
+                    "Sculpt mode {mode:?} not implemented yet — \
+                     Raise / Carve / Inflate / Deflate / Smooth are wired through P2.",
+                ));
+                return 0;
+            }
+        };
+
+        // Snapshot the live `(TileKey, Entity, AssetHandle)` triples we
+        // intend to stamp before doing any &mut self work. Holding a
+        // borrow into `self.terrain.tile_keys` across the per-tile
+        // mutation loop would conflict with `scene_mgr` / overlays /
+        // dirty marks below.
+        let candidate_keys = arvx_terrain::tile_keys_intersecting_aabb(
+            world_pos - Vec3::splat(radius),
+            world_pos + Vec3::splat(radius),
+        );
+        let mut targets: Vec<(arvx_terrain::TileKey, hecs::Entity, arvx_render::AssetHandle)> =
+            Vec::new();
+        if let Some(runtime) = self.terrain.as_ref() {
+            for key in &candidate_keys {
+                if let Some(&(entity, handle)) = runtime.tile_keys.get(key) {
+                    targets.push((*key, entity, handle));
+                }
+            }
+        }
+        if targets.is_empty() {
+            return 0;
+        }
+
+        let mut total_removed: usize = 0;
+        let identity = glam::Affine3A::IDENTITY;
+        let brush_aabb = arvx_core::Aabb::from_center_half_extents(
+            world_pos,
+            Vec3::splat(radius),
+        );
+
+        for (_key, entity, asset_handle) in targets {
+            // Per-tile brush stamp. Tile entities sit at world-frame
+            // identity; their `SpatialData.grid_origin` carries the
+            // tile-origin offset, so `apply_sculpt_brush` resolves
+            // grid coords correctly with an identity entity_world.
+            let result = {
+                let mut scene = self.scene_mgr.lock().expect("scene_mgr poisoned");
+                scene.apply_sculpt_brush(
+                    asset_handle,
+                    world_pos,
+                    identity,
+                    radius,
+                    falloff_curve,
+                    strength,
+                    stroke_seq,
+                    brush_mode,
+                    material_id,
+                )
+            };
+            let Some(result) = result else {
+                continue;
+            };
+            total_removed += result.leaves_removed;
+
+            // Mirror the asset path's per-entity bookkeeping for the
+            // tile's entity. See `apply_sculpt_stamp` for rationale on
+            // each line.
+            let overlay = self.sculpt_overlays.entry(entity).or_default();
+            overlay.insert_batch(result.removed_leaf_attr_ids);
+            for slot in &result.allocated_leaf_attr_ids {
+                overlay.remove(*slot);
+            }
+            self.gpu_instance_sculpts_dirty = true;
+            self.gpu_objects_dirty.mark_entity(entity);
+            self.painted_dirty_entities.insert(entity);
+            self.painted_dirty_regions
+                .entry(entity)
+                .or_default()
+                .push(brush_aabb);
+
+            if matches!(mode, SculptMode::Raise) {
+                let is_glass_brush = (material_id as usize) < self.material_is_glass.len()
+                    && self.material_is_glass[material_id as usize];
+                if is_glass_brush {
+                    // Tiles share `release_asset` cache keys via their
+                    // octree root_offset; flush so the next has_glass
+                    // verdict rescans.
+                    if let Ok(r) = self.world.get::<&crate::components::Renderable>(entity) {
+                        if let Some(spatial) = r.spatial.as_ref().and_then(|g| g.as_octree()) {
+                            self.asset_has_glass_cache.remove(&spatial.root_offset);
+                        }
+                    }
+                }
+            }
+
+            self.mutation_log.push(super::mutation_log::MutationEvent::SculptStamp {
+                entity,
+                mode,
+                material_id,
+            });
+        }
+
+        if total_removed > 0 {
+            eprintln!(
+                "[sculpt-terrain] stamp candidate_tiles={} mode={:?} total_removed={}",
+                candidate_keys.len(),
+                mode,
+                total_removed,
+            );
+        }
+
+        total_removed
+    }
+}
+
 /// Route the legacy [`EngineCommand::Sculpt`] (world-position variant)
 /// to [`EngineState::apply_sculpt_stamp`]. Used by tests + any caller
 /// that has already resolved the hit point; the editor's UI flow takes
