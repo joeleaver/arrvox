@@ -195,6 +195,107 @@ impl super::state::EngineState {
         Some(token)
     }
 
+    /// Phase 4.3: write every dirty terrain tile as `.arvxtile`
+    /// alongside the scene file. Clears the dirty set on success.
+    ///
+    /// Cost: O(dirty_tile_count × tile_cell_count) for the artifact
+    /// extraction + write. Each tile bake-time-ish (~1-2 s per Tier-2
+    /// tile on cold cache); usually the dirty set is small.
+    ///
+    /// Per-tile failures are logged but don't abort the loop — partial
+    /// progress is better than no progress.
+    pub(crate) fn flush_dirty_terrain_tiles(&mut self, scene_dir: &std::path::Path) {
+        let Some(runtime) = self.terrain.as_mut() else { return };
+        if runtime.dirty_tiles.is_empty() {
+            return;
+        }
+        let dirty: Vec<arvx_terrain::TileKey> =
+            runtime.dirty_tiles.iter().copied().collect();
+        let mut succeeded: Vec<arvx_terrain::TileKey> = Vec::new();
+        let mut failed: usize = 0;
+        for key in &dirty {
+            // Resolve the asset handle. The tile may have been
+            // evicted between the last edit and the save — log and
+            // skip (V1 limitation; the .arvxtile would need to come
+            // from a not-yet-implemented "edit log" or in-memory
+            // shadow to survive eviction).
+            let Some(&(_entity, handle)) = runtime.tile_keys.get(key) else {
+                self.console.warn(format!(
+                    "Skipping save for evicted dirty tile (lvl {}, {}, {}, {}). \
+                     Phase 4.3 V1 limitation: edits to evicted tiles aren't \
+                     persisted.",
+                    key.level, key.x, key.y, key.z,
+                ));
+                failed += 1;
+                continue;
+            };
+
+            // Compute voxel size for this tile's level. Pull from the
+            // Terrain config so the saved file's voxel size matches
+            // what the next bake would produce.
+            let voxel_size = self
+                .world
+                .get::<&arvx_terrain::Terrain>(runtime.terrain_entity)
+                .ok()
+                .map(|t| t.voxel_size_for_level(key.level))
+                .unwrap_or(
+                    arvx_core::constants::RESOLUTION_TIERS
+                        [arvx_core::constants::DEFAULT_TERRAIN_TIER]
+                        .voxel_size,
+                );
+
+            let (artifact, _mesh) = {
+                let scene = match self.scene_mgr.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let artifact = match scene.extract_artifact_from_handle(handle) {
+                    Some(a) => a,
+                    None => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+                // Mesh blob deliberately read but unused for v0 of
+                // Phase 4.3 — we let the load path re-extract the
+                // mesh from the saved octree to avoid the file-local
+                // vertex-ID relocation complexity in the
+                // not-yet-implemented Phase 4.4 reader. Once 4.4
+                // lands the mesh blob, swap to passing it through
+                // `write_rkp` directly. Computed-and-dropped here so
+                // any borrow / cost issues show up early.
+                let mesh = scene.extract_mesh_blob_from_handle(handle);
+                (artifact, mesh)
+            };
+            match arvx_terrain::save_tile(scene_dir, *key, &artifact, voxel_size) {
+                Ok(path) => {
+                    if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
+                        eprintln!(
+                            "[terrain-save] tile ({}, {}, {}, lvl {}) -> {}",
+                            key.x, key.y, key.z, key.level, path.display(),
+                        );
+                    }
+                    succeeded.push(*key);
+                }
+                Err(e) => {
+                    self.console.warn(format!(
+                        "Save tile ({}, {}, {}, lvl {}) failed: {e}",
+                        key.x, key.y, key.z, key.level,
+                    ));
+                    failed += 1;
+                }
+            }
+        }
+        for k in &succeeded {
+            runtime.dirty_tiles.remove(k);
+        }
+        self.console.info(format!(
+            "Terrain: persisted {} tile(s) ({} failed)",
+            succeeded.len(),
+            failed,
+        ));
+    }
+
     /// Despawn + release_asset for every `(key, token)` pair.
     fn evict_terrain_tiles(
         &mut self,

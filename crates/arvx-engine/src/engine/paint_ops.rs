@@ -340,11 +340,11 @@ impl EngineState {
             world_pos - Vec3::splat(radius),
             world_pos + Vec3::splat(radius),
         );
-        let mut targets: Vec<hecs::Entity> = Vec::new();
+        let mut targets: Vec<(arvx_terrain::TileKey, hecs::Entity)> = Vec::new();
         if let Some(runtime) = self.terrain.as_ref() {
             for key in &candidate_keys {
                 if let Some(&(entity, _handle)) = runtime.tile_keys.get(key) {
-                    targets.push(entity);
+                    targets.push((*key, entity));
                 }
             }
         }
@@ -366,7 +366,8 @@ impl EngineState {
         );
 
         let mut total_written: usize = 0;
-        for entity in targets {
+        let mut touched_keys: Vec<arvx_terrain::TileKey> = Vec::new();
+        for (key, entity) in targets {
             // Resolve the per-tile `AssetInfo`. Tile entities carry the
             // octree handle in their `Renderable.spatial`; identity
             // world transform is correct (tile-origin lives in
@@ -393,6 +394,7 @@ impl EngineState {
                 continue;
             }
             total_written += written;
+            touched_keys.push(key);
             self.last_paint_stamp_at = Some(std::time::Instant::now());
             self.gpu_instance_overlays_dirty = true;
             self.gpu_objects_dirty.mark_entity(entity);
@@ -408,6 +410,12 @@ impl EngineState {
                 mode,
                 material_id,
             });
+        }
+        // Mark every paint-edited tile dirty for Phase 4.3 save.
+        if let Some(runtime) = self.terrain.as_mut() {
+            for k in &touched_keys {
+                runtime.dirty_tiles.insert(*k);
+            }
         }
         total_written
     }

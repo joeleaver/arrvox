@@ -7,7 +7,7 @@
 //! gets a u64 token back. [`TerrainRuntime`] maps tokens to live
 //! `(Entity, AssetHandle)` pairs so eviction can release both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use arvx_render::AssetHandle;
 use arvx_terrain::{TileKey, TileStreamer};
@@ -34,6 +34,19 @@ pub struct TerrainRuntime {
     /// — populated on integrate, depopulated on evict — so all
     /// reads are O(1).
     pub tile_keys: HashMap<TileKey, (hecs::Entity, AssetHandle)>,
+    /// Phase 4.3: tiles that have been edited (sculpt or paint) since
+    /// the last save flush. On `File → Save scene` the engine
+    /// serialises each entry to `<scene>/tiles/<key>.arvxtile` and
+    /// clears the set. Eviction does NOT clear an entry — when a
+    /// dirty tile leaves the residency radius before a save, we keep
+    /// the bit so the next save still writes it (the in-memory
+    /// state is reconstructed from disk on the next residency pass,
+    /// at which point the eviction-time `release_asset` may already
+    /// have dropped the live state — Phase 4.4 wires that side).
+    /// For Phase 4.3 V1 we accept that an evict-without-save loses
+    /// the edits; the editor-driven workflow saves frequently
+    /// enough that this is rare.
+    pub dirty_tiles: HashSet<TileKey>,
     /// Monotonic token counter — the streamer doesn't generate these
     /// itself.
     pub next_token: u64,
@@ -48,6 +61,7 @@ impl TerrainRuntime {
             streamer: TileStreamer::new(2, 2),
             live_tiles: HashMap::new(),
             tile_keys: HashMap::new(),
+            dirty_tiles: HashSet::new(),
             next_token: 1,
         }
     }

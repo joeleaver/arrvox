@@ -27,6 +27,7 @@ mod manager;
 mod paint;
 mod sculpt;
 mod terrain_integrate;
+mod terrain_save;
 mod types;
 mod voxelize;
 

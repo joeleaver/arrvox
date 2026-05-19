@@ -326,7 +326,13 @@ impl EngineState {
             Vec3::splat(radius),
         );
 
-        for (_key, entity, asset_handle) in targets {
+        // Track which tiles produced edits this stamp so the dirty
+        // set captures only tiles whose disk state will diverge from
+        // a fresh TerrainFn bake. Tiles in the brush AABB but with
+        // no actual cell changes don't enter the set.
+        let mut touched_keys: Vec<arvx_terrain::TileKey> = Vec::new();
+
+        for (key, entity, asset_handle) in targets {
             // Per-tile brush stamp. Tile entities sit at world-frame
             // identity; their `SpatialData.grid_origin` carries the
             // tile-origin offset, so `apply_sculpt_brush` resolves
@@ -349,6 +355,7 @@ impl EngineState {
                 continue;
             };
             total_removed += result.leaves_removed;
+            touched_keys.push(key);
 
             // Mirror the asset path's per-entity bookkeeping for the
             // tile's entity. See `apply_sculpt_stamp` for rationale on
@@ -388,10 +395,20 @@ impl EngineState {
             });
         }
 
+        // Mark every tile this stamp actually edited as dirty for
+        // Phase 4.3 save. Idempotent — HashSet folds repeated stamps
+        // on the same stroke into one entry.
+        if let Some(runtime) = self.terrain.as_mut() {
+            for k in &touched_keys {
+                runtime.dirty_tiles.insert(*k);
+            }
+        }
+
         if total_removed > 0 {
             eprintln!(
-                "[sculpt-terrain] stamp candidate_tiles={} mode={:?} total_removed={}",
+                "[sculpt-terrain] stamp candidate_tiles={} touched={} mode={:?} total_removed={}",
                 candidate_keys.len(),
+                touched_keys.len(),
                 mode,
                 total_removed,
             );

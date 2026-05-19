@@ -724,6 +724,13 @@ impl EngineState {
                     if let Err(e) = crate::scene_io::save_scene(&scene, &save_path) {
                         eprintln!("[ArvxEngine] save scene failed: {e}");
                     }
+                    // Phase 4.3: flush every dirty terrain tile to
+                    // its `.arvxtile` alongside the scene file.
+                    // Untouched tiles regenerate from `TerrainFn` on
+                    // the next load and never hit disk.
+                    if let Some(scene_dir) = save_path.parent() {
+                        self.flush_dirty_terrain_tiles(scene_dir);
+                    }
                     self.scene_path = Some(save_path);
                 }
                 // Persist the project descriptor alongside the scene so
