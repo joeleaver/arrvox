@@ -234,9 +234,24 @@ impl EngineState {
                 self.assign_entity_uuid(entity);
                 self.scene_dirty.mark_entity(entity);
                 self.selected_entity = Some(entity);
-                self.terrain = Some(Box::new(
+                let mut runtime = Box::new(
                     crate::terrain_state::TerrainRuntime::new(entity),
-                ));
+                );
+                // Phase 4.4: if the scene has a known save path, seed
+                // the streamer's scene_dir so newly-baked tiles
+                // prefer the on-disk `.arvxtile` over `TerrainFn`. A
+                // fresh `SpawnTerrain` on a previously-saved scene
+                // that has terrain tiles on disk will pick them up
+                // automatically.
+                if let Some(scene_dir) = self
+                    .scene_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_path_buf())
+                {
+                    runtime.streamer.set_scene_dir(Some(scene_dir));
+                }
+                self.terrain = Some(runtime);
                 self.console.info(format!(
                     "Spawned '{name}' — streamer running with 2 workers, render radius 192 m"
                 ));
@@ -730,6 +745,16 @@ impl EngineState {
                     // the next load and never hit disk.
                     if let Some(scene_dir) = save_path.parent() {
                         self.flush_dirty_terrain_tiles(scene_dir);
+                        // Phase 4.4: keep the streamer's scene_dir
+                        // in sync with the save path. The next
+                        // streamer tick will reach for .arvxtile
+                        // files under this directory before falling
+                        // back to TerrainFn.
+                        if let Some(runtime) = self.terrain.as_mut() {
+                            runtime.streamer.set_scene_dir(
+                                Some(scene_dir.to_path_buf()),
+                            );
+                        }
                     }
                     self.scene_path = Some(save_path);
                 }

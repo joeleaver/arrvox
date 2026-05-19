@@ -40,6 +40,7 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 
 use crate::bake::bake_tile;
 use crate::baked_tile::BakedTile;
+use crate::persist::read_baked_tile;
 use crate::terrain_fn::TerrainFn;
 use crate::tile_key::TileKey;
 
@@ -61,6 +62,11 @@ pub struct BakeJob {
     /// streamer drops results whose generation no longer matches
     /// `slot.requested_generation`.
     pub generation: u64,
+    /// Phase 4.4: optional `.arvxtile` path. When `Some` and the file
+    /// exists on disk, the worker loads the tile from disk instead of
+    /// running `TerrainFn`-driven voxelization. Caller resolves this
+    /// via `persist::tile_path(scene_dir, key)`.
+    pub disk_path: Option<std::path::PathBuf>,
 }
 
 /// Outcome of one worker job. `baked = None` means the bake failed —
@@ -188,12 +194,35 @@ fn worker_loop(
     completed: Arc<AtomicUsize>,
 ) {
     while let Ok(job) = inbox.recv() {
-        let BakeJob { key, voxel_size_m, terrain_fn, generation } = job;
+        let BakeJob { key, voxel_size_m, terrain_fn, generation, disk_path } = job;
 
-        // `bake_tile` only borrows `terrain_fn`; we keep the Arc on
-        // the stack so the worker doesn't have to handle the
-        // upgrade-vs-weak juggling later phases might want.
+        // Phase 4.4: if a `.arvxtile` is on disk for this key, load
+        // it instead of re-running `TerrainFn`. Falls back to the
+        // procedural bake on any read error so a corrupted file
+        // doesn't permanently block streaming the tile.
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(ref p) = disk_path {
+                if p.exists() {
+                    match read_baked_tile(p) {
+                        Ok((artifact, mesh, vs)) => {
+                            return Some(BakedTile {
+                                key,
+                                artifact,
+                                mesh,
+                                voxel_size_m: vs,
+                                bake_time_ms: 0.0,
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[arvx-terrain-bake] read {} failed: {e}; \
+                                 falling back to TerrainFn",
+                                p.display(),
+                            );
+                        }
+                    }
+                }
+            }
             bake_tile(key, voxel_size_m, &*terrain_fn)
         }));
         drop(terrain_fn);

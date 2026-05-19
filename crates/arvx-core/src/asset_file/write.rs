@@ -327,7 +327,13 @@ pub fn write_artifact_rkp(
     // the asset's global leaf_attr offset before any GPU upload.
     // Same one-time cost the arvx-import path pays — moves DAG
     // build out of the editor's load critical path.
-    let mesh_blob = build_mesh_sections_blob(
+    // Preserve halo data the artifact carries (terrain Phase 3+):
+    // when `halo_cells` is non-empty, build the mesh sections with
+    // the halo-aware extractor so the saved file's seam geometry
+    // matches what's in RAM. Non-terrain bakes pass an empty slice
+    // → identical to the non-halo path.
+    let halo_width: u32 = if artifact.halo_cells.is_empty() { 0 } else { 2 };
+    let mesh_blob = build_mesh_sections_blob_haloed(
         artifact.octree.as_slice(),
         artifact.octree.depth(),
         voxel_size,
@@ -337,6 +343,8 @@ pub fn write_artifact_rkp(
         // Procedural bakes never carry skinning data — generator
         // outputs are static geometry.
         &[],
+        &artifact.halo_cells,
+        halo_width,
     );
     let mesh_sections = if !mesh_blob.vertices.is_empty() {
         Some(mesh_blob.as_in())

@@ -109,6 +109,11 @@ pub struct TileStreamer {
     /// in steady state.
     submit_scratch: Vec<(TileKey, f32)>,
     evict_scratch: Vec<TileKey>,
+    /// Phase 4.4: scene directory used to resolve per-tile `.arvxtile`
+    /// paths at submit time. `None` for unsaved scratch scenes — the
+    /// worker then runs `TerrainFn` baking exclusively. The engine
+    /// updates this whenever `scene_path` changes (load / save-as).
+    scene_dir: Option<std::path::PathBuf>,
 }
 
 impl TileStreamer {
@@ -122,7 +127,20 @@ impl TileStreamer {
             max_in_flight: max_in_flight.max(1),
             submit_scratch: Vec::new(),
             evict_scratch: Vec::new(),
+            scene_dir: None,
         }
+    }
+
+    /// Phase 4.4: tell the streamer which scene directory holds the
+    /// `.arvxtile` files for this scene's terrain. Submitted bake
+    /// jobs will resolve `<scene_dir>/tiles/<key>.arvxtile` and the
+    /// worker will load from disk when the file exists.
+    ///
+    /// Pass `None` for unsaved scratch scenes — bakes then always
+    /// run `TerrainFn` voxelization. The engine sets this on
+    /// scene-load + save-as.
+    pub fn set_scene_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.scene_dir = dir;
     }
 
     /// Worker pool size this streamer was constructed with.
@@ -328,11 +346,16 @@ impl TileStreamer {
                 continue;
             }
             slot.requested_generation = slot.requested_generation.wrapping_add(1);
+            let disk_path = self
+                .scene_dir
+                .as_ref()
+                .map(|d| crate::persist::tile_path(d, key));
             let job = BakeJob {
                 key,
                 voxel_size_m: terrain.voxel_size_for_level(0),
                 terrain_fn: Arc::clone(&terrain.terrain_fn),
                 generation: slot.requested_generation,
+                disk_path,
             };
             if self.worker.submit(job) {
                 slot.state = TileState::Submitted;
