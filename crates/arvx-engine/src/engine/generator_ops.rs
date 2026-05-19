@@ -9,6 +9,23 @@
 use super::procedural_params::json_to_field_value;
 use super::state::EngineState;
 
+/// Geometry handed to [`EngineState::spawn_or_update_generated_child`].
+///
+/// Proxy meshes are the default (`emit_child` → surface-nets-from-SDF),
+/// matching the engine-wide "procedurals → proxy mesh" rule. Voxelized
+/// is for the rare `emit_child_artifact` path where the generator hand-
+/// rolled a `BakeArtifact`.
+pub(crate) enum GeneratedChildGeometry {
+    Voxelized {
+        spatial: crate::components::SpatialData,
+        voxel_count: u32,
+    },
+    ProxyMesh {
+        surface_mesh: arvx_render::proc_surface_nets::SurfaceMesh,
+        cluster: arvx_core::mesh_cluster::MeshletCluster,
+    },
+}
+
 impl EngineState {
     /// Pump the generator system once per frame.
     ///
@@ -114,14 +131,18 @@ impl EngineState {
     /// parent's *current* transform (not a stale snapshot from the
     /// worker), so dragging the generator between emit and spawn
     /// still places the child correctly.
+    ///
+    /// Geometry comes in two flavours. Proxy meshes are the default
+    /// (emit_child → surface-nets-from-SDF); voxelized children are
+    /// rare (emit_child_artifact → full BakeArtifact). The renderer
+    /// handles both via `RenderGeometry`.
     pub(crate) fn spawn_or_update_generated_child(
         &mut self,
         generator_entity: hecs::Entity,
         local_transform: crate::components::Transform,
         generation: u64,
         slot_key: String,
-        spatial: crate::components::SpatialData,
-        voxel_count: u32,
+        geometry: GeneratedChildGeometry,
         name_hint: Option<String>,
     ) {
         use crate::components::*;
@@ -148,27 +169,23 @@ impl EngineState {
             .or_default()
             .insert(slot_key.clone());
 
+        let voxel_count_for_log = match &geometry {
+            GeneratedChildGeometry::Voxelized { voxel_count, .. } => *voxel_count,
+            GeneratedChildGeometry::ProxyMesh { .. } => 0,
+        };
+        let geom_kind = match &geometry {
+            GeneratedChildGeometry::Voxelized { .. } => "voxelized",
+            GeneratedChildGeometry::ProxyMesh { .. } => "proxy",
+        };
+
         if let Some(existing) = self.find_persistent_child(generator_entity, &slot_key) {
-            // Reuse: free the old geometry, swap the Renderable's
-            // spatial in place, refresh transform + generation. Other
-            // components stay → user-attached lights / scripts survive
-            // across regens.
-            self.release_renderable_geometry(existing);
+            // Reuse: free the old geometry, swap in the new one,
+            // refresh transform + generation. Other components stay →
+            // user-attached lights / scripts survive across regens.
             if let Ok(mut t) = self.world.get::<&mut Transform>(existing) {
                 *t = world_transform;
             }
-            if let Ok(mut r) = self.world.get::<&mut Renderable>(existing) {
-                r.spatial = Some(crate::components::RenderGeometry::Octree(spatial));
-                r.voxel_count = voxel_count;
-                // Reload-from-cache populates `asset_handle` (children
-                // round-trip through the asset cache on load). The
-                // fresh bake hands us a raw scene-pool allocation,
-                // not an asset — clear the stale handle so the NEXT
-                // regen's release_renderable_geometry takes the
-                // deallocate-spatial path instead of releasing an
-                // asset that was already released up above.
-                r.asset_handle = None;
-            }
+            self.install_generated_geometry(existing, geometry);
             if let Ok(mut owned) =
                 self.world.get::<&mut crate::generator::GeneratorOwned>(existing)
             {
@@ -179,7 +196,7 @@ impl EngineState {
             self.gpu_objects_dirty.mark_all();
             eprintln!(
                 "[gen] reused child entity={existing:?} parent={generator_entity:?} \
-                 slot='{slot_key}' voxels={voxel_count} gen={generation}"
+                 slot='{slot_key}' kind={geom_kind} voxels={voxel_count_for_log} gen={generation}"
             );
             return;
         }
@@ -191,12 +208,15 @@ impl EngineState {
                 .unwrap_or_else(|_| "child".into())
         });
         let name = self.unique_name(&base_name);
+        // Spawn with empty geometry, then install — install handles
+        // the proxy-mesh handle-reserve + UploadProxyMesh round-trip,
+        // and the voxelized path just writes the SpatialData in place.
         let renderable = Renderable {
             asset_path: None,
             primitive: None,
             material_id: 0,
-            voxel_count,
-            spatial: Some(crate::components::RenderGeometry::Octree(spatial)),
+            voxel_count: 0,
+            spatial: None,
             ..Default::default()
         };
         let parent_uuid = self.entity_uuids.get(&generator_entity).copied();
@@ -234,13 +254,48 @@ impl EngineState {
             );
         }
         self.assign_entity_uuid(child);
+        self.install_generated_geometry(child, geometry);
         self.scene_dirty.mark_entity(child);
         self.geometry_dirty.mark_all();
         self.gpu_objects_dirty.mark_all();
         eprintln!(
             "[gen] spawned child entity={child:?} parent={generator_entity:?} \
-             name='{name}' slot='{slot_key}' voxels={voxel_count} gen={generation}"
+             name='{name}' slot='{slot_key}' kind={geom_kind} voxels={voxel_count_for_log} gen={generation}"
         );
+    }
+
+    /// Install the bake's geometry on a child entity that already has
+    /// the right Transform + EditorMetadata + GeneratorOwned wiring.
+    /// Handles both flavours; the proxy-mesh branch reserves a handle
+    /// and uploads to the render worker via `install_proxy_mesh_on_entity`.
+    pub(crate) fn install_generated_geometry(
+        &mut self,
+        entity: hecs::Entity,
+        geometry: GeneratedChildGeometry,
+    ) {
+        use crate::components::*;
+        match geometry {
+            GeneratedChildGeometry::Voxelized { spatial, voxel_count } => {
+                // Free the previous geometry first — if this is a reuse
+                // path, the old octree or proxy handle is still wired in.
+                self.release_renderable_geometry(entity);
+                if let Ok(mut r) = self.world.get::<&mut Renderable>(entity) {
+                    r.spatial = Some(RenderGeometry::Octree(spatial));
+                    r.voxel_count = voxel_count;
+                    // Reload-from-cache populates `asset_handle` (children
+                    // round-trip through the asset cache on load). The
+                    // fresh bake hands us a raw scene-pool allocation,
+                    // not an asset — clear the stale handle so the NEXT
+                    // regen's release_renderable_geometry takes the
+                    // deallocate-spatial path instead of releasing an
+                    // asset that was already released up above.
+                    r.asset_handle = None;
+                }
+            }
+            GeneratedChildGeometry::ProxyMesh { surface_mesh, cluster } => {
+                self.install_proxy_mesh_on_entity(entity, surface_mesh, cluster);
+            }
+        }
     }
 
     /// Find the existing persistent child of `parent` matching

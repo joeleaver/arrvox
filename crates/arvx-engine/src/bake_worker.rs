@@ -348,6 +348,37 @@ fn run_bake(
         );
         let outcome = match mesh {
             Some(m) => {
+                // Persist the proxy mesh to a sidecar cache if the
+                // caller asked for one (generator-child bakes do; live
+                // procedural edits don't). `cache_output_path` is
+                // already keyed `gen_<parent>_<slot>.arvxproxy` by the
+                // generator context — see `context::child_cache_path`.
+                // Cache failures are non-fatal: log + continue so the
+                // in-memory bake still installs on the entity.
+                if let Some(ref out_path) = req.cache_output_path {
+                    let cache = arvx_core::asset_file::ProxyCache {
+                        aabb_min: m.aabb_min.to_array(),
+                        aabb_max: m.aabb_max.to_array(),
+                        vertices: m.vertices.clone(),
+                        indices: m.indices.clone(),
+                    };
+                    let t_write_start = std::time::Instant::now();
+                    match arvx_core::asset_file::write_arvxproxy(out_path, &cache) {
+                        Ok(()) => {
+                            eprintln!(
+                                "[bake_worker] wrote proxy cache {} in {:.1}ms",
+                                out_path.display(),
+                                t_write_start.elapsed().as_secs_f32() * 1000.0,
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[bake_worker] proxy cache write failed ({}): {e}",
+                                out_path.display(),
+                            );
+                        }
+                    }
+                }
                 let cluster = m.single_cluster();
                 BakeOutcome::ProxyMeshOk {
                     surface_mesh: m,

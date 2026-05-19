@@ -54,6 +54,7 @@
 use std::io::Read;
 
 mod write;
+pub mod proxy;
 
 #[cfg(test)]
 mod tests;
@@ -61,6 +62,10 @@ mod tests;
 pub use write::{
     build_mesh_sections_blob, write_artifact_rkp, write_rkp, write_rkp_with_progress,
     MeshSectionsIn,
+};
+pub use proxy::{
+    read_arvxproxy, write_arvxproxy, ArvxProxyError, ArvxProxyHeader, ProxyCache,
+    ARVXPROXY_MAGIC, ARVXPROXY_VERSION,
 };
 
 use bytemuck::{Pod, Zeroable};

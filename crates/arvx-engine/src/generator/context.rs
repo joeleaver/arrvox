@@ -299,9 +299,18 @@ impl<'w> GeneratorContext<'w> {
         // when there's no scene path yet (unsaved scratch session) or
         // the generator entity has no UUID — both edge cases that
         // suppress caching gracefully.
+        //
+        // Extension tracks the bake-input variant so the loader can
+        // route to the right reader without sniffing file contents:
+        // - `Procedural` → proxy-mesh sidecar (`.arvxproxy`)
+        // - `ProceduralVoxelize` / `Artifact` → voxel asset (`.arvx`)
+        let cache_ext = match &input {
+            BakeInput::Procedural(_) => "arvxproxy",
+            BakeInput::ProceduralVoxelize(_) | BakeInput::Artifact(_) => "arvx",
+        };
         let cache_output_path = match (&self.child_cache_dir, self.generator_entity_uuid) {
             (Some(dir), Some(parent_uuid)) => {
-                Some(child_cache_path(dir, parent_uuid, &slot_key))
+                Some(child_cache_path(dir, parent_uuid, &slot_key, cache_ext))
             }
             _ => None,
         };
@@ -338,7 +347,9 @@ impl<'w> GeneratorContext<'w> {
 }
 
 /// Compute the on-disk bake-cache path for a persistent generator
-/// child: `{child_cache_dir}/gen_{parent_uuid_short}_{slot_slug}.arvx`.
+/// child: `{child_cache_dir}/gen_{parent_uuid_short}_{slot_slug}.{ext}`.
+/// `ext` is `arvx` for voxelized children and `arvxproxy` for proxy-mesh
+/// children — pick based on the `BakeInput` variant.
 ///
 /// Same path is used at write time (worker bakes the artifact here)
 /// and at save time (engine references it from the SceneObject's
@@ -348,6 +359,7 @@ pub fn child_cache_path(
     child_cache_dir: &std::path::Path,
     parent_uuid: uuid::Uuid,
     slot_key: &str,
+    ext: &str,
 ) -> std::path::PathBuf {
     let slot_slug: String = slot_key
         .chars()
@@ -364,7 +376,7 @@ pub fn child_cache_path(
     // filenames unwieldy.
     let parent_prefix = format!("{}", parent_uuid.simple());
     let parent_prefix = &parent_prefix[..parent_prefix.len().min(8)];
-    child_cache_dir.join(format!("gen_{parent_prefix}_{slot_slug}.arvx"))
+    child_cache_dir.join(format!("gen_{parent_prefix}_{slot_slug}.{ext}"))
 }
 
 #[cfg(test)]

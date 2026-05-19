@@ -68,29 +68,82 @@ impl EngineState {
                             Err(_) => None,
                         }
                     } else if obj.procedural_cache.is_some() {
-                        // Two cases land here:
+                        // Three cases land here:
                         //   - Procedurals (`primitive == Some("procedural")`):
                         //     the tree component arrives via the generic
                         //     components pass (ProceduralGeometry). The
-                        //     cache provides the pre-baked voxels so
+                        //     cache provides the pre-baked geometry so
                         //     reload is instant.
-                        //   - Persistent generator children (`primitive
-                        //     == None`, GeneratorOwned arrives via the
-                        //     generic components pass): the cache is
-                        //     their only geometry source. Without
-                        //     loading it here the child is invisible
-                        //     until the generator regens.
+                        //   - Persistent generator children with proxy-
+                        //     mesh geometry (`.arvxproxy` cache): the
+                        //     mesh-first default for `emit_child`.
+                        //     `GeneratorOwned` arrives via the generic
+                        //     components pass.
+                        //   - Persistent generator children with voxel
+                        //     geometry (`.arvx` cache): the rarer
+                        //     `emit_child_artifact` path.
                         //
-                        // Either way, attach the baked spatial. Missing
-                        // or unreadable cache leaves the entity empty —
-                        // for procedurals that's recoverable via Bake;
-                        // for generator children the parent generator's
-                        // next tick will detect the missing slot and
-                        // re-emit it.
+                        // Cache extension picks the loader:
+                        // `.arvxproxy` → ProxyMesh spatial via direct
+                        // read + render-thread upload; anything else →
+                        // shared asset cache (`.arvx` voxel asset).
+                        // Missing / unreadable caches leave the entity
+                        // empty — recoverable on the next Bake (for
+                        // single procedurals) or generator regen (for
+                        // children).
                         let (spatial, asset_handle, voxel_count) = match (&obj.procedural_cache, &scene_dir) {
                             (Some(rel), Some(dir)) => {
                                 let full = dir.join(rel);
-                                if full.exists() {
+                                if !full.exists() {
+                                    self.console.warn(format!(
+                                        "Procedural cache '{rel}' referenced by '{}' not found — entity will load unbaked",
+                                        obj.name,
+                                    ));
+                                    (None, None, 0)
+                                } else if rel.ends_with(".arvxproxy") {
+                                    match arvx_core::asset_file::read_arvxproxy(&full) {
+                                        Ok(cache) => {
+                                            let aabb = arvx_core::Aabb {
+                                                min: glam::Vec3::from_array(cache.aabb_min),
+                                                max: glam::Vec3::from_array(cache.aabb_max),
+                                            };
+                                            let surface_mesh = arvx_render::proc_surface_nets::SurfaceMesh {
+                                                vertices: cache.vertices,
+                                                indices: cache.indices,
+                                                aabb_min: aabb.min,
+                                                aabb_max: aabb.max,
+                                            };
+                                            let cluster = surface_mesh.single_cluster();
+                                            let handle = self
+                                                .scene_mgr
+                                                .lock()
+                                                .unwrap()
+                                                .reserve_procedural_handle();
+                                            let _ = self.render_worker.commands.send(
+                                                crate::render_frame::RenderCommand::UploadProxyMesh {
+                                                    handle_raw: handle.raw(),
+                                                    vertices: surface_mesh.vertices,
+                                                    indices: surface_mesh.indices,
+                                                    cluster,
+                                                },
+                                            );
+                                            (
+                                                Some(crate::components::RenderGeometry::ProxyMesh(
+                                                    crate::components::ProxyMeshData { handle, aabb },
+                                                )),
+                                                Some(handle),
+                                                0,
+                                            )
+                                        }
+                                        Err(e) => {
+                                            self.console.warn(format!(
+                                                "Failed to load proxy cache '{rel}' for '{}': {e}",
+                                                obj.name,
+                                            ));
+                                            (None, None, 0)
+                                        }
+                                    }
+                                } else {
                                     match self.scene_mgr.lock().unwrap().acquire_asset(&full.to_string_lossy()) {
                                         Ok((handle, info)) => {
                                             let sp = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
@@ -104,12 +157,6 @@ impl EngineState {
                                             (None, None, 0)
                                         }
                                     }
-                                } else {
-                                    self.console.warn(format!(
-                                        "Procedural cache '{rel}' referenced by '{}' not found — entity will load unbaked",
-                                        obj.name,
-                                    ));
-                                    (None, None, 0)
                                 }
                             }
                             _ => (None, None, 0),
@@ -120,8 +167,7 @@ impl EngineState {
                             // procedurals (so the inspector still
                             // recognises them and the components pass
                             // attaches the tree); `None` for generator
-                            // children (no tree, no procedural
-                            // affordances, just baked voxels).
+                            // children.
                             primitive: obj.primitive.clone(),
                             material_id: obj.material_id,
                             voxel_count,
@@ -471,12 +517,31 @@ impl EngineState {
                         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
                     match (&scene_dir, stem_opt) {
                         (Some(dir), Some(stem)) => {
+                            // Generator children come in two flavours:
+                            //   - Proxy-mesh (`emit_child`) → `.arvxproxy`
+                            //   - Voxelized (`emit_child_artifact`) → `.arvx`
+                            // Both share the `gen_<parent>_<slot>` stem;
+                            // probe proxy first (the dominant path),
+                            // fall through to voxel for the rare case.
+                            // The `abs.exists()` gate below filters
+                            // unbacked entries.
                             let bakes = dir.join(format!("{stem}.bakes"));
-                            Some(crate::generator::child_cache_path(
+                            let proxy_path = crate::generator::child_cache_path(
                                 &bakes,
                                 owned.parent_uuid,
                                 &owned.slot_key,
-                            ))
+                                "arvxproxy",
+                            );
+                            if proxy_path.exists() {
+                                Some(proxy_path)
+                            } else {
+                                Some(crate::generator::child_cache_path(
+                                    &bakes,
+                                    owned.parent_uuid,
+                                    &owned.slot_key,
+                                    "arvx",
+                                ))
+                            }
                         }
                         _ => None,
                     }

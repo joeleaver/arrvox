@@ -345,31 +345,39 @@ impl EngineState {
             // the spec carries everything needed downstream.
             if let Some(spec) = result.generator_child {
                 match result.outcome {
-                    BakeOutcome::Ok { spatial, voxel_count } => {
+                    BakeOutcome::ProxyMeshOk { surface_mesh, cluster } => {
                         self.spawn_or_update_generated_child(
                             spec.parent_entity,
                             spec.local_transform,
                             spec.generation,
                             spec.slot_key,
-                            spatial,
-                            voxel_count,
+                            super::generator_ops::GeneratedChildGeometry::ProxyMesh {
+                                surface_mesh,
+                                cluster,
+                            },
                             spec.name_hint,
                         );
                     }
-                    BakeOutcome::ProxyMeshOk { .. } => {
-                        // Generator children always voxelize today
-                        // (see context.rs's BakeRequest construction);
-                        // a ProxyMeshOk for a generator child means
-                        // the gate was bypassed somewhere upstream.
-                        self.console.warn(format!(
-                            "Generator child returned ProxyMesh — only Voxelize is supported \
-                             for generator-emitted children (parent={:?}).",
+                    BakeOutcome::Ok { spatial, voxel_count } => {
+                        // `emit_child_artifact` (BakeInput::Artifact) →
+                        // pre-voxelized child. Less common than the
+                        // proxy-mesh `emit_child` path but still
+                        // supported for hand-rolled BakeArtifact emits.
+                        self.spawn_or_update_generated_child(
                             spec.parent_entity,
-                        ));
+                            spec.local_transform,
+                            spec.generation,
+                            spec.slot_key,
+                            super::generator_ops::GeneratedChildGeometry::Voxelized {
+                                spatial,
+                                voxel_count,
+                            },
+                            spec.name_hint,
+                        );
                     }
                     BakeOutcome::Failed => {
                         self.console.warn(format!(
-                            "Generator child voxelization failed (parent={:?}, vs={:.4}).",
+                            "Generator child bake failed (parent={:?}, vs={:.4}).",
                             spec.parent_entity, result.voxel_size,
                         ));
                     }
@@ -526,18 +534,21 @@ impl EngineState {
         ));
     }
 
-    /// Apply a completed proxy-mesh bake. Releases any previous
-    /// renderer handle on the entity, reserves a fresh one,
-    /// commands the render thread to upload the GPU buffers, and
-    /// stamps the entity's `Renderable.spatial` with the
-    /// `RenderGeometry::ProxyMesh` variant.
-    pub(crate) fn apply_proxy_mesh_result(
+    /// Install a freshly-baked proxy mesh on `entity`: release any
+    /// prior geometry, reserve a procedural handle, ship the vertex /
+    /// index buffers to the render thread, and stamp the renderable.
+    /// Returns `false` if the entity vanished between bake and apply
+    /// (handle is rolled back so it doesn't leak).
+    ///
+    /// Shared between [`apply_proxy_mesh_result`] (single-procedural
+    /// bake) and [`install_generated_geometry`] (generator-emitted
+    /// child) — both need the same render-thread round-trip.
+    pub(crate) fn install_proxy_mesh_on_entity(
         &mut self,
         entity: hecs::Entity,
-        baked_root_scale: glam::Vec3,
         surface_mesh: arvx_render::proc_surface_nets::SurfaceMesh,
         cluster: arvx_core::mesh_cluster::MeshletCluster,
-    ) {
+    ) -> bool {
         use crate::components::*;
 
         // Free the previous geometry — either an octree allocation
@@ -575,6 +586,7 @@ impl EngineState {
             }));
             renderable.asset_handle = Some(handle);
             renderable.voxel_count = 0;
+            true
         } else {
             // Entity disappeared between request and result —
             // release the freshly-reserved handle so we don't leak.
@@ -588,6 +600,23 @@ impl EngineState {
                 .send(crate::render_frame::RenderCommand::ReleaseProxyMesh {
                     handle_raw: handle.raw(),
                 });
+            false
+        }
+    }
+
+    /// Apply a completed proxy-mesh bake. Installs the mesh via
+    /// [`install_proxy_mesh_on_entity`], then runs the procedural-
+    /// specific Transform.scale reconciliation.
+    pub(crate) fn apply_proxy_mesh_result(
+        &mut self,
+        entity: hecs::Entity,
+        baked_root_scale: glam::Vec3,
+        surface_mesh: arvx_render::proc_surface_nets::SurfaceMesh,
+        cluster: arvx_core::mesh_cluster::MeshletCluster,
+    ) {
+        use crate::components::*;
+
+        if !self.install_proxy_mesh_on_entity(entity, surface_mesh, cluster) {
             return;
         }
 
