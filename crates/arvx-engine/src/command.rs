@@ -57,6 +57,19 @@ pub enum EngineCommand {
         kind: StampKindSpec,
     },
 
+    /// Phase 6: spawn a `Region` entity (the cross-cutting region
+    /// primitive — see `docs/REGIONS.md`). Picks a shape from
+    /// [`RegionShapeSpec`] with sensible V1 defaults (radius / extents
+    /// / Smoothstep falloff). The new entity gets a `Transform` at
+    /// the editor camera's forward axis (matching `SpawnStamp` /
+    /// `SpawnPointLight`), an `EditorMetadata`, and the `Region`
+    /// component. No data components are attached on spawn — those
+    /// (e.g. `BiomeRegion`) are added through the Inspector's "Add
+    /// Component" affordance.
+    SpawnRegion {
+        shape: RegionShapeSpec,
+    },
+
     /// Spawn a generator-driven entity. `generator_name` must match a
     /// registered generator from the gameplay dylib. The entity gets a
     /// Transform, EditorMetadata, GeneratorState, and a default instance
@@ -748,6 +761,23 @@ pub enum PaintMode {
     Color,
     Material,
     Erase,
+}
+
+/// Wire-format selector for `SpawnRegion`. Mirrors
+/// `arvx_regions::RegionShape` minus the per-variant parameters —
+/// the engine handler fills those in with sensible V1 defaults
+/// (Sphere radius = 25 m, Box half-extents = (15, 15, 15) m, OBB
+/// same with identity rotation). Authors tweak from the Inspector
+/// after spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionShapeSpec {
+    /// Centred sphere.
+    Sphere,
+    /// Axis-aligned box.
+    Box,
+    /// Oriented box. Spawned with identity rotation — author edits
+    /// rotation via the standard rotate gizmo.
+    Obb,
 }
 
 /// Wire-format selector for `SpawnStamp`. Mirrors `arvx_terrain::StampKind`

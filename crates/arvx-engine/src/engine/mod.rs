@@ -35,6 +35,7 @@ mod sculpt_ops;
 mod procedural_gizmo;
 mod procedural_ops;
 mod procedural_params;
+mod region_ops;
 mod scene_gpu;
 mod scene_io_ops;
 mod scene_tree_ops;

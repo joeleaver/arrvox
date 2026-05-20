@@ -203,6 +203,19 @@ impl EngineState {
                 self.console.info(format!("Spawned '{name}'"));
             }
 
+            EngineCommand::SpawnRegion { shape } => {
+                // Spawn in front of the camera at ground level — same
+                // ergonomic as SpawnStamp / SpawnPointLight. Regions
+                // are usually placed where the author is looking; the
+                // gizmo nudges the rest of the way.
+                let cam = self.camera.position;
+                let yaw = self.camera.yaw;
+                let forward_xz = glam::Vec3::new(-yaw.sin(), 0.0, -yaw.cos()) * 25.0;
+                let position =
+                    glam::Vec3::new(cam.x + forward_xz.x, cam.y, cam.z + forward_xz.z);
+                self.handle_spawn_region(shape, position);
+            }
+
             EngineCommand::SpawnStamp { kind } => {
                 // Spawn in front of the camera at ground level. Stamps
                 // are heightmap features; we project the camera's

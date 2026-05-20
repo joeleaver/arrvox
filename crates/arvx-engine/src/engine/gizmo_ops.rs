@@ -276,6 +276,13 @@ impl EngineState {
     pub(crate) fn build_gizmo_wireframe(&self) -> Vec<arvx_render::LineVertex> {
         let mut verts = Vec::new();
 
+        // Region gizmos — Phase 6. Always-on outline of the shape, plus
+        // a softer outer shell at the falloff transition radius when
+        // selected. Cross-cutting primitive: any entity carrying a
+        // Region renders, regardless of which data components are
+        // attached (BiomeRegion, future Audio / Fog / Trigger).
+        verts.extend(self.build_region_wireframes());
+
         // Light gizmos — always visible for all light entities.
         let light_color = [1.0, 0.9, 0.5, 0.5]; // warm yellow, semi-transparent
         let selected_light_color = [1.0, 0.9, 0.5, 1.0]; // bright when selected
@@ -527,6 +534,99 @@ impl EngineState {
             let _ = self.world.remove_one::<ColliderCache>(entity);
         }
         let _ = self.world.insert_one(entity, cache);
+    }
+
+    /// Build wireframe visualization for every Region entity in the
+    /// world. Cyan palette to keep regions visually distinct from
+    /// light gizmos (warm yellow) and physics colliders (green/blue/
+    /// orange). Always-on dim outline of the shape; selection adds a
+    /// brighter outline + an outer shell at the falloff transition
+    /// radius.
+    pub(crate) fn build_region_wireframes(&self) -> Vec<arvx_render::LineVertex> {
+        use arvx_regions::{Region, RegionShape};
+        let mut verts = Vec::new();
+
+        let dim_color: [f32; 4] = [0.4, 0.9, 1.0, 0.45];
+        let bright_color: [f32; 4] = [0.55, 0.95, 1.0, 1.0];
+        let falloff_color: [f32; 4] = [0.55, 0.95, 1.0, 0.35];
+
+        for (entity, (transform, region)) in self
+            .world
+            .query::<(&crate::components::Transform, &Region)>()
+            .iter()
+        {
+            let selected = self.selected_entity == Some(entity);
+            let primary = if selected { bright_color } else { dim_color };
+            let center = transform.position;
+
+            // Shape outline (always drawn).
+            match region.shape {
+                RegionShape::Sphere { radius } => {
+                    let r = radius.max(0.0);
+                    verts.extend(arvx_render::wireframe::sphere_wireframe(center, r, primary));
+                }
+                RegionShape::Box { half_extents } => {
+                    let he = half_extents.max(glam::Vec3::ZERO);
+                    verts.extend(arvx_render::wireframe::aabb_wireframe(
+                        center - he,
+                        center + he,
+                        primary,
+                    ));
+                }
+                RegionShape::Obb { half_extents, rotation } => {
+                    let he = half_extents.max(glam::Vec3::ZERO);
+                    verts.extend(arvx_render::wireframe::obb_wireframe(
+                        -he,
+                        he,
+                        center,
+                        rotation,
+                        glam::Vec3::ONE,
+                        primary,
+                    ));
+                }
+            }
+
+            // Falloff shell (selected-only) — expanded copy of the shape
+            // at radius/extents + transition_m. Mirrors the light-range
+            // gizmo pattern (icon always, range only when selected) so
+            // unselected regions don't crowd the viewport.
+            if selected {
+                let t = region.falloff.transition_m();
+                if t > 0.0 {
+                    match region.shape {
+                        RegionShape::Sphere { radius } => {
+                            let r = radius.max(0.0) + t;
+                            verts.extend(arvx_render::wireframe::sphere_wireframe(
+                                center,
+                                r,
+                                falloff_color,
+                            ));
+                        }
+                        RegionShape::Box { half_extents } => {
+                            let he = half_extents.max(glam::Vec3::ZERO) + glam::Vec3::splat(t);
+                            verts.extend(arvx_render::wireframe::aabb_wireframe(
+                                center - he,
+                                center + he,
+                                falloff_color,
+                            ));
+                        }
+                        RegionShape::Obb { half_extents, rotation } => {
+                            let he = half_extents.max(glam::Vec3::ZERO) + glam::Vec3::splat(t);
+                            verts.extend(arvx_render::wireframe::obb_wireframe(
+                                -he,
+                                he,
+                                center,
+                                rotation,
+                                glam::Vec3::ONE,
+                                falloff_color,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        verts
     }
 
     /// Build wireframe visualization for all physics colliders from cached data.

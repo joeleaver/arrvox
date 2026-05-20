@@ -178,6 +178,23 @@ fn build_menus(
             }
         }));
     }
+    // Regions (Phase 6) — flat in the Spawn menu, same rationale as
+    // stamps. Region data components (BiomeRegion / future Audio /
+    // Fog / Trigger) are added through the Inspector's "Add
+    // Component" affordance after spawn.
+    spawn_menu = spawn_menu.separator();
+    for (label, spec) in [
+        ("Sphere Region", arvx_engine::RegionShapeSpec::Sphere),
+        ("Box Region", arvx_engine::RegionShapeSpec::Box),
+        ("OBB Region", arvx_engine::RegionShapeSpec::Obb),
+    ] {
+        spawn_menu = spawn_menu.item(MenuItem::new(label).on_click({
+            let tx = tx.clone();
+            move || {
+                let _ = tx.send(arvx_engine::EngineCommand::SpawnRegion { shape: spec });
+            }
+        }));
+    }
     // Generators live in the Models panel — they're assets, not spawn-
     // menu items. See `ui/panels/models_panel.rs`.
 
