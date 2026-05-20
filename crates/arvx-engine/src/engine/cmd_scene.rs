@@ -203,6 +203,22 @@ impl EngineState {
                 self.console.info(format!("Spawned '{name}'"));
             }
 
+            EngineCommand::SpawnStamp { kind } => {
+                // Spawn in front of the camera at ground level. Stamps
+                // are heightmap features; we project the camera's
+                // forward onto the XZ plane (drop the pitch component)
+                // so the new stamp is always visible regardless of the
+                // current camera pitch. Forward convention matches
+                // `fly_direction` in camera.rs: forward = (-sin yaw, _, -cos yaw).
+                let cam = self.camera.position;
+                let yaw = self.camera.yaw;
+                let forward_xz =
+                    glam::Vec3::new(-yaw.sin(), 0.0, -yaw.cos()) * 25.0;
+                let position =
+                    glam::Vec3::new(cam.x + forward_xz.x, 0.0, cam.z + forward_xz.z);
+                self.handle_spawn_stamp(kind, position);
+            }
+
             EngineCommand::SpawnTerrain => {
                 use crate::components::*;
                 use arvx_terrain::Terrain;
@@ -505,6 +521,11 @@ impl EngineState {
                     if let Ok(mut t) = self.world.get::<&mut crate::components::Transform>(entity) {
                         t.position = position;
                     }
+                    // Phase 5.6: if the moved entity is a stamp, mirror
+                    // the new world position into its Stamp component and
+                    // invalidate the union(old, new) AABB so the streamer
+                    // re-bakes affected tiles. No-op for non-stamps.
+                    self.maybe_sync_stamp_after_transform(entity);
                 }
             }
 

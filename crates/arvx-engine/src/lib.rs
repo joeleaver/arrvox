@@ -43,7 +43,9 @@ pub mod terrain_state;
 pub mod viewport;
 pub mod wireframe_builders;
 
-pub use command::{DragPreviewSource, EngineCommand, PaintMode, SculptMode};
+pub use command::{
+    DragPreviewSource, EngineCommand, PaintMode, SculptMode, StampKindSpec,
+};
 /// Re-export of [`arvx_core::sculpt::FalloffCurve`] so the editor
 /// (which does not depend on `arvx-core` directly) can name it when
 /// building [`EngineCommand::SculptAtPixel`].

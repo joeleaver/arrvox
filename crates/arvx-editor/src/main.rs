@@ -158,7 +158,25 @@ fn build_menus(
         .item(MenuItem::new("Terrain").on_click({
             let tx = tx.clone();
             move || { let _ = tx.send(arvx_engine::EngineCommand::SpawnTerrain); }
-        }));
+        }))
+        .submenu("Stamp", {
+            let mut sub = Menu::new();
+            for (label, spec) in [
+                ("Mountain", arvx_engine::StampKindSpec::Mountain),
+                ("Hill", arvx_engine::StampKindSpec::Hill),
+                ("Lake", arvx_engine::StampKindSpec::Lake),
+                ("Plateau", arvx_engine::StampKindSpec::Plateau),
+                ("Flatten", arvx_engine::StampKindSpec::Flatten),
+            ] {
+                sub = sub.item(MenuItem::new(label).on_click({
+                    let tx = tx.clone();
+                    move || {
+                        let _ = tx.send(arvx_engine::EngineCommand::SpawnStamp { kind: spec });
+                    }
+                }));
+            }
+            sub
+        });
     // Generators live in the Models panel — they're assets, not spawn-
     // menu items. See `ui/panels/models_panel.rs`.
 

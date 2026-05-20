@@ -5,9 +5,10 @@
 
 use crate::inspector::{FieldType, FieldValue};
 
-mod world;
-mod visuals;
 mod sim;
+mod terrain_stamp;
+mod visuals;
+mod world;
 
 /// Metadata for a single field on a component.
 #[derive(Debug, Clone)]
@@ -137,5 +138,6 @@ pub fn register_builtins(registry: &mut ComponentRegistry) {
     registry.register(sim::animation_player_entry());
     registry.register(crate::generator::generator_state_entry());
     registry.register(crate::generator::generator_owned_entry());
+    registry.register(terrain_stamp::stamp_entry());
 }
 

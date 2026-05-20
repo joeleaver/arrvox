@@ -158,6 +158,12 @@ impl EngineState {
             .map(|m| m.name.clone())
             .unwrap_or_else(|_| "unknown".into());
 
+        // Phase 5.6: capture the stamp's AABB before despawn so the
+        // post-delete sync invalidates the right tiles. Pre-delete
+        // because the Stamp component is gone after `world.despawn`.
+        let stamp_aabb_to_invalidate =
+            self.capture_stamp_aabb_before_delete(entity);
+
         // If this is a generator entity, cancel any in-flight run and
         // recursively delete its owned children first. Children hold
         // their own pool allocations that need the standard cleanup
@@ -256,6 +262,14 @@ impl EngineState {
 
         // Despawn from ECS.
         let _ = self.world.despawn(entity);
+
+        // Phase 5.6: if this was a stamp, the Terrain.stamps index now
+        // contains a stale entry. Re-sync from the live ECS (the
+        // entity is gone, so the new index won't include it) and
+        // invalidate the AABB we captured before despawn.
+        if let Some(aabb) = stamp_aabb_to_invalidate {
+            self.sync_terrain_stamps_and_invalidate(Some(aabb));
+        }
 
         self.console.info(format!("Deleted '{name}'"));
         self.geometry_dirty.mark_all();

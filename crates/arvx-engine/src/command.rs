@@ -43,6 +43,20 @@ pub enum EngineCommand {
     /// 192 m render radius); Phase 9 adds Inspector / preset support.
     SpawnTerrain,
 
+    /// Phase 5: spawn a heightmap `Stamp` entity under the Terrain.
+    /// The engine rebuilds the Terrain's `StampIndex` and dirties
+    /// every tile whose AABB intersects the new stamp's footprint.
+    /// No-op + console warn when no Terrain is in the scene.
+    ///
+    /// Position resolves to the editor camera's forward axis at a
+    /// small offset (matches the `SpawnPointLight` ergonomic) so the
+    /// new stamp is visible immediately. Users nudge it into place
+    /// via the standard translate gizmo; the `SetObjectPosition` hook
+    /// re-syncs the stamp index and invalidates touched tiles.
+    SpawnStamp {
+        kind: StampKindSpec,
+    },
+
     /// Spawn a generator-driven entity. `generator_name` must match a
     /// registered generator from the gameplay dylib. The entity gets a
     /// Transform, EditorMetadata, GeneratorState, and a default instance
@@ -734,6 +748,25 @@ pub enum PaintMode {
     Color,
     Material,
     Erase,
+}
+
+/// Wire-format selector for `SpawnStamp`. Mirrors `arvx_terrain::StampKind`
+/// but lives here so commands stay flat-Copy + serializable without
+/// pulling the terrain crate's geometry types into command serde.
+/// Each variant maps 1:1 to a `StampKind` constructor with sensible
+/// V1 defaults applied by the engine handler.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StampKindSpec {
+    /// Circular peak. Default h_max = 50 m, radius = 30 m, smoothstep falloff.
+    Mountain,
+    /// Smaller circular peak. Default h_max = 10 m, radius = 15 m, smoothstep falloff.
+    Hill,
+    /// Circular basin. Default depth = 8 m, radius = 20 m, smoothstep falloff.
+    Lake,
+    /// Rectangular plateau. Default half-extents = (15 m, 15 m). SmoothMax op.
+    Plateau,
+    /// Rectangular hard flatten. Default half-extents = (10 m, 10 m). Replace op.
+    Flatten,
 }
 
 /// What's being dragged into the viewport for a live preview. The
