@@ -364,6 +364,26 @@ impl TileStreamer {
     /// path. V1 limitation: there's a one-bake gap between despawn
     /// and re-integrate; tiles flicker out briefly. Hot-swap (keep
     /// the live entity until the new bake lands) is a follow-up.
+    /// Evict every Live tile and re-queue it. Used by editor flows
+    /// that change the global terrain source (TerrainFn parameters,
+    /// base tier) — every loaded tile is now stale, so we throw
+    /// everything away and let the streamer rebuild from scratch on
+    /// the next residency tick.
+    ///
+    /// Same return shape as [`Self::invalidate_aabb`] so the engine's
+    /// eviction path is shared.
+    pub fn invalidate_all(&mut self) -> Vec<(TileKey, u64)> {
+        // f32::MAX would overflow into NaN arithmetic for slot AABB
+        // intersection; use a finite but enormous box that comfortably
+        // exceeds any plausible world extent (one billion metres on
+        // each side).
+        let huge = Aabb {
+            min: glam::Vec3::splat(-1.0e9),
+            max: glam::Vec3::splat(1.0e9),
+        };
+        self.invalidate_aabb(huge)
+    }
+
     pub fn invalidate_aabb(&mut self, aabb: Aabb) -> Vec<(TileKey, u64)> {
         let mut to_evict: Vec<(TileKey, u64)> = Vec::new();
         for (key, slot) in self.tiles.iter_mut() {
@@ -484,6 +504,7 @@ mod tests {
                 extent: glam::UVec3::new(2, 1, 2),
             },
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
+            spec: crate::TerrainFnSpec::default(),
             terrain_fn: Arc::new(AllSky),
             stamps: Arc::new(crate::stamp_index::StampIndex::new()),
             regions: Arc::new(crate::TerrainRegionSnapshot::new()),
@@ -529,6 +550,7 @@ mod tests {
         let large = Terrain {
             bounds: TerrainBounds::Unbounded,
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
+            spec: crate::TerrainFnSpec::default(),
             terrain_fn: Arc::new(AllSky),
             stamps: Arc::new(crate::stamp_index::StampIndex::new()),
             regions: Arc::new(crate::TerrainRegionSnapshot::new()),
@@ -588,6 +610,32 @@ mod tests {
         let post = s.stats();
         assert!(post.queued >= evictions.len() as u32);
         assert!(post.live <= live_before - evictions.len() as u32);
+    }
+
+    /// Phase 9: `invalidate_all` evicts every Live tile, regardless
+    /// of its world position. Same as `invalidate_aabb` with a huge
+    /// box but exposes the "kill everything" semantic in one call.
+    #[test]
+    fn invalidate_all_evicts_every_live_tile() {
+        let mut s = TileStreamer::new(1, 1);
+        let terrain = small_terrain();
+        let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
+        let _ = s.update_residency(&terrain, camera);
+
+        // Force every slot to Live.
+        let mut next_tok: u64 = 100;
+        for slot in s.tiles.values_mut() {
+            slot.state = TileState::Live;
+            slot.integrated_token = Some(next_tok);
+            next_tok += 1;
+        }
+        let live_before = s.stats().live;
+        assert!(live_before > 0);
+
+        let evictions = s.invalidate_all();
+        assert_eq!(evictions.len() as u32, live_before);
+        assert_eq!(s.stats().live, 0);
+        assert!(s.stats().queued >= live_before);
     }
 
     /// `invalidate_aabb` bumps generation on a Submitted slot so the

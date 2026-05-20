@@ -27,7 +27,7 @@ use glam::Vec3;
 ///
 /// Deterministic given the seed. Self-contained — uses an internal
 /// xorshift-style hash for the noise lattice, no `rand`/`noise` crate.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FbmTerrainFn {
     /// Determinism seed.
     pub seed: u32,

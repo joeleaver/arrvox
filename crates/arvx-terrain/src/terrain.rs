@@ -7,10 +7,10 @@
 //! the Inspector / viewport toolbar / save-scene path.
 
 use crate::bounds::TerrainBounds;
-use crate::fbm::FbmTerrainFn;
 use crate::region_snapshot::{TerrainRegionSnapshot, TerrainRegionSnapshotHandle};
 use crate::stamp_index::{StampIndex, StampIndexHandle};
 use crate::terrain_fn::TerrainFn;
+use crate::terrain_fn_spec::TerrainFnSpec;
 use std::sync::Arc;
 
 /// Per-scene terrain feature. Singleton enforced by the editor.
@@ -31,9 +31,15 @@ pub struct Terrain {
     /// the unified pow2 table). The V2 LOD pyramid walks one tier
     /// coarser per LOD level (`base_tier + level`).
     pub base_tier: usize,
-    /// Procedural source. Defaults to a vanilla [`FbmTerrainFn`].
-    /// Phase 9 will swap this from the Inspector. `Arc` makes job
-    /// submission cheap.
+    /// Procedural source as a serializable spec — authoritative on
+    /// disk. Phase 9 Inspector edits write here; `terrain_fn`
+    /// stays in lockstep via `spec.to_dyn()`. On scene load we
+    /// reconstruct `terrain_fn` from the loaded `spec`.
+    pub spec: TerrainFnSpec,
+    /// Procedural source (runtime form). Always equals
+    /// `spec.to_dyn()`; the two fields move together on every
+    /// write. Wrapped in `Arc` so bake jobs clone the pointer
+    /// cheaply.
     pub terrain_fn: Arc<dyn TerrainFn>,
     /// Layer-2 stamp index — cached mirror of the world's `Stamp` ECS
     /// entities owned by this Terrain. The engine rebuilds this
@@ -72,10 +78,13 @@ impl std::fmt::Debug for Terrain {
 
 impl Default for Terrain {
     fn default() -> Self {
+        let spec = TerrainFnSpec::default();
+        let terrain_fn = spec.to_dyn();
         Self {
             bounds: TerrainBounds::default(),
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
-            terrain_fn: Arc::new(FbmTerrainFn::default()),
+            spec,
+            terrain_fn,
             stamps: Arc::new(StampIndex::new()),
             regions: Arc::new(TerrainRegionSnapshot::new()),
             render_radius_m: 192.0,
@@ -84,6 +93,29 @@ impl Default for Terrain {
 }
 
 impl Terrain {
+    /// Replace the procedural source. Updates both `spec` and the
+    /// cached runtime `terrain_fn` in lockstep so subsequent bake
+    /// jobs use the new source.
+    pub fn set_spec(&mut self, spec: TerrainFnSpec) {
+        self.terrain_fn = spec.to_dyn();
+        self.spec = spec;
+    }
+
+    /// Mutate the spec in place (Inspector edits hit one field at a
+    /// time) and refresh the runtime trait object. The closure
+    /// returns whether it actually changed anything — `false`
+    /// skips the trait-object rebuild.
+    pub fn mutate_spec<F>(&mut self, f: F) -> bool
+    where
+        F: FnOnce(&mut TerrainFnSpec) -> bool,
+    {
+        let changed = f(&mut self.spec);
+        if changed {
+            self.terrain_fn = self.spec.to_dyn();
+        }
+        changed
+    }
+
     /// Voxel size in metres for a tile at the given LOD level.
     ///
     /// V2 LOD-pyramid semantics: each LOD level *doubles* the voxel
