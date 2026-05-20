@@ -425,6 +425,7 @@ pub fn extract_surface_mesh(
     brick_cells: &[u32],
     leaf_attr_pool: &[LeafAttr],
     bone_voxel_pool: &[BoneVoxel],
+    sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
 ) -> (Vec<MeshVertex>, Vec<u32>) {
     extract_surface_mesh_haloed(
         octree_nodes,
@@ -436,6 +437,7 @@ pub fn extract_surface_mesh(
         bone_voxel_pool,
         &[],
         0,
+        sculpt_slots,
     )
 }
 
@@ -480,6 +482,12 @@ pub fn extract_surface_mesh(
 /// inside the neighbouring solid). When `halo = 0` this function is
 /// bit-identical to [`extract_surface_mesh`] regardless of the slice.
 #[allow(clippy::too_many_arguments)]
+/// `sculpt_slots`: leaf-attr slots allocated by sculpt. Used by
+/// `build_cube_vertex`'s tie-break to prefer sculpt cells over
+/// procedural neighbours when both share an SN cube corner. `None`
+/// (or empty set) keeps the original position-only `coord_less`
+/// tie-break — what callers without sculpt context (procedural
+/// bakes, paint, the initial extract) want.
 pub fn extract_surface_mesh_haloed(
     octree_nodes: &[u32],
     octree_depth: u8,
@@ -490,6 +498,7 @@ pub fn extract_surface_mesh_haloed(
     bone_voxel_pool: &[BoneVoxel],
     halo_cells: &[(IVec3, u32)],
     halo: u32,
+    sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
 ) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
@@ -619,6 +628,7 @@ pub fn extract_surface_mesh_haloed(
                             grid_origin,
                             leaf_attr_pool,
                             bone_voxel_pool,
+                            sculpt_slots,
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
@@ -708,6 +718,7 @@ pub fn extract_mesh_region_from_cells(
     brick_cells: &[u32],
     leaf_attr_pool: &[LeafAttr],
     bone_voxel_pool: &[BoneVoxel],
+    sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
 ) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut scratch = SculptExtractScratch::new();
     extract_mesh_region_from_cells_pooled(
@@ -722,6 +733,7 @@ pub fn extract_mesh_region_from_cells(
         brick_cells,
         leaf_attr_pool,
         bone_voxel_pool,
+        sculpt_slots,
     )
 }
 
@@ -750,6 +762,7 @@ pub fn extract_mesh_region_from_cells_pooled(
     brick_cells: &[u32],
     leaf_attr_pool: &[LeafAttr],
     bone_voxel_pool: &[BoneVoxel],
+    sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
 ) -> (Vec<MeshVertex>, Vec<u32>) {
     extract_mesh_region_from_cells_pooled_haloed(
         scratch,
@@ -764,6 +777,7 @@ pub fn extract_mesh_region_from_cells_pooled(
         leaf_attr_pool,
         bone_voxel_pool,
         &[],
+        sculpt_slots,
     )
 }
 
@@ -800,6 +814,7 @@ pub fn extract_mesh_region_from_cells_pooled_haloed(
     leaf_attr_pool: &[LeafAttr],
     bone_voxel_pool: &[BoneVoxel],
     halo_cells: &[(IVec3, u32)],
+    sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
 ) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
@@ -960,6 +975,7 @@ pub fn extract_mesh_region_from_cells_pooled_haloed(
                             grid_origin,
                             leaf_attr_pool,
                             bone_voxel_pool,
+                            sculpt_slots,
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
@@ -1008,6 +1024,7 @@ pub fn extract_surface_mesh_region(
         brick_cells,
         leaf_attr_pool,
         bone_voxel_pool,
+        None,
     )
 }
 
@@ -1044,6 +1061,7 @@ fn build_cube_vertex<F>(
     grid_origin: Vec3,
     leaf_attr_pool: &[LeafAttr],
     bone_voxel_pool: &[BoneVoxel],
+    sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
 ) -> MeshVertex
 where
     F: Fn(IVec3) -> Option<u32>,
@@ -1053,7 +1071,16 @@ where
     let mut corner_solid = [false; 8];
     let mut normal_sum = Vec3::ZERO;
     let mut leaf_attr_id: u32 = 0;
-    let mut chosen: Option<IVec3> = None;
+    // `chosen` carries (coord, is_sculpt) so the per-corner tie-break
+    // can prefer sculpt slots over pre-existing ones. Without that
+    // bias the lowest-coord cell wins purely by position, and a
+    // brush-allocated cell sharing an SN cube with procedural
+    // neighbours sometimes loses the corner — visible as the sculpt
+    // surface picking up the surrounding terrain's material/colour
+    // in a position-dependent pattern. Among cells of the same
+    // sculpt class we fall back to `coord_less` so the tie-break
+    // stays deterministic.
+    let mut chosen: Option<(IVec3, bool)> = None;
     for i in 0u32..8 {
         let oa = corner_offset(i);
         let c = cube + oa;
@@ -1063,12 +1090,21 @@ where
                 if let Some(attr) = leaf_attr_pool.get(slot as usize) {
                     normal_sum += unpack_oct(attr.normal_oct);
                 }
+                let c_is_sculpt = sculpt_slots
+                    .map(|s| s.contains(&slot))
+                    .unwrap_or(false);
                 let take = match chosen {
                     None => true,
-                    Some(prev) => coord_less(c, prev),
+                    Some((prev_coord, prev_is_sculpt)) => {
+                        match (c_is_sculpt, prev_is_sculpt) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            _ => coord_less(c, prev_coord),
+                        }
+                    }
                 };
                 if take {
-                    chosen = Some(c);
+                    chosen = Some((c, c_is_sculpt));
                     leaf_attr_id = slot;
                 }
             }
@@ -1557,7 +1593,7 @@ mod tests {
     #[test]
     fn empty_octree_yields_nothing() {
         let nodes = vec![EMPTY_NODE];
-        let (verts, indices) = extract_surface_mesh(&nodes, 4, 0.001, Vec3::ZERO, &[], &[], &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 4, 0.001, Vec3::ZERO, &[], &[], &[], None);
         assert!(verts.is_empty());
         assert!(indices.is_empty());
     }
@@ -1579,7 +1615,7 @@ mod tests {
         let nodes = vec![make_leaf(7)];
         let vs = 0.5;
         let origin = Vec3::new(1.0, 2.0, 3.0);
-        let (verts, indices) = extract_surface_mesh(&nodes, 0, vs, origin, &[], &[], &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 0, vs, origin, &[], &[], &[], None);
 
         assert_eq!(verts.len(), 8, "8 SN-cube vertices around the unit cell");
         assert_eq!(indices.len(), 36, "6 faces × 2 triangles × 3 indices");
@@ -1618,7 +1654,7 @@ mod tests {
     #[test]
     fn closed_cube_winds_outward() {
         let nodes = vec![make_leaf(0)];
-        let (verts, indices) = extract_surface_mesh(&nodes, 0, 1.0, Vec3::ZERO, &[], &[], &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 0, 1.0, Vec3::ZERO, &[], &[], &[], None);
         let mut counts = [0i32; 6]; // +X -X +Y -Y +Z -Z
 
         for tri in indices.chunks(3) {
@@ -1657,7 +1693,7 @@ mod tests {
         let nodes = vec![make_brick(0)];
         let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
         bricks[0] = 99;
-        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[], None);
         assert_eq!(verts.len(), 8);
         assert_eq!(indices.len(), 36);
         for v in &verts {
@@ -1676,7 +1712,7 @@ mod tests {
         let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
         bricks[0] = 1; // (0,0,0)
         bricks[1] = 2; // (1,0,0) — face-adjacent in +X
-        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[], None);
         assert_eq!(verts.len(), 12, "12 unique corners of a 2×1×1 box");
         assert_eq!(indices.len(), 60, "10 exposed faces × 2 triangles × 3 indices");
     }
@@ -1693,7 +1729,7 @@ mod tests {
         let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
         bricks[0] = 5; // (0,0,0) surface
         bricks[1] = BRICK_INTERIOR; // (1,0,0) interior
-        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[], None);
         // Surface cell exposes 5 of 6 faces (+X is hidden by INTERIOR).
         // INTERIOR cell exposes 5 of 6 faces toward EMPTY (-X is hidden
         // by the surface cell, but +X, +Y, -Y, +Z, -Z are exposed to
@@ -1749,7 +1785,7 @@ mod tests {
             }
         }
 
-        let (verts, indices) = extract_surface_mesh(&nodes, 3, 1.0, Vec3::ZERO, &bricks, &[], &[]);
+        let (verts, indices) = extract_surface_mesh(&nodes, 3, 1.0, Vec3::ZERO, &bricks, &[], &[], None);
 
         // Every triangle must point along an outward axis. Check that
         // *no* triangle points in +X (those would be surface→INTERIOR
@@ -1791,7 +1827,7 @@ mod tests {
             BoneVoxel::new([7, 0, 0, 0], [255, 0, 0, 0]),
         ];
         let (verts, _) = extract_surface_mesh(
-            &nodes, 2, 1.0, Vec3::ZERO, &bricks, &leaf_attrs, &bone_pool,
+            &nodes, 2, 1.0, Vec3::ZERO, &bricks, &leaf_attrs, &bone_pool, None,
         );
         assert!(!verts.is_empty(), "extractor produced no vertices");
         for v in &verts {
@@ -1809,7 +1845,7 @@ mod tests {
         bricks[0] = 0;
         bricks[1] = 1;
         let (verts, _) = extract_surface_mesh(
-            &nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[],
+            &nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[], None,
         );
         assert!(!verts.is_empty());
         for v in &verts {
@@ -1840,7 +1876,7 @@ mod tests {
                 material_secondary_blend: 0,
             },
         ];
-        let (verts, _) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &pool, &[]);
+        let (verts, _) = extract_surface_mesh(&nodes, 2, 1.0, Vec3::ZERO, &bricks, &pool, &[], None);
         for v in &verts {
             let n = unpack_oct(v.normal_oct);
             assert!((n - Vec3::Y).length() < 1e-3, "expected +Y, got {:?}", n);
@@ -1894,7 +1930,7 @@ mod tests {
         let depth = 2u8;
         let extent = 1i32 << depth;
         let (full_v, full_i) =
-            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[]);
+            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[], None);
         let (region_v, region_i) = extract_surface_mesh_region(
             &nodes,
             depth,
@@ -1973,7 +2009,7 @@ mod tests {
         let depth = 2u8;
         // Full extract for reference (10 faces × 2 = 20 tris).
         let (full_v, full_i) =
-            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[]);
+            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[], None);
         let full_tris = full_i.len() / 3;
         assert_eq!(full_tris, 20, "2-cell box has 10 exposed faces × 2 tris");
 
@@ -2042,23 +2078,23 @@ mod tests {
         let cells1 = collect_cell_map(&nodes1, depth, &bricks1);
         let (ref_v1, ref_i1) = extract_mesh_region_from_cells(
             &cells1, region_min, region_max, &nodes1, depth, 1.0,
-            Vec3::ZERO, &bricks1, &[], &[],
+            Vec3::ZERO, &bricks1, &[], &[], None,
         );
         let cells2 = collect_cell_map(&nodes2, depth, &bricks2);
         let (ref_v2, ref_i2) = extract_mesh_region_from_cells(
             &cells2, region_min, region_max, &nodes2, depth, 1.0,
-            Vec3::ZERO, &bricks2, &[], &[],
+            Vec3::ZERO, &bricks2, &[], &[], None,
         );
 
         // Pooled: both stamps share the same scratch.
         let mut scratch = SculptExtractScratch::new();
         let (pool_v1, pool_i1) = extract_mesh_region_from_cells_pooled(
             &mut scratch, &cells1, region_min, region_max, &nodes1,
-            depth, 1.0, Vec3::ZERO, &bricks1, &[], &[],
+            depth, 1.0, Vec3::ZERO, &bricks1, &[], &[], None,
         );
         let (pool_v2, pool_i2) = extract_mesh_region_from_cells_pooled(
             &mut scratch, &cells2, region_min, region_max, &nodes2,
-            depth, 1.0, Vec3::ZERO, &bricks2, &[], &[],
+            depth, 1.0, Vec3::ZERO, &bricks2, &[], &[], None,
         );
 
         assert_eq!(
@@ -2076,7 +2112,7 @@ mod tests {
         // stamp 1's output — the dirty-tracking reset must be complete.
         let (pool_v3, pool_i3) = extract_mesh_region_from_cells_pooled(
             &mut scratch, &cells1, region_min, region_max, &nodes1,
-            depth, 1.0, Vec3::ZERO, &bricks1, &[], &[],
+            depth, 1.0, Vec3::ZERO, &bricks1, &[], &[], None,
         );
         assert_eq!(
             triangle_position_set(&ref_i1, &ref_v1),
@@ -2107,7 +2143,7 @@ mod tests {
         let extent = 1i32 << depth;
 
         let (full_v, full_i) =
-            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[]);
+            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[], None);
         let (region_v, region_i) = extract_surface_mesh_region(
             &nodes,
             depth,
@@ -2163,6 +2199,7 @@ mod tests {
             &bricks,
             &[],
             &[],
+            None,
         );
         assert_eq!(
             triangle_position_set(&i1, &v1),

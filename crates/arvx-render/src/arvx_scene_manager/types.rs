@@ -240,6 +240,23 @@ pub(super) struct AssetEntry {
     /// Stored as a `HashSet<u32>` so freed-then-reallocated slots
     /// don't accumulate duplicates that would double-free on release.
     pub(super) sculpt_extra_slots: std::collections::HashSet<u32>,
+    /// Every leaf-attr slot the sculpt brush has allocated for this
+    /// asset (superset of `sculpt_extra_slots` — includes both
+    /// out-of-bake-range AND reused in-bake-range slots). Used by
+    /// `build_cube_vertex`'s sculpt-bias tie-break: when an SN cube
+    /// has corner cells from both sculpt and pre-existing surface,
+    /// the per-vertex `leaf_attr_id` (which drives material + color)
+    /// prefers the sculpt slot. Without this bias the lowest-coord
+    /// corner wins purely by position, so sculpt cells sometimes
+    /// inherit a procedural neighbour's material and the brush
+    /// material disappears in a position-dependent pattern.
+    ///
+    /// Populated on every sculpt-allocated slot in `apply_delta`'s
+    /// post-write loop; entries removed when slots are freed (so the
+    /// set tracks only currently-live sculpt cells). Empty for
+    /// assets that have never been sculpted — those paths see the
+    /// original `coord_less`-only behaviour.
+    pub(super) sculpt_owned_slots: rustc_hash::FxHashSet<u32>,
     /// Phase 4.2b: leaf-attr slots allocated specifically for new
     /// halo cells discovered during cross-tile halo refresh. The
     /// bake-time halo's slots live inside the asset's contiguous
@@ -830,6 +847,7 @@ mod slab_tests {
             cluster_spatial_index:
                 crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
             sculpt_extra_slots: std::collections::HashSet::new(),
+            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
         }
@@ -1034,6 +1052,7 @@ mod slab_tests {
             cluster_spatial_index:
                 crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
             sculpt_extra_slots: std::collections::HashSet::new(),
+            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
         };

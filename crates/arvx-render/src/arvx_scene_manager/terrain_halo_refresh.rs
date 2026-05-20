@@ -381,6 +381,13 @@ impl ArvxSceneManager {
                 self.leaf_attr_pool.bones_as_slice(),
                 &halo_cells,
                 TILE_HALO_VOXELS as u32,
+                // Halo refresh re-extracts the whole target tile —
+                // bias the SN tie-break toward sculpt-allocated
+                // slots so brush-added cells along the boundary
+                // keep their material/colour against neighbour
+                // halo cells (which always carry the procedural
+                // material).
+                Some(&entry.sculpt_owned_slots),
             )
         };
 

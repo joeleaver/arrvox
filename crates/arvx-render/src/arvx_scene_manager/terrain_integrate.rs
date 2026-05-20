@@ -342,6 +342,7 @@ impl ArvxSceneManager {
             clusters_dirty: true,
             cluster_spatial_index,
             sculpt_extra_slots: std::collections::HashSet::new(),
+            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             halo_cells,
         };

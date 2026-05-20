@@ -540,6 +540,14 @@ impl ArvxSceneManager {
             if *slot < base_lo || *slot >= base_hi {
                 entry.sculpt_extra_slots.insert(*slot);
             }
+            // Mark this slot as sculpt-owned regardless of whether
+            // it sits in the bake range. The mesh-extract tie-break
+            // uses this set to prefer sculpt cells over procedural
+            // neighbours when both share an SN cube corner —
+            // otherwise the position-only `coord_less` tie-break in
+            // `build_cube_vertex` leaks the procedural neighbour's
+            // material/colour into the sculpt vertex.
+            entry.sculpt_owned_slots.insert(*slot);
         }
         // Renormalize pre-existing neighbour slots whose post-stamp
         // gradient differs from the stored normal. Patches only the
@@ -562,6 +570,12 @@ impl ArvxSceneManager {
             self.leaf_attr_pool.deallocate_range(*slot, 1);
             if let Some(entry) = self.asset_cache.get_mut(handle) {
                 entry.sculpt_extra_slots.remove(slot);
+                // Drop from the sculpt-owned set too — a freed slot
+                // may be re-allocated for a non-sculpt purpose (paint
+                // doesn't currently do that, but defensive against
+                // future allocators). The tie-break only wants slots
+                // that are CURRENTLY live sculpt cells.
+                entry.sculpt_owned_slots.remove(slot);
             }
         }
         _p_leaf_attr_ms = _ph_t5.elapsed().as_secs_f64() * 1000.0;
@@ -1054,6 +1068,7 @@ impl ArvxSceneManager {
                 self.leaf_attr_pool.as_slice(),
                 self.leaf_attr_pool.bones_as_slice(),
                 &entry.halo_cells,
+                Some(&entry.sculpt_owned_slots),
             )
         };
         let _p_extract_mesh_ms = _ph_t3b.elapsed().as_secs_f64() * 1000.0;
@@ -1351,6 +1366,11 @@ impl ArvxSceneManager {
             self.brick_pool.as_slice(),
             self.leaf_attr_pool.as_slice(),
             self.leaf_attr_pool.bones_as_slice(),
+            // Sculpt full re-extract — bias the SN tie-break toward
+            // sculpt-allocated slots so brush-added cells keep their
+            // material/colour at vertices shared with procedural
+            // neighbours.
+            Some(&entry.sculpt_owned_slots),
         );
 
         if vertices.is_empty() {
@@ -1512,6 +1532,7 @@ mod tests {
             dag_produced: Vec::new(),
             cpu_octree: SparseOctree::new(depth, base_vs),
             sculpt_extra_slots: std::collections::HashSet::new(),
+            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
             mesh_dirty: false,

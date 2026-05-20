@@ -484,6 +484,7 @@ pub fn build_mesh_sections_blob_haloed(
         bone_voxels,
         halo_cells,
         halo,
+        None, // bake-time extract: no sculpt history yet.
     );
     if vertices.is_empty() || indices_unclustered.is_empty() {
         return MeshSectionsBlob::default();

@@ -534,6 +534,8 @@ impl ArvxSceneManager {
                 // v4 assets get their bone weights baked into the
                 // newly extracted vertices on the spot.
                 self.leaf_attr_pool.bones_as_slice(),
+                // Fresh asset load: no sculpt history.
+                None,
             );
             let dag_t0 = std::time::Instant::now();
             let dag = crate::mesh_pass::build_cluster_dag(&v, &i_unc);
@@ -862,6 +864,7 @@ impl ArvxSceneManager {
             clusters_dirty: true,
             cluster_spatial_index,
             sculpt_extra_slots: std::collections::HashSet::new(),
+            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             // Disk-loaded non-terrain assets have no halo by
             // construction; the slice stays empty. Terrain tiles
