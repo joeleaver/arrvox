@@ -72,6 +72,23 @@ impl EngineState {
                                 if component_name == "RigidBody" {
                                     self.collider_caches_dirty.mark_all();
                                 }
+                                // Phase 5.6: Inspector edits to a stamp's
+                                // amplitude / radius / priority change its
+                                // contribution to the heightmap. Re-sync the
+                                // index + invalidate the stamp's AABB so the
+                                // streamer re-bakes affected tiles. AABB might
+                                // have grown (bigger radius / amplitude), so
+                                // compute it AFTER the set_field write.
+                                if component_name == "Stamp" {
+                                    if let Some(aabb) = self
+                                        .world
+                                        .get::<&arvx_terrain::Stamp>(entity)
+                                        .ok()
+                                        .map(|s| s.aabb())
+                                    {
+                                        self.sync_terrain_stamps_and_invalidate(Some(aabb));
+                                    }
+                                }
                             }
                         }
                     }
