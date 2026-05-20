@@ -97,6 +97,18 @@ impl EngineState {
                         }
                     }
                 }
+                // Phase 5.6: gizmo writes Transform.position directly
+                // (not via SetObjectPosition), so the
+                // `maybe_sync_stamp_after_transform` hook in
+                // cmd_scene.rs never fires for gizmo drags. Trigger
+                // it here on translate drag-end so a moved stamp
+                // dirties + re-bakes its affected tiles. Per-frame
+                // sync during drag would thrash the streamer; one
+                // sync on release matches the existing "edit ends,
+                // then commit" rhythm.
+                if matches!(self.gizmo.mode, crate::gizmo::GizmoMode::Translate) {
+                    self.maybe_sync_stamp_after_transform(selected);
+                }
                 self.gizmo.end_drag();
             }
         } else {
