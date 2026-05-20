@@ -140,6 +140,18 @@ impl EngineState {
                                         self.sync_terrain_regions_and_invalidate(Some(aabb));
                                     }
                                 }
+                                // Phase 9: Terrain Inspector edits
+                                // change the world's procedural source
+                                // (TerrainFn parameters), bounds, or
+                                // residency radius. Any of these
+                                // invalidates every live tile —
+                                // simplest correct response is to
+                                // evict all and let the streamer
+                                // repopulate on the next residency
+                                // tick.
+                                if component_name == "Terrain" {
+                                    self.invalidate_all_terrain_tiles();
+                                }
                             }
                         }
                     }

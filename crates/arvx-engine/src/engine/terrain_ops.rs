@@ -328,6 +328,46 @@ impl super::state::EngineState {
         ));
     }
 
+    /// Phase 9: invalidate every live terrain tile + the streamer's
+    /// view. Used after Terrain Inspector edits change the world's
+    /// procedural source — every loaded tile is stale and needs to
+    /// be re-baked under the new parameters. The streamer
+    /// republishes them on the next residency tick.
+    pub(crate) fn invalidate_all_terrain_tiles(&mut self) {
+        let Some(runtime) = self.terrain.as_mut() else {
+            return;
+        };
+        let evictions = runtime.streamer.invalidate_all();
+        if evictions.is_empty() {
+            return;
+        }
+        // Process evictions through the shared collider-aware path.
+        // The streamer already bumped its slot states; we just need
+        // to drop the live entity / asset / collider for each one.
+        let mut to_drop: Vec<(arvx_terrain::TileKey, hecs::Entity, arvx_render::AssetHandle)> =
+            Vec::new();
+        for (key, token) in &evictions {
+            runtime.tile_keys.remove(key);
+            if let Some((entity, asset_handle)) = runtime.live_tiles.remove(token) {
+                to_drop.push((*key, entity, asset_handle));
+            }
+        }
+        for (key, entity, asset_handle) in to_drop {
+            let _ = self.world.despawn(entity);
+            self.sculpt_overlays.remove(&entity);
+            let mut sm = match self.scene_mgr.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            sm.release_asset(asset_handle);
+            drop(sm);
+            if let Some(ref mut play) = self.play_state {
+                play.on_terrain_tile_evicted(key);
+            }
+        }
+        self.gpu_objects_dirty.mark_all();
+    }
+
     /// Despawn + release_asset for every `(key, token)` pair.
     fn evict_terrain_tiles(
         &mut self,

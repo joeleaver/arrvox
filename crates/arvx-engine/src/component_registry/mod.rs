@@ -8,6 +8,7 @@ use crate::inspector::{FieldType, FieldValue};
 mod biome_region;
 mod region;
 mod sim;
+mod terrain;
 mod terrain_stamp;
 mod visuals;
 mod world;
@@ -140,6 +141,7 @@ pub fn register_builtins(registry: &mut ComponentRegistry) {
     registry.register(sim::animation_player_entry());
     registry.register(crate::generator::generator_state_entry());
     registry.register(crate::generator::generator_owned_entry());
+    registry.register(terrain::terrain_entry());
     registry.register(terrain_stamp::stamp_entry());
     registry.register(region::region_entry());
     registry.register(biome_region::biome_region_entry());

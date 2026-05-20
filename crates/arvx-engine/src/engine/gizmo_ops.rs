@@ -281,6 +281,11 @@ impl EngineState {
     pub(crate) fn build_gizmo_wireframe(&self) -> Vec<arvx_render::LineVertex> {
         let mut verts = Vec::new();
 
+        // Terrain bounds — Phase 9. Always-on dim outline of the
+        // bounded world extent (skipped for Unbounded terrains).
+        // Brighter when the Terrain entity is selected.
+        verts.extend(self.build_terrain_bounds_wireframe());
+
         // Region gizmos — Phase 6. Always-on outline of the shape, plus
         // a softer outer shell at the falloff transition radius when
         // selected. Cross-cutting primitive: any entity carrying a
@@ -539,6 +544,40 @@ impl EngineState {
             let _ = self.world.remove_one::<ColliderCache>(entity);
         }
         let _ = self.world.insert_one(entity, cache);
+    }
+
+    /// Phase 9: outline of the bounded terrain extent. Always-on dim
+    /// orange (visually distinct from the cyan region palette and the
+    /// physics-collider palette). Brighter when the Terrain entity is
+    /// selected. `Unbounded` terrains skip the overlay — there's no
+    /// box to draw.
+    pub(crate) fn build_terrain_bounds_wireframe(&self) -> Vec<arvx_render::LineVertex> {
+        use arvx_terrain::{Terrain, TerrainBounds};
+        let mut verts = Vec::new();
+
+        let dim: [f32; 4] = [1.0, 0.65, 0.2, 0.4];
+        let bright: [f32; 4] = [1.0, 0.75, 0.3, 1.0];
+
+        for (entity, terrain) in self.world.query::<&Terrain>().iter() {
+            let TerrainBounds::Bounded { origin, extent } = terrain.bounds else {
+                continue;
+            };
+            let selected = self.selected_entity == Some(entity);
+            let color = if selected { bright } else { dim };
+
+            let origin_world = origin.origin_world().to_vec3();
+            let tile_extent_m = origin.extent_m();
+            let min = origin_world;
+            let max = origin_world
+                + glam::Vec3::new(
+                    extent.x as f32 * tile_extent_m,
+                    extent.y as f32 * tile_extent_m,
+                    extent.z as f32 * tile_extent_m,
+                );
+            verts.extend(arvx_render::wireframe::aabb_wireframe(min, max, color));
+        }
+
+        verts
     }
 
     /// Build wireframe visualization for every Region entity in the
