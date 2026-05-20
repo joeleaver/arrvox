@@ -131,6 +131,14 @@ impl super::state::EngineState {
             };
             sm.release_asset(asset_handle);
         }
+        // Phase 8: drop colliders for each evicted tile while play
+        // mode is active — `on_terrain_tile_added` rebuilds them
+        // when the next bake completes.
+        if let Some(ref mut play) = self.play_state {
+            for (key, _) in evictions {
+                play.on_terrain_tile_evicted(*key);
+            }
+        }
     }
 
     /// Called after an entity's Transform changes. If the entity has

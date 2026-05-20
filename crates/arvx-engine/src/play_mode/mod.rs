@@ -14,12 +14,14 @@ use arvx_physics::rigid_body::BodyType;
 use crate::components::{RigidBody, RigidBodyRuntime, Transform};
 
 mod collider;
+mod terrain_colliders;
 
 #[cfg(test)]
 mod tests;
 
 use collider::build_collider_from_cache;
 pub use collider::{build_coarse_collider, compute_tight_local_aabb};
+use terrain_colliders::TerrainColliders;
 
 /// Saved transform for restoring on play stop.
 struct SavedTransform {
@@ -33,6 +35,11 @@ pub struct PlayModeState {
     physics: PhysicsWorld,
     body_map: HashMap<hecs::Entity, RigidBodyRuntime>,
     saved_transforms: HashMap<hecs::Entity, SavedTransform>,
+    /// Phase 8: per-tile Rapier `TriMesh` colliders. Built at play
+    /// start; rebuilt as tiles re-bake during play (sculpt / stamp /
+    /// region edits). Owns its `RigidBodyHandle` set, dropped with
+    /// the `PhysicsWorld` when play ends.
+    terrain_colliders: TerrainColliders,
     frame_count: u32,
 }
 
@@ -87,10 +94,54 @@ impl PlayModeState {
             body_map.insert(*entity, RigidBodyRuntime { handle });
         }
 
-        eprintln!("[PlayMode] started with {} bodies + ground plane, gravity={:?}, timestep={}",
-            body_map.len(), physics.config.gravity, physics.config.timestep);
+        // Phase 8: build TriMesh colliders for every live terrain
+        // tile. The integration path attached a `TileColliderMesh` to
+        // each tile entity at bake time, so this is a flat query
+        // walk — no scene-manager touchpoint.
+        let mut terrain_colliders = TerrainColliders::new();
+        terrain_colliders.build_initial_from_world(&mut physics, world);
 
-        Self { physics, body_map, saved_transforms, frame_count: 0 }
+        eprintln!(
+            "[PlayMode] started with {} bodies + {} terrain colliders, gravity={:?}, timestep={}",
+            body_map.len(),
+            terrain_colliders.len(),
+            physics.config.gravity,
+            physics.config.timestep,
+        );
+
+        Self {
+            physics,
+            body_map,
+            saved_transforms,
+            terrain_colliders,
+            frame_count: 0,
+        }
+    }
+
+    /// Called by the engine when a fresh tile (initial bake OR
+    /// re-bake after sculpt / stamp / region edit) gets integrated
+    /// into the scene while play mode is active. Builds the
+    /// `TriMesh` collider AND, on re-bake, wakes nearby sleeping
+    /// bodies so they re-evaluate against the new geometry.
+    pub fn on_terrain_tile_added(
+        &mut self,
+        world: &hecs::World,
+        entity: hecs::Entity,
+        key: arvx_terrain::TileKey,
+        tile_world_aabb: arvx_core::Aabb,
+    ) {
+        self.terrain_colliders
+            .on_tile_added(&mut self.physics, world, entity, key, tile_world_aabb);
+    }
+
+    /// Called when the engine evicts a tile (camera moved past
+    /// residency, stamp moved, region moved, etc.). Drops the
+    /// collider associated with the tile key. The streamer typically
+    /// follows up with a re-bake that produces a fresh integration —
+    /// `on_terrain_tile_added` rebuilds the collider then.
+    pub fn on_terrain_tile_evicted(&mut self, key: arvx_terrain::TileKey) {
+        self.terrain_colliders
+            .on_tile_evicted(&mut self.physics, key);
     }
 
     /// Substeps performed in the most recent `step()`. Surfaced so the

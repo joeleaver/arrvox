@@ -109,6 +109,12 @@ impl super::state::EngineState {
             voxel_size_m,
             ..
         } = baked;
+
+        // Phase 8: snapshot the LOD-0 triangle data so the play-mode
+        // physics path can build a Rapier TriMesh later. Reading
+        // before `mesh` moves into `sm.integrate_baked_tile` because
+        // the scene manager consumes the blob.
+        let collider_mesh = arvx_terrain::TileColliderMesh::from_mesh_blob(&mesh);
         let synthetic_path = PathBuf::from(format!(
             "terrain://{}_{}_{}_{}",
             key.level, key.x, key.y, key.z
@@ -184,7 +190,18 @@ impl super::state::EngineState {
                 material_overrides: Vec::new(),
             },
             TerrainTile { key },
+            collider_mesh,
         ));
+
+        // Phase 8: if play mode is live, tell it about the new tile so
+        // it builds (or rebuilds, on re-bake) the Rapier TriMesh
+        // collider AND wakes any sleeping bodies inside the rebuilt
+        // tile's AABB. Edit-mode tiles still carry the
+        // `TileColliderMesh` component; entering play later picks
+        // them up via `build_initial_from_world`.
+        if let Some(ref mut play) = self.play_state {
+            play.on_terrain_tile_added(&self.world, entity, key, aabb);
+        }
 
         let token = runtime.next_token;
         runtime.next_token = runtime.next_token.wrapping_add(1);
@@ -334,6 +351,13 @@ impl super::state::EngineState {
                     Err(p) => p.into_inner(),
                 };
                 sm.release_asset(asset_handle);
+            }
+            // Phase 8: drop the tile's Rapier collider if play mode is
+            // active. The `on_terrain_tile_added` hook will rebuild it
+            // when the next bake completes (stamp / region / sculpt
+            // re-bake spawns a fresh tile entity for the same key).
+            if let Some(ref mut play) = self.play_state {
+                play.on_terrain_tile_evicted(*key);
             }
         }
     }

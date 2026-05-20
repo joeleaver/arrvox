@@ -190,6 +190,15 @@ impl super::state::EngineState {
             };
             sm.release_asset(asset_handle);
         }
+        // Phase 8: drop colliders for each evicted tile if play mode
+        // is active. `on_terrain_tile_added` will rebuild on the next
+        // re-bake; wake-on-rebuild fires then, not here (the new
+        // geometry is what matters for bodies, not the disappearance).
+        if let Some(ref mut play) = self.play_state {
+            for (key, _) in evictions {
+                play.on_terrain_tile_evicted(*key);
+            }
+        }
     }
 
     /// Called after an entity's Transform changes. If the entity has
