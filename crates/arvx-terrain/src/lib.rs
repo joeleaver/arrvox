@@ -14,6 +14,7 @@
 
 pub mod bake;
 pub mod baked_tile;
+pub mod biome_region;
 pub mod bounds;
 pub mod fbm;
 pub mod persist;
@@ -28,6 +29,7 @@ pub mod worker;
 
 pub use bake::bake_tile;
 pub use baked_tile::BakedTile;
+pub use biome_region::BiomeRegion;
 pub use bounds::TerrainBounds;
 pub use fbm::FbmTerrainFn;
 pub use persist::{save_tile, tile_path, TILES_SUBDIR};

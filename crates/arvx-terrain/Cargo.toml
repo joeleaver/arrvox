@@ -7,6 +7,7 @@ description = "Streamed editable voxel terrain for the Arrvox engine: tile-octre
 
 [dependencies]
 arvx-core = { workspace = true }
+arvx-regions = { workspace = true }
 glam = { workspace = true }
 bytemuck = { workspace = true }
 hecs = { workspace = true }
