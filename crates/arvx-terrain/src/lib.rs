@@ -18,12 +18,14 @@ pub mod biome_region;
 pub mod bounds;
 pub mod fbm;
 pub mod persist;
+pub mod physics_policy;
 pub mod region_snapshot;
 pub mod stamp;
 pub mod stamp_index;
 pub mod streamer;
 pub mod terrain;
 pub mod terrain_fn;
+pub mod tile_collider_mesh;
 pub mod tile_key;
 pub mod tile_tag;
 pub mod worker;
@@ -34,12 +36,18 @@ pub use biome_region::BiomeRegion;
 pub use bounds::TerrainBounds;
 pub use fbm::FbmTerrainFn;
 pub use persist::{save_tile, tile_path, TILES_SUBDIR};
+pub use physics_policy::{
+    AlwaysResident, ColliderResidencyPolicy, EditRebuildPolicy, NoPredictive, OnIntegrate,
+    OnStrokeRelease, PredictiveMaterializationPolicy, RadiusResident, RebuildContext,
+    RebuildDecision, ResidencyContext, TileSet, TrajectoryContext,
+};
 pub use region_snapshot::{TerrainRegionSnapshot, TerrainRegionSnapshotHandle};
 pub use stamp::{combine_heights, CombineOp, FalloffCurve, Stamp, StampKind};
 pub use stamp_index::{StampIndex, StampIndexHandle};
 pub use streamer::{StreamerStats, TileSlot, TileState, TileStreamer};
 pub use terrain::Terrain;
 pub use terrain_fn::{TerrainFn, TerrainSample};
+pub use tile_collider_mesh::TileColliderMesh;
 pub use tile_key::{tile_keys_intersecting_aabb, TileKey, TILE_SIZE_M};
 pub use tile_tag::TerrainTile;
 pub use worker::{BakeJob, BakeJobResult, BakeWorker};
