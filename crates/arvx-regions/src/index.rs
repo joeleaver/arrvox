@@ -110,6 +110,28 @@ impl RegionIndex {
         out
     }
 
+    /// Visit each entry that contributes membership at `point` —
+    /// callback receives `(entry_index, weight)`. The index is a
+    /// position into [`Self::entries`], stable for the life of the
+    /// `RegionIndex`.
+    ///
+    /// Lets consumer crates carry a parallel side table of typed
+    /// per-region data (e.g. `arvx_terrain`'s `BiomeRegion`
+    /// snapshot) and look up the payload by entry index without
+    /// touching the world. This is the off-main-thread query path
+    /// used by the terrain bake worker; the world-aware
+    /// [`Self::query`] only works on the main thread where the
+    /// `hecs::World` lives.
+    pub fn query_indices<F: FnMut(usize, f32)>(&self, point: Vec3, mut visit: F) {
+        self.bvh.query_point(&self.aabbs, point, |i| {
+            let e = &self.entries[i];
+            let w = membership(&e.region, e.center, point);
+            if w > 0.0 {
+                visit(i, w);
+            }
+        });
+    }
+
     /// Like [`Self::query_all`] but only returns regions whose entity
     /// carries the data component `D`. Use this from consumer
     /// systems: terrain biomes pass `BiomeRegion`, an audio system
@@ -246,6 +268,41 @@ mod tests {
         let idx = RegionIndex::from_entries(vec![RegionEntry::new(e, r, Vec3::ZERO)]);
         let hits = idx.query_all(Vec3::new(1000.0, 0.0, 0.0));
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn query_indices_yields_entry_positions() {
+        // Two regions at separated centres so the BVH actually
+        // branches. Point inside only the second one yields entry
+        // index 1.
+        let mut w = World::new();
+        let r = sphere_region(2.0, 1.0);
+        let a = w.spawn((r,));
+        let b = w.spawn((r,));
+        let idx = RegionIndex::from_entries(vec![
+            RegionEntry::new(a, r, Vec3::new(0.0, 0.0, 0.0)),
+            RegionEntry::new(b, r, Vec3::new(100.0, 0.0, 0.0)),
+        ]);
+        let mut hits: Vec<(usize, f32)> = Vec::new();
+        idx.query_indices(Vec3::new(100.0, 0.0, 0.0), |i, w| hits.push((i, w)));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 1);
+        assert!((hits[0].1 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn query_indices_no_world_required() {
+        // query_indices doesn't take &World — proves the off-main-
+        // thread path works.
+        let mut w = World::new();
+        let r = sphere_region(5.0, 1.0);
+        let e = w.spawn((r,));
+        let idx = RegionIndex::from_entries(vec![RegionEntry::new(e, r, Vec3::ZERO)]);
+        // Move the world out of scope to make the point.
+        drop(w);
+        let mut hit = false;
+        idx.query_indices(Vec3::ZERO, |_, _| hit = true);
+        assert!(hit);
     }
 
     #[test]
