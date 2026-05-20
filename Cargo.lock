@@ -323,6 +323,7 @@ name = "arvx-editor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arvx-core",
  "arvx-engine",
  "arvx-render",
  "arvx-runtime",

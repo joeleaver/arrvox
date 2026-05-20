@@ -419,10 +419,11 @@ impl EngineState {
                 material_id,
             });
         }
-        // Mark every paint-edited tile dirty for Phase 4.3 save.
+        // Mark every paint-edited tile dirty for Phase 4.3 save AND
+        // divergent for Phase 9b heatmap.
         if let Some(runtime) = self.terrain.as_mut() {
             for k in &touched_keys {
-                runtime.dirty_tiles.insert(*k);
+                runtime.mark_dirty(*k);
             }
         }
         // Diagnostic: fire only when paint had candidates but wrote

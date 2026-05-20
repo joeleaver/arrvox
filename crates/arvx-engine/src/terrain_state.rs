@@ -47,6 +47,13 @@ pub struct TerrainRuntime {
     /// the edits; the editor-driven workflow saves frequently
     /// enough that this is rare.
     pub dirty_tiles: HashSet<TileKey>,
+    /// Phase 9b: tiles divergent from the procedural baseline —
+    /// what the heatmap visualises. Superset of `dirty_tiles`:
+    /// includes any tile that has ever been persisted as
+    /// `.arvxtile` on disk (so cross-session edits stay visible) or
+    /// has been edited this session. Cleared on
+    /// `revert_terrain_in_aabb`.
+    pub divergent_tiles: HashSet<TileKey>,
     /// Monotonic token counter — the streamer doesn't generate these
     /// itself.
     pub next_token: u64,
@@ -62,7 +69,17 @@ impl TerrainRuntime {
             live_tiles: HashMap::new(),
             tile_keys: HashMap::new(),
             dirty_tiles: HashSet::new(),
+            divergent_tiles: HashSet::new(),
             next_token: 1,
         }
+    }
+
+    /// Phase 9b: mark a tile as divergent from baseline (sculpt /
+    /// paint edited it this session). Both `dirty_tiles` and
+    /// `divergent_tiles` get the key — the former tracks "needs to
+    /// be flushed on save," the latter "shows up in the heatmap."
+    pub fn mark_dirty(&mut self, key: TileKey) {
+        self.dirty_tiles.insert(key);
+        self.divergent_tiles.insert(key);
     }
 }

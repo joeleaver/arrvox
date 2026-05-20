@@ -341,6 +341,8 @@ impl EngineState {
             project_loading: Some(status),
             console_entries: Vec::new(),
             profiling: None,
+            active_terrain_region: None,
+            divergent_tile_count: None,
         };
         (self.state_callback)(&update);
     }
@@ -602,6 +604,25 @@ impl EngineState {
                 .latest_with_render_data()
                 .or_else(|| self.profiling.latest())
                 .cloned(),
+            active_terrain_region: if self.active_terrain_region_dirty {
+                self.active_terrain_region_dirty = false;
+                Some(self.active_terrain_region)
+            } else {
+                None
+            },
+            divergent_tile_count: {
+                let cur = self
+                    .terrain
+                    .as_ref()
+                    .map(|rt| rt.divergent_tiles.len())
+                    .unwrap_or(0);
+                if cur != self.prev_divergent_tile_count {
+                    self.prev_divergent_tile_count = cur;
+                    Some(cur)
+                } else {
+                    None
+                }
+            },
         }
     }
 

@@ -845,6 +845,28 @@ pub(crate) struct EngineState {
     /// is removed. Phase 2 ships exactly one Terrain per scene
     /// (singleton enforced in the `SpawnTerrain` handler).
     pub(crate) terrain: Option<Box<crate::terrain_state::TerrainRuntime>>,
+
+    /// Phase 9b: the editor's active terrain region — a world-space
+    /// AABB committed from the viewport drag-box, used as the scope
+    /// for Revert / Bake-snapshot operations until cleared. `None`
+    /// when the toolbar has no region set (commands then fall back
+    /// to camera-radius). Echoed in `StateUpdate.active_terrain_region`
+    /// so the editor draws the wireframe overlay.
+    pub(crate) active_terrain_region: Option<arvx_core::Aabb>,
+    /// Dirty flag for [`Self::active_terrain_region`]; set whenever
+    /// the region changes (commit or clear), cleared after the next
+    /// `StateUpdate` push.
+    pub(crate) active_terrain_region_dirty: bool,
+
+    /// Phase 9b: heatmap overlay visibility. Driven by the editor
+    /// toolbar's Heatmap button via `SetTerrainHeatmapVisible`. The
+    /// wireframe-overlay pass gates the divergent-tile AABB outlines
+    /// on this flag.
+    pub(crate) terrain_heatmap_visible: bool,
+    /// Last-published divergent tile count. Cached so the snapshot
+    /// publisher can change-detect against the live runtime set
+    /// without rebuilding the snapshot on every tick.
+    pub(crate) prev_divergent_tile_count: usize,
 }
 
 impl EngineState {

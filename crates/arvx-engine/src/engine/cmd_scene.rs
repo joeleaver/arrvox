@@ -232,6 +232,36 @@ impl EngineState {
                 self.handle_spawn_stamp(kind, position);
             }
 
+            EngineCommand::RevertTerrainInAabb { aabb } => {
+                self.revert_terrain_in_aabb(aabb);
+            }
+
+            EngineCommand::RevertTerrainAtCameraRadius { radius } => {
+                let aabb = self.camera_radius_aabb(radius);
+                self.revert_terrain_in_aabb(aabb);
+            }
+
+            EngineCommand::BakeTerrainSnapshotInAabb { aabb } => {
+                self.bake_terrain_snapshot_in_aabb(aabb);
+            }
+
+            EngineCommand::BakeTerrainSnapshotAtCameraRadius { radius } => {
+                let aabb = self.camera_radius_aabb(radius);
+                self.bake_terrain_snapshot_in_aabb(aabb);
+            }
+
+            EngineCommand::SetTerrainRegionFromScreenRect { id, x0, y0, x1, y1 } => {
+                self.set_terrain_region_from_screen_rect(id, x0, y0, x1, y1);
+            }
+
+            EngineCommand::ClearTerrainRegion => {
+                self.clear_terrain_region();
+            }
+
+            EngineCommand::SetTerrainHeatmapVisible { visible } => {
+                self.terrain_heatmap_visible = visible;
+            }
+
             EngineCommand::SpawnTerrain => {
                 use crate::components::*;
                 use arvx_terrain::Terrain;

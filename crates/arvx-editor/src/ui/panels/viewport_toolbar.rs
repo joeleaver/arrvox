@@ -554,6 +554,465 @@ fn sculpt_settings_panel(
     }
 }
 
+// ── Phase 9b: Terrain viewport toolbar ─────────────────────────────────
+
+/// Floating overlay at the top-centre of the viewport, shown when
+/// the selected entity is a Terrain. Contains:
+///
+///   Row 1: Sculpt · Paint · Heatmap
+///   Row 2: Region · Revert · Bake · + Stamp ▼
+///
+/// Sculpt / Paint reuse the same signals as [`BrushToolbar`] — the
+/// two toolbars cross-reference the same mode state. Heatmap toggles
+/// the overlay visibility signal (the overlay pass itself is a
+/// separate Phase 9b item). Region toggles a "next drag = region
+/// drag-box" arming state in the viewport. Revert / Bake fire the
+/// corresponding `EngineCommand`s against the active region — or the
+/// camera-radius fallback when none is set.
+#[component]
+pub fn TerrainToolbar() -> NodeHandle {
+    let store = use_context::<EditorStore>();
+    let cmd = use_context::<CommandSender>();
+
+    // Visibility — checks the inspector snapshot for a Terrain
+    // component. The inspector is None when nothing is selected; an
+    // empty snapshot or one without the Terrain component hides the
+    // toolbar.
+    let visible = Memo::new(move || {
+        store
+            .inspector
+            .get()
+            .map(|snap| snap.components.iter().any(|c| c.name == "Terrain"))
+            .unwrap_or(false)
+    });
+
+    let stamp_menu_open = Signal::new(false);
+    // rsx!'s `if` branches each move-capture `cmd` independently —
+    // pre-clone one binding per branch so the closures don't double-
+    // move the same value. Same pattern as `BrushToolbar` (where the
+    // sub-pane closures clone before consuming).
+    let cmd_row1 = cmd.clone();
+    let cmd_row2 = cmd.clone();
+    let cmd_stamp = cmd.clone();
+    let cmd_badge = cmd;
+
+    rsx! {
+        div {
+            // Always-mounted div so the visibility toggle is a cheap
+            // style swap rather than a tree mount/unmount on every
+            // selection change.
+            style: {move || {
+                if visible.get() {
+                    "position:absolute;top:8px;left:50%;transform:translateX(-50%);\
+                     z-index:20;display:flex;flex-direction:column;gap:4px;\
+                     align-items:center;"
+                } else {
+                    "display:none;"
+                }
+            }},
+
+            // Row 1 — Sculpt · Paint · Heatmap.
+            {terrain_toolbar_row1(__scope, store, cmd_row1)}
+            // Row 2 — Region · Revert · Bake · + Stamp ▼.
+            {terrain_toolbar_row2(__scope, store, cmd_row2, stamp_menu_open)}
+
+            // Stamp submenu (anchored under row 2 when open).
+            if stamp_menu_open.get() {
+                {terrain_stamp_menu(__scope, cmd_stamp.clone(), stamp_menu_open)}
+            }
+
+            // Active-region badge — only when a region is set. Gives
+            // the author a clear "Revert / Bake will scope to this
+            // region" cue plus a clear-region affordance.
+            if store.active_terrain_region.get().is_some() {
+                {terrain_active_region_badge(__scope, store, cmd_badge.clone())}
+            }
+
+            // Heatmap counter — shown only when the overlay is on.
+            // Live count of divergent tiles so the author can tell
+            // at a glance how much editing's happened.
+            if store.terrain_heatmap_visible.get() {
+                {terrain_heatmap_counter(__scope, store)}
+            }
+        }
+    }
+}
+
+fn terrain_toolbar_row1(
+    __scope: &mut rinch::core::dom::RenderScope,
+    store: EditorStore,
+    cmd: CommandSender,
+) -> rinch::core::dom::NodeHandle {
+    let cmd_sculpt = cmd.clone();
+    let cmd_paint = cmd.clone();
+    let cmd_heatmap = cmd;
+    rsx! {
+        div {
+            style: "display:flex;flex-direction:row;gap:1px;\
+                    background:rgba(30,30,30,0.85);border-radius:6px;\
+                    border:1px solid #3c3c3c;padding:2px;\
+                    backdrop-filter:blur(8px);",
+
+            // Sculpt — same signal + mutual-exclusion as BrushToolbar's
+            // sculpt button. Re-clicking here turns sculpt off.
+            {terrain_mode_button(
+                __scope,
+                TablerIcon::Sphere,
+                "Sculpt — sculpt terrain (S)",
+                Memo::new(move || store.sculpt_active.get()),
+                {
+                    let cmd = cmd_sculpt;
+                    move || {
+                        let on = !store.sculpt_active.get();
+                        store.sculpt_active.set(on);
+                        if on && store.paint_active.get() {
+                            store.paint_active.set(false);
+                            let _ = cmd.0.send(arvx_engine::EngineCommand::SetPaintActive {
+                                active: false,
+                                radius: store.paint_radius.get(),
+                            });
+                        }
+                        let _ = cmd.0.send(arvx_engine::EngineCommand::SetSculptActive {
+                            active: on,
+                            radius: store.sculpt_radius.get(),
+                        });
+                    }
+                },
+            )}
+
+            // Paint — mirrors sculpt above.
+            {terrain_mode_button(
+                __scope,
+                TablerIcon::Brush,
+                "Paint — paint terrain materials / color (P)",
+                Memo::new(move || store.paint_active.get()),
+                {
+                    let cmd = cmd_paint;
+                    move || {
+                        let on = !store.paint_active.get();
+                        store.paint_active.set(on);
+                        if on && store.sculpt_active.get() {
+                            store.sculpt_active.set(false);
+                            let _ = cmd.0.send(arvx_engine::EngineCommand::SetSculptActive {
+                                active: false,
+                                radius: store.sculpt_radius.get(),
+                            });
+                        }
+                        let _ = cmd.0.send(arvx_engine::EngineCommand::SetPaintActive {
+                            active: on,
+                            radius: store.paint_radius.get(),
+                        });
+                    }
+                },
+            )}
+
+            // Heatmap — outlines every tile divergent from the
+            // procedural baseline (sculpt edits this session or a
+            // saved `.arvxtile` from a prior session). Wireframes
+            // render in the engine's gizmo overlay; the toolbar just
+            // gates visibility.
+            {terrain_mode_button(
+                __scope,
+                TablerIcon::Flame,
+                "Heatmap — outline tiles diverged from the procedural baseline",
+                Memo::new(move || store.terrain_heatmap_visible.get()),
+                {
+                    let cmd = cmd_heatmap;
+                    move || {
+                        let on = !store.terrain_heatmap_visible.get();
+                        store.terrain_heatmap_visible.set(on);
+                        let _ = cmd.0.send(
+                            arvx_engine::EngineCommand::SetTerrainHeatmapVisible {
+                                visible: on,
+                            },
+                        );
+                    }
+                },
+            )}
+        }
+    }
+}
+
+fn terrain_toolbar_row2(
+    __scope: &mut rinch::core::dom::RenderScope,
+    store: EditorStore,
+    cmd: CommandSender,
+    stamp_menu_open: Signal<bool>,
+) -> rinch::core::dom::NodeHandle {
+    let cmd_region = cmd.clone();
+    let cmd_revert = cmd.clone();
+    let cmd_bake = cmd.clone();
+    rsx! {
+        div {
+            style: "display:flex;flex-direction:row;gap:1px;\
+                    background:rgba(30,30,30,0.85);border-radius:6px;\
+                    border:1px solid #3c3c3c;padding:2px;\
+                    backdrop-filter:blur(8px);",
+
+            // Region — toggles drag-box arm state. The viewport's
+            // mouse handler reads `terrain_region_drag_armed` to
+            // decide whether LMB-down begins a drag-box rather than
+            // a normal click-select pick.
+            {terrain_mode_button(
+                __scope,
+                TablerIcon::Rectangle,
+                "Region — drag-box to set the active region for Revert / Bake",
+                Memo::new(move || store.terrain_region_drag_armed.get()),
+                {
+                    let cmd = cmd_region;
+                    move || {
+                        let on = !store.terrain_region_drag_armed.get();
+                        store.terrain_region_drag_armed.set(on);
+                        // Toggling armed off also clears any
+                        // in-progress drag rect, so a stale half-drag
+                        // doesn't reappear if the author re-arms.
+                        if !on {
+                            store.terrain_region_drag_rect.set(None);
+                        }
+                        // Disarming with no active region is also a
+                        // good moment to drop the engine's region —
+                        // matches the "click again to leave region
+                        // mode" mental model.
+                        if !on && store.active_terrain_region.get().is_some() {
+                            let _ = cmd.0.send(arvx_engine::EngineCommand::ClearTerrainRegion);
+                        }
+                    }
+                },
+            )}
+
+            // Revert — fires against the active region (if set) or
+            // the camera-radius AABB. The engine warns to console if
+            // no Terrain is in the scene.
+            {terrain_action_button(
+                __scope,
+                TablerIcon::Restore,
+                "Revert — drop sculpt edits in the active region (or camera radius)",
+                {
+                    let cmd = cmd_revert;
+                    move || {
+                        let region = store.active_terrain_region.get();
+                        let radius = store.terrain_camera_radius_m.get();
+                        if let Some(aabb) = region {
+                            let _ = cmd.0.send(
+                                arvx_engine::EngineCommand::RevertTerrainInAabb { aabb },
+                            );
+                        } else {
+                            let _ = cmd.0.send(
+                                arvx_engine::EngineCommand::RevertTerrainAtCameraRadius { radius },
+                            );
+                        }
+                    }
+                },
+            )}
+
+            // Bake — persists live tiles in the active region (or
+            // camera radius) as `.arvxtile` files next to the scene.
+            {terrain_action_button(
+                __scope,
+                TablerIcon::DeviceFloppy,
+                "Bake — persist tiles in the active region (or camera radius) to .arvxtile",
+                {
+                    let cmd = cmd_bake;
+                    move || {
+                        let region = store.active_terrain_region.get();
+                        let radius = store.terrain_camera_radius_m.get();
+                        if let Some(aabb) = region {
+                            let _ = cmd.0.send(
+                                arvx_engine::EngineCommand::BakeTerrainSnapshotInAabb { aabb },
+                            );
+                        } else {
+                            let _ = cmd.0.send(
+                                arvx_engine::EngineCommand::BakeTerrainSnapshotAtCameraRadius {
+                                    radius,
+                                },
+                            );
+                        }
+                    }
+                },
+            )}
+
+            // + Stamp — toggle dropdown menu of stamp kinds.
+            {terrain_action_button(
+                __scope,
+                TablerIcon::Mountain,
+                "Add Stamp — Mountain / Hill / Lake / Plateau / Flatten",
+                move || {
+                    stamp_menu_open.set(!stamp_menu_open.get());
+                },
+            )}
+        }
+    }
+}
+
+fn terrain_stamp_menu(
+    __scope: &mut rinch::core::dom::RenderScope,
+    cmd: CommandSender,
+    stamp_menu_open: Signal<bool>,
+) -> rinch::core::dom::NodeHandle {
+    use arvx_engine::StampKindSpec;
+    let entries: [(StampKindSpec, &str); 5] = [
+        (StampKindSpec::Mountain, "Mountain"),
+        (StampKindSpec::Hill, "Hill"),
+        (StampKindSpec::Lake, "Lake"),
+        (StampKindSpec::Plateau, "Plateau"),
+        (StampKindSpec::Flatten, "Flatten"),
+    ];
+    rsx! {
+        div {
+            style: "display:flex;flex-direction:column;gap:1px;\
+                    background:rgba(30,30,30,0.92);border-radius:6px;\
+                    border:1px solid #3c3c3c;padding:2px;min-width:140px;\
+                    backdrop-filter:blur(8px);",
+            for (spec, label) in entries {
+                {terrain_stamp_menu_item(__scope, cmd.clone(), spec, label, stamp_menu_open)}
+            }
+        }
+    }
+}
+
+fn terrain_stamp_menu_item(
+    __scope: &mut rinch::core::dom::RenderScope,
+    cmd: CommandSender,
+    spec: arvx_engine::StampKindSpec,
+    label: &str,
+    stamp_menu_open: Signal<bool>,
+) -> rinch::core::dom::NodeHandle {
+    let label_str = label.to_string();
+    rsx! {
+        div {
+            style: "padding:4px 10px;border-radius:4px;cursor:pointer;\
+                    color:#ddd;font-size:11px;",
+            onclick: move || {
+                let _ = cmd.0.send(arvx_engine::EngineCommand::SpawnStamp { kind: spec });
+                stamp_menu_open.set(false);
+            },
+            {label_str}
+        }
+    }
+}
+
+fn terrain_active_region_badge(
+    __scope: &mut rinch::core::dom::RenderScope,
+    store: EditorStore,
+    cmd: CommandSender,
+) -> rinch::core::dom::NodeHandle {
+    rsx! {
+        div {
+            style: "display:flex;flex-direction:row;align-items:center;gap:6px;\
+                    padding:3px 8px;border-radius:4px;\
+                    background:rgba(255,193,7,0.18);border:1px solid #ffc107;\
+                    color:#ffe082;font-size:10px;\
+                    backdrop-filter:blur(8px);",
+            span {
+                {move || {
+                    match store.active_terrain_region.get() {
+                        Some(a) => format!(
+                            "Region {:.0}×{:.0} m",
+                            a.max.x - a.min.x,
+                            a.max.z - a.min.z,
+                        ),
+                        None => String::new(),
+                    }
+                }}
+            }
+            div {
+                style: "padding:0 4px;cursor:pointer;color:#ffe082;font-weight:600;",
+                title: "Clear active region",
+                onclick: move || {
+                    let _ = cmd.0.send(arvx_engine::EngineCommand::ClearTerrainRegion);
+                },
+                {"×"}
+            }
+        }
+    }
+}
+
+fn terrain_heatmap_counter(
+    __scope: &mut rinch::core::dom::RenderScope,
+    store: EditorStore,
+) -> rinch::core::dom::NodeHandle {
+    rsx! {
+        div {
+            style: "display:flex;align-items:center;\
+                    padding:3px 8px;border-radius:4px;\
+                    background:rgba(255,115,20,0.18);border:1px solid #ff7314;\
+                    color:#ffcd91;font-size:10px;\
+                    backdrop-filter:blur(8px);",
+            span {
+                {move || {
+                    let n = store.terrain_divergent_tile_count.get();
+                    if n == 1 {
+                        "1 tile edited".to_string()
+                    } else {
+                        format!("{n} tiles edited")
+                    }
+                }}
+            }
+        }
+    }
+}
+
+/// Smaller variant of [`gizmo_button`] tuned for the Terrain
+/// toolbar's pill: text label below the icon (or just icon) and a
+/// distinct active colour (terrain-orange to echo the bounds
+/// wireframe).
+fn terrain_mode_button(
+    __scope: &mut rinch::core::dom::RenderScope,
+    icon: TablerIcon,
+    tooltip: &str,
+    is_active: Memo<bool>,
+    on_click: impl Fn() + Clone + 'static,
+) -> rinch::core::dom::NodeHandle {
+    let tooltip = tooltip.to_string();
+    rsx! {
+        div {
+            style: {move || {
+                if is_active.get() {
+                    "width:30px;height:28px;display:flex;align-items:center;\
+                     justify-content:center;border-radius:4px;cursor:pointer;\
+                     background:#ff9800;color:#1e1e1e;"
+                } else {
+                    "width:30px;height:28px;display:flex;align-items:center;\
+                     justify-content:center;border-radius:4px;cursor:pointer;\
+                     color:#bbb;background:transparent;"
+                }
+            }},
+            title: tooltip,
+            onclick: move || on_click(),
+            span {
+                style: "width:18px;height:18px;display:inline-flex;\
+                        align-items:center;justify-content:center;",
+                {render_tabler_icon(__scope, icon, TablerIconStyle::Outline)}
+            }
+        }
+    }
+}
+
+/// Push-button variant (no active state) for one-shot actions like
+/// Revert / Bake / Add Stamp.
+fn terrain_action_button(
+    __scope: &mut rinch::core::dom::RenderScope,
+    icon: TablerIcon,
+    tooltip: &str,
+    on_click: impl Fn() + Clone + 'static,
+) -> rinch::core::dom::NodeHandle {
+    let tooltip = tooltip.to_string();
+    rsx! {
+        div {
+            style: "width:30px;height:28px;display:flex;align-items:center;\
+                    justify-content:center;border-radius:4px;cursor:pointer;\
+                    color:#bbb;background:transparent;",
+            title: tooltip,
+            onclick: move || on_click(),
+            span {
+                style: "width:18px;height:18px;display:inline-flex;\
+                        align-items:center;justify-content:center;",
+                {render_tabler_icon(__scope, icon, TablerIconStyle::Outline)}
+            }
+        }
+    }
+}
+
 fn paint_settings_panel(
     __scope: &mut rinch::core::dom::RenderScope,
     store: EditorStore,

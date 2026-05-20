@@ -572,6 +572,15 @@ fn main() -> anyhow::Result<()> {
                         }
                     });
                 }
+                // Phase 9b: mirror engine's active terrain region. The
+                // engine ships an outer `Some(_)` only when the value
+                // changed (commit / clear), so this branch is rare.
+                if let Some(region) = update.active_terrain_region {
+                    store.active_terrain_region.send(region);
+                }
+                if let Some(count) = update.divergent_tile_count {
+                    store.terrain_divergent_tile_count.send(count);
+                }
             })
         },
     );

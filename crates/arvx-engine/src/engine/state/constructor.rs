@@ -241,6 +241,10 @@ impl EngineState {
             // existing 1-fetch path.
             surfacenet_enabled: false,
             terrain: None,
+            active_terrain_region: None,
+            active_terrain_region_dirty: true, // push initial None on startup
+            terrain_heatmap_visible: false,
+            prev_divergent_tile_count: usize::MAX, // sentinel forces first push
         }
     }
 }

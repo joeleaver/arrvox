@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "Arrvox editor — gaussian splat scene editor, thin client over ArvxEngine"
 
 [dependencies]
+arvx-core = { workspace = true }
 arvx-engine = { workspace = true }
 arvx-render = { workspace = true }
 arvx-runtime = { workspace = true }

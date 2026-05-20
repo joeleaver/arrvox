@@ -562,11 +562,12 @@ impl EngineState {
         }
 
         // Mark every tile this stamp actually edited as dirty for
-        // Phase 4.3 save. Idempotent — HashSet folds repeated stamps
-        // on the same stroke into one entry.
+        // Phase 4.3 save AND divergent for Phase 9b heatmap.
+        // Idempotent — HashSet folds repeated stamps on the same
+        // stroke into one entry.
         if let Some(runtime) = self.terrain.as_mut() {
             for k in &touched_keys {
-                runtime.dirty_tiles.insert(*k);
+                runtime.mark_dirty(*k);
             }
         }
 

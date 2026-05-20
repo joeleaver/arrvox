@@ -298,6 +298,39 @@ pub struct EditorStore {
     /// bounds, and a centered modal inside the narrow scene-tree
     /// column would never catch a click aimed at its own buttons.
     pub convert_procedural_target: Signal<Option<uuid::Uuid>>,
+
+    // ── Phase 9b: Terrain viewport toolbar ─────────────────────────
+
+    /// Heatmap overlay visibility toggle. The overlay rendering pass
+    /// itself is deferred to a separate Phase 9b item — this signal
+    /// is the toolbar's persistent state for when that lands.
+    pub terrain_heatmap_visible: Signal<bool>,
+    /// "Region drag-box mode armed." Clicking the toolbar Region
+    /// button sets this; the first LMB-down in the viewport then
+    /// starts the drag (suppressing the normal click-select pick).
+    /// Cleared on commit / Escape / re-clicking Region.
+    pub terrain_region_drag_armed: Signal<bool>,
+    /// In-progress region drag-box rect: `Some((x0, y0, x1, y1))` in
+    /// CSS pixel coordinates while the user is dragging; `None` when
+    /// idle. The viewport draws an overlay rect from this; on
+    /// mouse-up the editor sends
+    /// `EngineCommand::SetTerrainRegionFromScreenRect` and clears.
+    pub terrain_region_drag_rect: Signal<Option<(f32, f32, f32, f32)>>,
+    /// Engine-published "active terrain region" as a world-space
+    /// AABB. Mirrored from `StateUpdate.active_terrain_region` so the
+    /// toolbar knows when to route Revert / Bake to the region path
+    /// versus the camera-radius fallback. Drawn as a wireframe
+    /// overlay (TODO: hook into `build_gizmo_wireframe`).
+    pub active_terrain_region: Signal<Option<arvx_core::Aabb>>,
+    /// World-space radius for the camera-radius fallback when no
+    /// active region is set. Sane default: 32 m (≈ a half tile) so
+    /// "click Revert" touches a noticeable area without nuking the
+    /// whole world.
+    pub terrain_camera_radius_m: Signal<f32>,
+    /// Number of terrain tiles divergent from the procedural
+    /// baseline. Mirrored from `StateUpdate.divergent_tile_count`;
+    /// shown next to the Heatmap toggle when the overlay is on.
+    pub terrain_divergent_tile_count: Signal<usize>,
 }
 
 /// Data about the tab being dragged.
@@ -419,6 +452,14 @@ impl EditorStore {
             drop_target: Signal::new(None),
 
             convert_procedural_target: Signal::new(None),
+
+            // Phase 9b — Terrain viewport toolbar.
+            terrain_heatmap_visible: Signal::new(false),
+            terrain_region_drag_armed: Signal::new(false),
+            terrain_region_drag_rect: Signal::new(None),
+            active_terrain_region: Signal::new(None),
+            terrain_camera_radius_m: Signal::new(32.0),
+            terrain_divergent_tile_count: Signal::new(0),
         }
     }
 

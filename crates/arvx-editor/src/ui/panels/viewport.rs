@@ -7,7 +7,7 @@ use arvx_engine::viewport::ViewportId;
 
 use crate::CommandSender;
 use crate::ui::store::EditorStore;
-use super::viewport_toolbar::{ViewportHeaderBar, EditModeToolbar, BrushToolbar};
+use super::viewport_toolbar::{ViewportHeaderBar, EditModeToolbar, BrushToolbar, TerrainToolbar};
 
 /// The viewport id this panel renders. Phase 3: only the MAIN viewport has
 /// a UI panel; the build viewport gets its own component in Phase 6.
@@ -164,6 +164,14 @@ pub fn Viewport() -> NodeHandle {
                 let _ = cmd_tx.send(arvx_engine::EngineCommand::MouseMove {
                     id: PANEL_VIEWPORT, x, y, dx, dy,
                 });
+                // Phase 9b: region drag-box — update the live rect's
+                // far corner while LMB is held. The overlay redraws
+                // reactively off the signal.
+                if let Some((x0, y0, _, _)) = store.terrain_region_drag_rect.get() {
+                    if lmb_held.get() {
+                        store.terrain_region_drag_rect.set(Some((x0, y0, x, y)));
+                    }
+                }
                 // Paint-drag: in paint mode with LMB held, each mouse
                 // move issues another stamp. The engine's pick
                 // in-flight gate naturally coalesces duplicates.
@@ -201,7 +209,14 @@ pub fn Viewport() -> NodeHandle {
                 });
                 if button == SurfaceMouseButton::Left {
                     lmb_held.set(true);
-                    if store.paint_active.get() {
+                    if store.terrain_region_drag_armed.get() {
+                        // Phase 9b: region drag-box mode owns LMB —
+                        // start a drag rect at the cursor and suppress
+                        // every other LMB-down side effect (pick,
+                        // paint, sculpt). The rect updates on
+                        // MouseMove; MouseUp commits it.
+                        store.terrain_region_drag_rect.set(Some((x, y, x, y)));
+                    } else if store.paint_active.get() {
                         // Paint mode owns LMB — suppress the normal
                         // click-select pick so the click doesn't
                         // deselect everything while painting.
@@ -237,6 +252,24 @@ pub fn Viewport() -> NodeHandle {
                 });
                 if button == SurfaceMouseButton::Left {
                     lmb_held.set(false);
+                    // Phase 9b: commit the region drag-box if one is
+                    // in flight. Disarms the toolbar so the next LMB
+                    // returns to its normal pick / paint / sculpt
+                    // behaviour — author re-clicks Region to draw
+                    // another box.
+                    if let Some((x0, y0, x1, y1)) = store.terrain_region_drag_rect.get() {
+                        store.terrain_region_drag_rect.set(None);
+                        store.terrain_region_drag_armed.set(false);
+                        let _ = cmd_tx.send(
+                            arvx_engine::EngineCommand::SetTerrainRegionFromScreenRect {
+                                id: PANEL_VIEWPORT,
+                                x0,
+                                y0,
+                                x1,
+                                y1,
+                            },
+                        );
+                    }
                 }
             }
             MouseWheel { delta_y, .. } => {
@@ -245,6 +278,17 @@ pub fn Viewport() -> NodeHandle {
                 });
             }
             KeyDown(key_data) => {
+                // Phase 9b: Escape cancels an in-progress region
+                // drag-box and disarms the toolbar. Handled before
+                // any other key wiring so it takes precedence.
+                if key_data.code == "Escape" {
+                    if store.terrain_region_drag_armed.get()
+                        || store.terrain_region_drag_rect.get().is_some()
+                    {
+                        store.terrain_region_drag_armed.set(false);
+                        store.terrain_region_drag_rect.set(None);
+                    }
+                }
                 // Delete key → delete selected entity.
                 if key_data.code == "Delete" || key_data.code == "Backspace" {
                     let _ = cmd_tx.send(arvx_engine::EngineCommand::DeleteSelected);
@@ -374,6 +418,30 @@ pub fn Viewport() -> NodeHandle {
                 RenderSurface { surface: Some(surface.clone()) }
                 EditModeToolbar {}
                 BrushToolbar {}
+                TerrainToolbar {}
+                // Phase 9b: region drag-box overlay. Reactive on the
+                // shared signal; visible only while a drag is in
+                // progress.
+                div {
+                    style: {move || {
+                        match store.terrain_region_drag_rect.get() {
+                            Some((x0, y0, x1, y1)) => {
+                                let lx = x0.min(x1);
+                                let ly = y0.min(y1);
+                                let w = (x1 - x0).abs();
+                                let h = (y1 - y0).abs();
+                                format!(
+                                    "position:absolute;left:{lx}px;top:{ly}px;\
+                                     width:{w}px;height:{h}px;\
+                                     border:1.5px dashed #ffc107;\
+                                     background:rgba(255,193,7,0.08);\
+                                     pointer-events:none;z-index:25;"
+                                )
+                            }
+                            None => "display:none;".to_string(),
+                        }
+                    }},
+                }
             }
         }
     }

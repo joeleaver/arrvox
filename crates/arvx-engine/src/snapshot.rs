@@ -216,6 +216,19 @@ pub struct StateUpdate {
     /// profiling panel's sparklines — MCP reads the full ring buffer
     /// directly from the engine via `ArvxEngine::profiling_history`.
     pub profiling: Option<crate::profiling::ProfilingFrame>,
+    /// Phase 9b: the engine's active terrain region (Revert / Bake
+    /// target) as a world-space AABB. Outer `Option` = "this tick
+    /// carries an update"; inner `Option` = `Some(aabb)` for an
+    /// active region or `None` to clear. The editor draws a
+    /// wireframe overlay when set and routes Revert / Bake to this
+    /// AABB instead of the camera-radius fallback.
+    pub active_terrain_region: Option<Option<arvx_core::Aabb>>,
+
+    /// Phase 9b: divergent terrain tile count (heatmap counter).
+    /// `Some(n)` when the count changed this tick; `None` when
+    /// unchanged so the toolbar doesn't re-render on every tick.
+    /// `0` is a valid update (the user just reverted everything).
+    pub divergent_tile_count: Option<usize>,
 }
 
 /// Info about an available model file.

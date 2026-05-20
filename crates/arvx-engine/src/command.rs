@@ -70,6 +70,69 @@ pub enum EngineCommand {
         shape: RegionShapeSpec,
     },
 
+    /// Phase 9b: revert all sculpt edits inside `aabb`. Deletes any
+    /// `.arvxtile` files inside the box AND invalidates live tiles —
+    /// the next bake reproduces the procedural+stamps+regions
+    /// baseline (no sculpt) from scratch. No-op + console warn when
+    /// no Terrain is in the scene.
+    RevertTerrainInAabb {
+        aabb: arvx_core::Aabb,
+    },
+
+    /// Phase 9b: convenience form of [`Self::RevertTerrainInAabb`]
+    /// that builds the AABB on the engine side from the editor
+    /// camera's position and the given world-space radius. Lets the
+    /// toolbar fire "revert around me" without having to plumb the
+    /// camera through to the editor.
+    RevertTerrainAtCameraRadius {
+        radius: f32,
+    },
+
+    /// Phase 9b: persist every live terrain tile whose AABB intersects
+    /// `aabb` as a `.arvxtile` next to the scene. Same effect as the
+    /// auto-flush-on-save path but scoped + on-demand. No-op + console
+    /// warn when no Terrain is in the scene or no scene path is set.
+    BakeTerrainSnapshotInAabb {
+        aabb: arvx_core::Aabb,
+    },
+
+    /// Phase 9b: convenience form of
+    /// [`Self::BakeTerrainSnapshotInAabb`] driven by the editor
+    /// camera's position + the given world-space radius.
+    BakeTerrainSnapshotAtCameraRadius {
+        radius: f32,
+    },
+
+    /// Phase 9b: commit a screen-space drag-box rect from the
+    /// viewport into the engine's active terrain region. The engine
+    /// projects the four screen corners onto the y=0 ground plane to
+    /// derive a world-space AABB; the vertical span comes from the
+    /// Terrain's bounded extent (Unbounded terrain uses a fixed
+    /// ±256 m span). The result is stored as the active region and
+    /// echoed back via `StateUpdate.active_terrain_region` so the
+    /// editor can draw the wireframe overlay.
+    SetTerrainRegionFromScreenRect {
+        id: ViewportId,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+    },
+
+    /// Phase 9b: clear the active terrain region (toolbar "X" or
+    /// Region-button toggle-off).
+    ClearTerrainRegion,
+
+    /// Phase 9b: toggle the terrain edit heatmap overlay. When
+    /// `visible == true` the wireframe-overlay pass adds an amber
+    /// AABB outline around every tile that's diverged from the
+    /// procedural baseline (sculpt edits this session OR a saved
+    /// `.arvxtile` from a prior session). Pure visualisation — no
+    /// effect on baking, physics, or save.
+    SetTerrainHeatmapVisible {
+        visible: bool,
+    },
+
     /// Spawn a generator-driven entity. `generator_name` must match a
     /// registered generator from the gameplay dylib. The entity gets a
     /// Transform, EditorMetadata, GeneratorState, and a default instance

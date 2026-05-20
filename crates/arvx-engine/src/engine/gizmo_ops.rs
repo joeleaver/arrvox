@@ -286,6 +286,17 @@ impl EngineState {
         // Brighter when the Terrain entity is selected.
         verts.extend(self.build_terrain_bounds_wireframe());
 
+        // Phase 9b: active terrain region from the toolbar's
+        // drag-box. Drawn in warm amber so it visually reads as a
+        // sub-scope of the terrain bounds (which use a similar
+        // orange palette).
+        verts.extend(self.build_active_terrain_region_wireframe());
+
+        // Phase 9b: edit heatmap — outlines every tile divergent
+        // from the procedural baseline. Toggled by the toolbar's
+        // Heatmap button.
+        verts.extend(self.build_terrain_heatmap_wireframe());
+
         // Region gizmos — Phase 6. Always-on outline of the shape, plus
         // a softer outer shell at the falloff transition radius when
         // selected. Cross-cutting primitive: any entity carrying a
@@ -577,6 +588,54 @@ impl EngineState {
             verts.extend(arvx_render::wireframe::aabb_wireframe(min, max, color));
         }
 
+        verts
+    }
+
+    /// Phase 9b: outline the editor's active terrain region (the
+    /// scope for Revert / Bake). Bright amber to read as "the thing
+    /// the next action will hit." Drawn only when a region is set.
+    pub(crate) fn build_active_terrain_region_wireframe(
+        &self,
+    ) -> Vec<arvx_render::LineVertex> {
+        let Some(aabb) = self.active_terrain_region else {
+            return Vec::new();
+        };
+        let color: [f32; 4] = [1.0, 0.78, 0.18, 0.95];
+        arvx_render::wireframe::aabb_wireframe(aabb.min, aabb.max, color)
+    }
+
+    /// Phase 9b: edit-heatmap visualisation. Outlines every divergent
+    /// terrain tile (sculpt-edited this session OR a `.arvxtile`
+    /// loaded from disk). Uses a brighter, more saturated amber than
+    /// the bounds overlay so it stands out against it. Drawn only
+    /// when the toolbar's Heatmap button is on. Outlines only live
+    /// tiles — evicted divergent tiles aren't on screen so there's
+    /// nothing to show for them.
+    pub(crate) fn build_terrain_heatmap_wireframe(
+        &self,
+    ) -> Vec<arvx_render::LineVertex> {
+        if !self.terrain_heatmap_visible {
+            return Vec::new();
+        }
+        let Some(rt) = self.terrain.as_ref() else {
+            return Vec::new();
+        };
+        let color: [f32; 4] = [1.0, 0.45, 0.05, 0.85];
+        let mut verts = Vec::new();
+        for key in &rt.divergent_tiles {
+            // We only outline divergent tiles that are currently
+            // live (in the scene). Evicted divergent tiles are
+            // out-of-frame and would render at world coordinates
+            // with no surrounding geometry — confusing.
+            if !rt.tile_keys.contains_key(key) {
+                continue;
+            }
+            let origin = key.origin_world().to_vec3();
+            let extent = key.extent_m();
+            let min = origin;
+            let max = origin + glam::Vec3::splat(extent);
+            verts.extend(arvx_render::wireframe::aabb_wireframe(min, max, color));
+        }
         verts
     }
 
