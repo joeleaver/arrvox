@@ -159,24 +159,25 @@ fn build_menus(
             let tx = tx.clone();
             move || { let _ = tx.send(arvx_engine::EngineCommand::SpawnTerrain); }
         }))
-        .submenu("Stamp", {
-            let mut sub = Menu::new();
-            for (label, spec) in [
-                ("Mountain", arvx_engine::StampKindSpec::Mountain),
-                ("Hill", arvx_engine::StampKindSpec::Hill),
-                ("Lake", arvx_engine::StampKindSpec::Lake),
-                ("Plateau", arvx_engine::StampKindSpec::Plateau),
-                ("Flatten", arvx_engine::StampKindSpec::Flatten),
-            ] {
-                sub = sub.item(MenuItem::new(label).on_click({
-                    let tx = tx.clone();
-                    move || {
-                        let _ = tx.send(arvx_engine::EngineCommand::SpawnStamp { kind: spec });
-                    }
-                }));
+        .separator();
+    // Terrain stamps are flattened into the Spawn menu rather than
+    // nested under a "Stamp" submenu — three-level menu nesting
+    // (Edit ▸ Spawn ▸ Stamp ▸ Mountain) doesn't render reliably on
+    // every platform's native menu backend.
+    for (label, spec) in [
+        ("Mountain Stamp", arvx_engine::StampKindSpec::Mountain),
+        ("Hill Stamp", arvx_engine::StampKindSpec::Hill),
+        ("Lake Stamp", arvx_engine::StampKindSpec::Lake),
+        ("Plateau Stamp", arvx_engine::StampKindSpec::Plateau),
+        ("Flatten Stamp", arvx_engine::StampKindSpec::Flatten),
+    ] {
+        spawn_menu = spawn_menu.item(MenuItem::new(label).on_click({
+            let tx = tx.clone();
+            move || {
+                let _ = tx.send(arvx_engine::EngineCommand::SpawnStamp { kind: spec });
             }
-            sub
-        });
+        }));
+    }
     // Generators live in the Models panel — they're assets, not spawn-
     // menu items. See `ui/panels/models_panel.rs`.
 
