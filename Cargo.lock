@@ -349,6 +349,7 @@ dependencies = [
  "arvx-macros",
  "arvx-physics",
  "arvx-procedural",
+ "arvx-regions",
  "arvx-render",
  "arvx-runtime",
  "arvx-terrain",
@@ -421,6 +422,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arvx-regions"
+version = "0.1.0"
+dependencies = [
+ "arvx-core",
+ "glam 0.29.3",
+ "hecs",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "arvx-render"
 version = "0.1.0"
 dependencies = [
@@ -469,6 +482,7 @@ name = "arvx-terrain"
 version = "0.1.0"
 dependencies = [
  "arvx-core",
+ "arvx-regions",
  "bytemuck",
  "crossbeam",
  "glam 0.29.3",

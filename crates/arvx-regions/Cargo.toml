@@ -1,0 +1,16 @@
+[package]
+name = "arvx-regions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Cross-cutting region primitive for Arrvox: shape + falloff + soft membership + spatial index"
+
+[dependencies]
+arvx-core = { workspace = true }
+glam = { workspace = true }
+hecs = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

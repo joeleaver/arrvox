@@ -12,6 +12,7 @@ members = [
     "crates/arvx-import",
     "crates/arvx-animation",
     "crates/arvx-physics",
+    "crates/arvx-regions",
     "crates/arvx-terrain",
 ]
 
@@ -34,6 +35,7 @@ arvx-procedural = { path = "crates/arvx-procedural" }
 arvx-import = { path = "crates/arvx-import" }
 arvx-animation = { path = "crates/arvx-animation" }
 arvx-physics = { path = "crates/arvx-physics" }
+arvx-regions = { path = "crates/arvx-regions" }
 arvx-terrain = { path = "crates/arvx-terrain" }
 
 # External dependencies (versions match RKIField)
