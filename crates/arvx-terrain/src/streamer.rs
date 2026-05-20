@@ -449,6 +449,7 @@ impl TileStreamer {
                 generation: slot.requested_generation,
                 disk_path,
                 stamps,
+                regions: Arc::clone(&terrain.regions),
             };
             if self.worker.submit(job) {
                 slot.state = TileState::Submitted;
@@ -485,6 +486,7 @@ mod tests {
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
             terrain_fn: Arc::new(AllSky),
             stamps: Arc::new(crate::stamp_index::StampIndex::new()),
+            regions: Arc::new(crate::TerrainRegionSnapshot::new()),
             render_radius_m: 200.0,
         }
     }
@@ -529,6 +531,7 @@ mod tests {
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
             terrain_fn: Arc::new(AllSky),
             stamps: Arc::new(crate::stamp_index::StampIndex::new()),
+            regions: Arc::new(crate::TerrainRegionSnapshot::new()),
             render_radius_m: 80.0, // ~1 tile radius
         };
 

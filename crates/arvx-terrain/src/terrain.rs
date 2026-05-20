@@ -8,6 +8,7 @@
 
 use crate::bounds::TerrainBounds;
 use crate::fbm::FbmTerrainFn;
+use crate::region_snapshot::{TerrainRegionSnapshot, TerrainRegionSnapshotHandle};
 use crate::stamp_index::{StampIndex, StampIndexHandle};
 use crate::terrain_fn::TerrainFn;
 use std::sync::Arc;
@@ -40,6 +41,12 @@ pub struct Terrain {
     /// jobs via `Arc`. Tiles compose stamps over the Layer-1
     /// `terrain_fn` output during bake.
     pub stamps: StampIndexHandle,
+    /// Phase 7 biome regions snapshot — cached mirror of every
+    /// `(Region, Transform)` entity in the scene (paired with optional
+    /// `BiomeRegion` data). The engine rebuilds this on Region or
+    /// BiomeRegion add/move/edit/delete; tiles read it during bake to
+    /// apply per-voxel material overrides.
+    pub regions: TerrainRegionSnapshotHandle,
     /// Camera-centric residency radius in metres. Tiles whose centre
     /// is within this distance from the camera (and inside bounds)
     /// are materialised; tiles beyond are evicted.
@@ -57,6 +64,7 @@ impl std::fmt::Debug for Terrain {
             .field("base_tier", &self.base_tier)
             .field("render_radius_m", &self.render_radius_m)
             .field("stamps_count", &self.stamps.len())
+            .field("regions_count", &self.regions.len())
             .field("terrain_fn", &"<Arc<dyn TerrainFn>>")
             .finish()
     }
@@ -69,6 +77,7 @@ impl Default for Terrain {
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
             terrain_fn: Arc::new(FbmTerrainFn::default()),
             stamps: Arc::new(StampIndex::new()),
+            regions: Arc::new(TerrainRegionSnapshot::new()),
             render_radius_m: 192.0,
         }
     }

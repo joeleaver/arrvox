@@ -93,7 +93,13 @@ fn main() {
         key.extent_m(),
     );
 
-    let baked = match bake_tile(key, voxel_size, &fbm, &[]) {
+    let baked = match bake_tile(
+        key,
+        voxel_size,
+        &fbm,
+        &[],
+        &arvx_terrain::TerrainRegionSnapshot::new(),
+    ) {
         Some(b) => b,
         None => {
             eprintln!("bake failed");

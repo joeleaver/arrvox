@@ -257,8 +257,14 @@ mod tests {
         // Coarse voxel size keeps the test fast (~milliseconds).
         let voxel_size_m = 1.0_f32;
         let key = TileKey::level0(0, 0, 0);
-        let baked = bake_tile(key, voxel_size_m, &FbmTerrainFn::default(), &[])
-            .expect("bake_tile should succeed on default FBM at origin");
+        let baked = bake_tile(
+            key,
+            voxel_size_m,
+            &FbmTerrainFn::default(),
+            &[],
+            &crate::TerrainRegionSnapshot::new(),
+        )
+        .expect("bake_tile should succeed on default FBM at origin");
         assert!(
             baked.artifact.voxel_count > 0,
             "test relies on FBM at origin producing a non-empty tile",

@@ -8,6 +8,7 @@
 //! ownership across threads.
 
 use crate::baked_tile::BakedTile;
+use crate::region_snapshot::TerrainRegionSnapshot;
 use crate::stamp::{combine_heights, Stamp};
 use crate::terrain_fn::TerrainFn;
 use crate::tile_key::TileKey;
@@ -50,6 +51,10 @@ const TILE_HALO_VOXELS: u32 = 2;
 ///   order. The streamer pre-filters the global `StampIndex` to just
 ///   the tile-relevant subset before submitting the bake job, so this
 ///   slice is typically small (zero in scenes with no stamps).
+/// * `regions` — Phase 7 snapshot of biome regions. Bake queries this
+///   per voxel for material overrides; the BVH inside
+///   `regions.index` is the spatial accelerator. Empty snapshot is a
+///   no-op (the common case in scenes without biomes).
 ///
 /// ## Heightmap composition contract
 ///
@@ -59,11 +64,29 @@ const TILE_HALO_VOXELS: u32 = 2;
 /// `sd = wy - composed_h`. V1 stamps are all heightmap kinds — this
 /// is the right shape. V2 volumetric stamps will skip this and apply
 /// their SD contribution directly (a future overload).
+///
+/// ## Material override precedence (Phase 7)
+///
+/// Per voxel the final material is decided in this order:
+///
+/// 1. Biome region material override (highest-priority overlapping
+///    `BiomeRegion` with a `Some(material)` — see
+///    [`TerrainRegionSnapshot::material_override_at`]).
+/// 2. Stamp material override (last stamp whose footprint covers the
+///    voxel and that carries `material_override`).
+/// 3. Base [`TerrainFn`] material from `sample`.
+///
+/// Biome wins over stamp because biomes are large-scale
+/// "this whole forest is moss" intent; stamp material is per-feature
+/// (Mountain → rock above the slope threshold) and should defer to
+/// the broader biome wash. Authors who want a stamp to punch through
+/// a biome do so by stacking a higher-priority biome on the stamp.
 pub fn bake_tile(
     key: TileKey,
     voxel_size_m: f32,
     terrain_fn: &dyn TerrainFn,
     stamps: &[Stamp],
+    regions: &TerrainRegionSnapshot,
 ) -> Option<BakedTile> {
     let t0 = std::time::Instant::now();
 
@@ -115,6 +138,17 @@ pub fn bake_tile(
                     }
                 }
 
+                // Phase 7 — biome regions. Highest-priority overlapping
+                // BiomeRegion with a `material_override` wins, replacing
+                // any stamp or base-TerrainFn material assignment.
+                if !regions.is_empty() {
+                    if let Some(m) = regions.material_override_at(world_pos) {
+                        s.primary_mat = m;
+                        s.secondary_mat = m;
+                        s.blend = 0.0;
+                    }
+                }
+
                 let blend_u4 = (s.blend.clamp(0.0, 1.0) * 15.0).round() as u8;
                 (s.sd, s.primary_mat, s.secondary_mat, blend_u4, 0)
             })
@@ -156,6 +190,13 @@ mod tests {
     use crate::stamp::{FalloffCurve, StampKind};
     use crate::terrain::Terrain;
     use crate::terrain_fn::TerrainSample;
+
+    /// Empty region snapshot — the "no biomes in this scene" baseline
+    /// every existing test wants. Phase 7 adds the regions parameter
+    /// to `bake_tile`; tests that don't care about regions pass this.
+    fn empty_regions() -> TerrainRegionSnapshot {
+        TerrainRegionSnapshot::new()
+    }
 
     /// All-empty terrain (everywhere above surface): the bake should
     /// still return a valid artifact, with an empty surface mesh.
@@ -204,7 +245,7 @@ mod tests {
     fn bake_all_sky_returns_empty_mesh() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
-        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &AllSky, &[]).expect("bake");
+        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &AllSky, &[], &empty_regions()).expect("bake");
         assert_eq!(
             baked.vertex_count(),
             0,
@@ -217,7 +258,7 @@ mod tests {
     fn bake_all_solid_returns_empty_mesh() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
-        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &AllSolid, &[]).expect("bake");
+        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &AllSolid, &[], &empty_regions()).expect("bake");
         // All-solid means no air-solid boundary inside the tile.
         // Surface extraction emits zero triangles.
         assert_eq!(baked.vertex_count(), 0);
@@ -227,7 +268,7 @@ mod tests {
     fn bake_flat_half_produces_surface_mesh() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
-        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[]).expect("bake");
+        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions()).expect("bake");
         assert!(
             baked.vertex_count() > 0,
             "flat plane bisecting tile must produce vertices; got {}",
@@ -246,7 +287,7 @@ mod tests {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
         let fbm = FbmTerrainFn::default();
-        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[]).expect("bake");
+        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake");
         assert!(
             baked.vertex_count() > 100,
             "FBM in a 64m tile should produce many surface vertices; got {}",
@@ -286,8 +327,8 @@ mod tests {
         // surface at local y = 32 m → world y = 32 (both tiles see
         // identical SDF since `sd = l.y - 32` is a pure local
         // formula).
-        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &surface, &[]).expect("bake A");
-        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &surface, &[]).expect("bake B");
+        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &surface, &[], &empty_regions()).expect("bake A");
+        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &surface, &[], &empty_regions()).expect("bake B");
 
         // For a horizontal surface (no X-edge crossings), each cube's
         // vertex sits at x = (cube_lo.x + 1) · voxel_size. The
@@ -356,8 +397,8 @@ mod tests {
         let vs = t.voxel_size_for_level(0);
         let fbm = FbmTerrainFn::default();
 
-        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[]).expect("bake A");
-        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm, &[]).expect("bake B");
+        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake A");
+        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake B");
 
         // For watertightness we only need to verify that vertices
         // landing exactly at the shared `x = 64 m` plane match
@@ -474,8 +515,8 @@ mod tests {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
         let fbm = FbmTerrainFn::default();
-        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[]).expect("bake A");
-        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm, &[]).expect("bake B");
+        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake A");
+        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake B");
 
         let stride = 32usize;
         let i_stride = 4usize;
@@ -619,7 +660,7 @@ mod tests {
         let vs = t.voxel_size_for_level(0);
 
         let baseline =
-            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[]).expect("baseline");
+            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions()).expect("baseline");
         let (_, base_max_y) = lod0_y_range(&baseline);
 
         // Mountain at tile centre, lifting 15 m above the flat plane.
@@ -631,7 +672,7 @@ mod tests {
             },
             Vec3::new(32.0, 32.0, 32.0),
         );
-        let stamped = bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[stamp])
+        let stamped = bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[stamp], &empty_regions())
             .expect("stamped");
         let (_, stamped_max_y) = lod0_y_range(&stamped);
 
@@ -655,7 +696,7 @@ mod tests {
         let vs = t.voxel_size_for_level(0);
 
         let baseline =
-            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[]).expect("baseline");
+            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions()).expect("baseline");
         let (base_min_y, _) = lod0_y_range(&baseline);
 
         let stamp = crate::stamp::Stamp::new(
@@ -668,7 +709,7 @@ mod tests {
             // so the basin floor lands at y = 22.
             Vec3::new(32.0, 32.0, 32.0),
         );
-        let stamped = bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[stamp])
+        let stamped = bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[stamp], &empty_regions())
             .expect("stamped");
         let (stamped_min_y, _) = lod0_y_range(&stamped);
 
@@ -702,7 +743,7 @@ mod tests {
             },
             Vec3::new(32.0, target_y, 32.0),
         );
-        let stamped = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[stamp])
+        let stamped = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[stamp], &empty_regions())
             .expect("stamped");
 
         let (min_y, max_y) = lod0_y_range(&stamped);
@@ -750,6 +791,7 @@ mod tests {
             vs,
             &FlatHalf,
             &[lake, mountain],
+            &empty_regions(),
         )
         .expect("bake");
         let (min_y, max_y) = lod0_y_range(&baked);
@@ -758,5 +800,114 @@ mod tests {
         // max_y around mountain peak.
         assert!(min_y < 30.0, "lake should pull min y below 30; got {min_y}");
         assert!(max_y > 38.0, "mountain should push max y above 38; got {max_y}");
+    }
+
+    // ── Phase 7 — biome region material overrides ─────────────────
+
+    /// Collect the set of primary material ids appearing on LOD-0
+    /// surface voxels in the baked tile via the artifact's leaf attr
+    /// array. (The mesh blob's vertex format doesn't carry material
+    /// directly — material is per-leaf, resolved at shade time — so
+    /// we read it from the source artifact, not the mesh.)
+    fn lod0_primary_materials(baked: &BakedTile) -> std::collections::HashSet<u16> {
+        baked
+            .artifact
+            .leaf_attrs
+            .iter()
+            .map(|a| a.material_primary)
+            .collect()
+    }
+
+    /// A biome that covers the whole tile and forces a known material.
+    /// FlatHalf gives a known base material; the biome must replace it.
+    #[test]
+    fn biome_region_material_override_replaces_base() {
+        use crate::biome_region::BiomeRegion;
+        use crate::region_snapshot::TerrainRegionSnapshot;
+        use arvx_regions::{Falloff, Region, RegionEntry, RegionShape};
+        use std::sync::Arc;
+
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+
+        // Baseline — FlatHalf hard-codes material id 1.
+        let baseline =
+            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions())
+                .expect("baseline");
+        let base_mats = lod0_primary_materials(&baseline);
+        assert!(
+            base_mats.contains(&1),
+            "FlatHalf baseline should write material 1; got {base_mats:?}"
+        );
+
+        // Single biome covering the entire tile, material override = 42.
+        let region = Region {
+            shape: RegionShape::Sphere { radius: 200.0 },
+            falloff: Falloff::Smoothstep { transition_m: 50.0 },
+            priority: 0,
+        };
+        let mut w = hecs::World::new();
+        let e = w.spawn((region,));
+        let snapshot = TerrainRegionSnapshot {
+            index: Arc::new(arvx_regions::RegionIndex::from_entries(vec![
+                RegionEntry::new(e, region, glam::Vec3::new(32.0, 32.0, 32.0)),
+            ])),
+            biomes: Arc::new(vec![Some(BiomeRegion {
+                material_override: Some(42),
+                ..Default::default()
+            })]),
+        };
+
+        let stamped =
+            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &snapshot).expect("stamped");
+        let mats = lod0_primary_materials(&stamped);
+        // Every surface voxel inside the region must carry material 42.
+        assert!(
+            mats.contains(&42),
+            "biome override material 42 should appear in baked materials; got {mats:?}"
+        );
+        // Base material 1 should NOT appear anywhere the biome reaches;
+        // the biome covers the entire tile so 1 should be gone.
+        assert!(
+            !mats.contains(&1),
+            "biome should fully override base material 1; got {mats:?}"
+        );
+    }
+
+    /// A biome with `material_override: None` doesn't touch the material
+    /// — it could still influence terrain_fn (V2) but Phase 7 only acts
+    /// on the override.
+    #[test]
+    fn biome_region_without_override_leaves_material_alone() {
+        use crate::biome_region::BiomeRegion;
+        use crate::region_snapshot::TerrainRegionSnapshot;
+        use arvx_regions::{Falloff, Region, RegionEntry, RegionShape};
+        use std::sync::Arc;
+
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+
+        let region = Region {
+            shape: RegionShape::Sphere { radius: 200.0 },
+            falloff: Falloff::Smoothstep { transition_m: 50.0 },
+            priority: 0,
+        };
+        let mut w = hecs::World::new();
+        let e = w.spawn((region,));
+        let snapshot = TerrainRegionSnapshot {
+            index: Arc::new(arvx_regions::RegionIndex::from_entries(vec![
+                RegionEntry::new(e, region, glam::Vec3::new(32.0, 32.0, 32.0)),
+            ])),
+            biomes: Arc::new(vec![Some(BiomeRegion::default())]),
+        };
+
+        let baked =
+            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &snapshot).expect("baked");
+        let mats = lod0_primary_materials(&baked);
+        // Base material 1 should still be present — no override.
+        assert!(
+            mats.contains(&1),
+            "empty BiomeRegion should leave base material intact; got {mats:?}"
+        );
     }
 }

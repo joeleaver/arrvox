@@ -41,6 +41,7 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 use crate::bake::bake_tile;
 use crate::baked_tile::BakedTile;
 use crate::persist::read_baked_tile;
+use crate::region_snapshot::TerrainRegionSnapshot;
 use crate::stamp::Stamp;
 use crate::terrain_fn::TerrainFn;
 use crate::tile_key::TileKey;
@@ -76,6 +77,12 @@ pub struct BakeJob {
     /// so the streamer can re-submit the same tile under the same
     /// stamp set without re-allocating.
     pub stamps: Arc<Vec<Stamp>>,
+    /// Phase 7: biome region snapshot. Shared by `Arc` across every
+    /// in-flight bake job — the streamer hands every worker the same
+    /// snapshot, and rebuilds it (allocating a fresh `Arc`) whenever
+    /// the region set changes. Always present, even for scenes
+    /// without regions (then it's the empty default).
+    pub regions: Arc<TerrainRegionSnapshot>,
 }
 
 /// Outcome of one worker job. `baked = None` means the bake failed —
@@ -203,7 +210,15 @@ fn worker_loop(
     completed: Arc<AtomicUsize>,
 ) {
     while let Ok(job) = inbox.recv() {
-        let BakeJob { key, voxel_size_m, terrain_fn, generation, disk_path, stamps } = job;
+        let BakeJob {
+            key,
+            voxel_size_m,
+            terrain_fn,
+            generation,
+            disk_path,
+            stamps,
+            regions,
+        } = job;
 
         // Phase 4.4: if a `.arvxtile` is on disk for this key, load
         // it instead of re-running `TerrainFn`. Falls back to the
@@ -239,10 +254,17 @@ fn worker_loop(
                     }
                 }
             }
-            bake_tile(key, voxel_size_m, &*terrain_fn, stamps.as_slice())
+            bake_tile(
+                key,
+                voxel_size_m,
+                &*terrain_fn,
+                stamps.as_slice(),
+                regions.as_ref(),
+            )
         }));
         drop(terrain_fn);
         drop(stamps);
+        drop(regions);
 
         let baked = match result {
             Ok(maybe) => maybe,
