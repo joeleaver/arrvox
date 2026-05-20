@@ -21,10 +21,35 @@ impl DirtyRanges {
         Self::default()
     }
 
-    /// Mark `[start, start + len)` as dirty. No-op when `len == 0` or
-    /// when the tracker is already in full-pool mode.
+    /// Mark `[start, start + len)` as dirty. No-op when `len == 0`.
+    ///
+    /// If the tracker is in full-pool mode and the new range fits
+    /// entirely inside the existing full range, the call is dropped
+    /// (the range is already covered). If the new range extends past
+    /// the full range, the full range is expanded to cover —
+    /// otherwise the appended tail would silently lose its dirty
+    /// bytes. (Concrete case: sculpt patch path appends K vertices
+    /// to a tile whose VBO was full-marked on integrate; without
+    /// this expansion the K new vertices never get uploaded and the
+    /// IBO indexes garbage GPU memory → spider-leg mesh corruption.)
     pub fn mark(&mut self, start: u32, len: u32) {
-        if len == 0 || self.full {
+        if len == 0 {
+            return;
+        }
+        if self.full {
+            // mark_full guarantees self.ranges is exactly one entry
+            // covering (0, total_len). Either expand it to swallow
+            // the new tail or leave it alone if the new range fits.
+            let new_end = start.saturating_add(len);
+            let cur_end = self
+                .ranges
+                .first()
+                .map(|(off, l)| off.saturating_add(*l))
+                .unwrap_or(0);
+            if new_end > cur_end {
+                self.ranges[0] = (0, new_end);
+                self.total_bytes = new_end as u64;
+            }
             return;
         }
         self.ranges.push((start, len));
@@ -190,12 +215,48 @@ mod tests {
     }
 
     #[test]
-    fn mark_after_full_is_noop() {
+    fn mark_inside_full_range_is_noop() {
+        // `mark` calls that fit inside the existing full range are
+        // redundant — `mark_full(N)` already says "all of [0, N) is
+        // dirty". The tracker stays in full mode with one range.
         let mut d = DirtyRanges::new();
         d.mark_full(1024);
         d.mark(0, 16);
         assert!(d.is_full_pool(1024));
         assert_eq!(d.range_count(), 1);
+    }
+
+    #[test]
+    fn mark_past_full_range_expands_it() {
+        // Regression test for the sculpt-after-integrate corruption.
+        // Terrain integrate calls `mark_full(N)` to mark the whole
+        // fresh VBO dirty. If a sculpt patch on the same engine tick
+        // appends K vertices and calls `mark(N, K)`, the new tail
+        // bytes MUST end up in the dirty range — otherwise the
+        // upload only writes [0, N) and the K appended vertices
+        // never reach the GPU, leaving the IBO indexing stale memory
+        // (spider-leg mesh corruption).
+        let mut d = DirtyRanges::new();
+        d.mark_full(1000);
+        d.mark(1000, 200);
+        let ranges: Vec<_> = d.iter().collect();
+        assert_eq!(ranges, vec![(0, 1200)]);
+        assert_eq!(d.total_dirty_bytes(), 1200);
+        assert_eq!(d.range_count(), 1);
+        // Still in full-pool mode at the new size — subsequent marks
+        // inside [0, 1200) remain no-ops.
+        assert!(d.is_full_pool(1200));
+    }
+
+    #[test]
+    fn mark_partially_overlapping_full_range_expands_it() {
+        // Mark a range that starts inside the full range and ends
+        // past it — extends the full range to the new end.
+        let mut d = DirtyRanges::new();
+        d.mark_full(1000);
+        d.mark(800, 400); // 800..1200, overlaps [0..1000), extends to 1200
+        let ranges: Vec<_> = d.iter().collect();
+        assert_eq!(ranges, vec![(0, 1200)]);
     }
 
     #[test]
