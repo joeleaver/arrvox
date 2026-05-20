@@ -8,6 +8,7 @@
 
 use crate::bounds::TerrainBounds;
 use crate::fbm::FbmTerrainFn;
+use crate::stamp_index::{StampIndex, StampIndexHandle};
 use crate::terrain_fn::TerrainFn;
 use std::sync::Arc;
 
@@ -30,9 +31,15 @@ pub struct Terrain {
     /// coarser per LOD level (`base_tier + level`).
     pub base_tier: usize,
     /// Procedural source. Defaults to a vanilla [`FbmTerrainFn`].
-    /// Phase 9 will swap this from the Inspector; Phase 5 swaps it on
-    /// stamps-change. `Arc` makes job submission cheap.
+    /// Phase 9 will swap this from the Inspector. `Arc` makes job
+    /// submission cheap.
     pub terrain_fn: Arc<dyn TerrainFn>,
+    /// Layer-2 stamp index — cached mirror of the world's `Stamp` ECS
+    /// entities owned by this Terrain. The engine rebuilds this
+    /// snapshot on stamp add/move/delete and shares it across bake
+    /// jobs via `Arc`. Tiles compose stamps over the Layer-1
+    /// `terrain_fn` output during bake.
+    pub stamps: StampIndexHandle,
     /// Camera-centric residency radius in metres. Tiles whose centre
     /// is within this distance from the camera (and inside bounds)
     /// are materialised; tiles beyond are evicted.
@@ -49,6 +56,7 @@ impl std::fmt::Debug for Terrain {
             .field("bounds", &self.bounds)
             .field("base_tier", &self.base_tier)
             .field("render_radius_m", &self.render_radius_m)
+            .field("stamps_count", &self.stamps.len())
             .field("terrain_fn", &"<Arc<dyn TerrainFn>>")
             .finish()
     }
@@ -60,6 +68,7 @@ impl Default for Terrain {
             bounds: TerrainBounds::default(),
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
             terrain_fn: Arc::new(FbmTerrainFn::default()),
+            stamps: Arc::new(StampIndex::new()),
             render_radius_m: 192.0,
         }
     }

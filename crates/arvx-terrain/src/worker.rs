@@ -41,6 +41,7 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 use crate::bake::bake_tile;
 use crate::baked_tile::BakedTile;
 use crate::persist::read_baked_tile;
+use crate::stamp::Stamp;
 use crate::terrain_fn::TerrainFn;
 use crate::tile_key::TileKey;
 
@@ -57,8 +58,8 @@ pub struct BakeJob {
     /// Procedural source; cloned cheaply from `Terrain::terrain_fn`.
     pub terrain_fn: Arc<dyn TerrainFn>,
     /// Per-tile request generation. The streamer bumps this whenever
-    /// it (re-)submits the same tile (e.g. evict-then-reload during
-    /// camera oscillation, or Phase 5 stamp invalidation). The
+    /// it (re-)submits the same tile (evict-then-reload during camera
+    /// oscillation, stamp invalidation, sculpt-edit re-bake). The
     /// streamer drops results whose generation no longer matches
     /// `slot.requested_generation`.
     pub generation: u64,
@@ -67,6 +68,14 @@ pub struct BakeJob {
     /// running `TerrainFn`-driven voxelization. Caller resolves this
     /// via `persist::tile_path(scene_dir, key)`.
     pub disk_path: Option<std::path::PathBuf>,
+    /// Phase 5: Layer-2 stamps overlapping this tile, in composition
+    /// order. Pre-filtered by the streamer's `submit_pending` from
+    /// the global `StampIndex` so the worker never iterates stamps
+    /// outside the tile's XZ footprint. Empty for scenes with no
+    /// stamps or tiles outside every stamp's reach. Wrapped in `Arc`
+    /// so the streamer can re-submit the same tile under the same
+    /// stamp set without re-allocating.
+    pub stamps: Arc<Vec<Stamp>>,
 }
 
 /// Outcome of one worker job. `baked = None` means the bake failed —
@@ -194,12 +203,19 @@ fn worker_loop(
     completed: Arc<AtomicUsize>,
 ) {
     while let Ok(job) = inbox.recv() {
-        let BakeJob { key, voxel_size_m, terrain_fn, generation, disk_path } = job;
+        let BakeJob { key, voxel_size_m, terrain_fn, generation, disk_path, stamps } = job;
 
         // Phase 4.4: if a `.arvxtile` is on disk for this key, load
         // it instead of re-running `TerrainFn`. Falls back to the
         // procedural bake on any read error so a corrupted file
         // doesn't permanently block streaming the tile.
+        //
+        // Phase 5 note: disk-loaded tiles already contain the stamp
+        // contribution baked-in (the persisted artifact is post-
+        // composition), so we deliberately do NOT re-apply stamps
+        // here. The slot bumps its generation when stamps change,
+        // which invalidates the on-disk cache for that tile via the
+        // editor's "Edits → Revert stamps" pathway in Phase 9.
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             if let Some(ref p) = disk_path {
                 if p.exists() {
@@ -223,9 +239,10 @@ fn worker_loop(
                     }
                 }
             }
-            bake_tile(key, voxel_size_m, &*terrain_fn)
+            bake_tile(key, voxel_size_m, &*terrain_fn, stamps.as_slice())
         }));
         drop(terrain_fn);
+        drop(stamps);
 
         let baked = match result {
             Ok(maybe) => maybe,

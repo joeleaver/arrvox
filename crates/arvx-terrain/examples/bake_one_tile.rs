@@ -93,7 +93,7 @@ fn main() {
         key.extent_m(),
     );
 
-    let baked = match bake_tile(key, voxel_size, &fbm) {
+    let baked = match bake_tile(key, voxel_size, &fbm, &[]) {
         Some(b) => b,
         None => {
             eprintln!("bake failed");

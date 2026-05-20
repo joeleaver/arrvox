@@ -31,7 +31,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arvx_core::WorldPosition;
+use arvx_core::{Aabb, WorldPosition};
+use glam::Vec3;
 
 use crate::baked_tile::BakedTile;
 use crate::terrain::Terrain;
@@ -98,6 +99,20 @@ pub struct StreamerStats {
     pub in_flight: u32,
     /// Number of worker threads in the pool.
     pub worker_count: u32,
+}
+
+/// True if a level-0 tile's full 3D cube intersects the query AABB.
+#[inline]
+fn tile_intersects_aabb(key: TileKey, q: &Aabb) -> bool {
+    let origin = key.origin_world().to_vec3();
+    let extent = key.extent_m();
+    let max = origin + Vec3::splat(extent);
+    q.max.x >= origin.x
+        && q.min.x <= max.x
+        && q.max.y >= origin.y
+        && q.min.y <= max.y
+        && q.max.z >= origin.z
+        && q.min.z <= max.z
 }
 
 /// The tile streamer itself.
@@ -325,6 +340,74 @@ impl TileStreamer {
         evicted
     }
 
+    /// Phase 5 stamp invalidation: mark every tile whose AABB
+    /// intersects `aabb` for re-bake under the current `Terrain` state
+    /// (including the latest `terrain.stamps`).
+    ///
+    /// State transitions:
+    /// - **Live** → `Queued` + the slot's `(key, token)` is returned
+    ///   for the caller to despawn. Generation bumped so any later
+    ///   `record_integrated` for the old token is a no-op.
+    /// - **Submitted** → `Queued`. Generation bumped so the in-flight
+    ///   stale result is discarded by `drain_completed`.
+    /// - **Queued** → unchanged. The pending bake hasn't started; it
+    ///   will read the latest stamp set when submitted.
+    /// - **Failed** → `Queued`. Stamps may have changed the failure
+    ///   condition; give it another shot.
+    ///
+    /// Caller is responsible for updating `terrain.stamps` BEFORE
+    /// invoking this so the next `submit_pending` baked job sees the
+    /// post-change stamp set.
+    ///
+    /// Returns evictions for the caller's despawn pass — same shape
+    /// as `update_residency` so the engine can reuse its eviction
+    /// path. V1 limitation: there's a one-bake gap between despawn
+    /// and re-integrate; tiles flicker out briefly. Hot-swap (keep
+    /// the live entity until the new bake lands) is a follow-up.
+    pub fn invalidate_aabb(&mut self, aabb: Aabb) -> Vec<(TileKey, u64)> {
+        let mut to_evict: Vec<(TileKey, u64)> = Vec::new();
+        for (key, slot) in self.tiles.iter_mut() {
+            if !tile_intersects_aabb(*key, &aabb) {
+                continue;
+            }
+            match slot.state {
+                TileState::Live => {
+                    if let Some(tok) = slot.integrated_token.take() {
+                        to_evict.push((*key, tok));
+                    }
+                    slot.state = TileState::Queued;
+                    slot.requested_generation =
+                        slot.requested_generation.wrapping_add(1);
+                }
+                TileState::Submitted => {
+                    slot.requested_generation =
+                        slot.requested_generation.wrapping_add(1);
+                    slot.state = TileState::Queued;
+                }
+                TileState::Queued => {
+                    // No-op; pending bake will use the new stamps.
+                }
+                TileState::Failed => {
+                    slot.state = TileState::Queued;
+                }
+            }
+        }
+
+        // Re-populate submit_scratch so the next `submit_pending`
+        // schedules these tiles. `submit_pending` skips slots whose
+        // state isn't `Queued`, so duplicate entries (e.g. one from
+        // `update_residency`, another from here) are self-cleaning —
+        // the first instance transitions the slot to `Submitted` and
+        // the second sees the new state and falls through.
+        for (key, slot) in &self.tiles {
+            if slot.state == TileState::Queued {
+                self.submit_scratch.push((*key, slot.camera_dist_sq));
+            }
+        }
+
+        to_evict
+    }
+
     /// Phase 3 of the streamer tick: submit fresh bake jobs to the
     /// worker pool, nearest-camera-first, up to the in-flight budget.
     /// Must be called after [`update_residency`] populated
@@ -350,12 +433,22 @@ impl TileStreamer {
                 .scene_dir
                 .as_ref()
                 .map(|d| crate::persist::tile_path(d, key));
+            // Pre-filter Layer-2 stamps down to those whose AABB
+            // overlaps the tile's XZ footprint. Skipped entirely
+            // when no stamps exist — avoids the empty Vec allocation
+            // in the common case.
+            let stamps = if terrain.stamps.is_empty() {
+                Arc::new(Vec::new())
+            } else {
+                Arc::new(terrain.stamps.relevant_for_tile(key))
+            };
             let job = BakeJob {
                 key,
                 voxel_size_m: terrain.voxel_size_for_level(0),
                 terrain_fn: Arc::clone(&terrain.terrain_fn),
                 generation: slot.requested_generation,
                 disk_path,
+                stamps,
             };
             if self.worker.submit(job) {
                 slot.state = TileState::Submitted;
@@ -391,6 +484,7 @@ mod tests {
             },
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
             terrain_fn: Arc::new(AllSky),
+            stamps: Arc::new(crate::stamp_index::StampIndex::new()),
             render_radius_m: 200.0,
         }
     }
@@ -434,6 +528,7 @@ mod tests {
             bounds: TerrainBounds::Unbounded,
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
             terrain_fn: Arc::new(AllSky),
+            stamps: Arc::new(crate::stamp_index::StampIndex::new()),
             render_radius_m: 80.0, // ~1 tile radius
         };
 
@@ -450,5 +545,125 @@ mod tests {
         let cam_b = WorldPosition::new(IVec3::new(500 / 8, 0, 0), Vec3::ZERO);
         let evicted = s.update_residency(&large, cam_b);
         assert!(!evicted.is_empty(), "expected at least one eviction");
+    }
+
+    // ── Phase 5.4 — stamp invalidation ────────────────────────────────────
+
+    /// `invalidate_aabb` evicts Live tiles inside the AABB and bounces
+    /// them to Queued so the next submit_pending re-bakes them.
+    #[test]
+    fn invalidate_aabb_evicts_live_tiles_inside_box() {
+        let mut s = TileStreamer::new(1, 1);
+        let terrain = small_terrain();
+
+        // Residency populates the slot map; force each to Live for the test.
+        let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
+        let _ = s.update_residency(&terrain, camera);
+        let mut next_tok: u64 = 100;
+        for slot in s.tiles.values_mut() {
+            slot.state = TileState::Live;
+            slot.integrated_token = Some(next_tok);
+            next_tok += 1;
+        }
+        let live_before = s.stats().live;
+        assert!(live_before > 0, "test setup: at least one live tile");
+
+        // Stamp at tile (0, 0, 0) centre — should hit tile 0,0,0 only.
+        let aabb = Aabb {
+            min: Vec3::new(20.0, 0.0, 20.0),
+            max: Vec3::new(40.0, 64.0, 40.0),
+        };
+        let evictions = s.invalidate_aabb(aabb);
+        assert!(!evictions.is_empty(), "expected at least one eviction");
+        // Evicted tile keys must all intersect the AABB.
+        for (key, _tok) in &evictions {
+            assert!(tile_intersects_aabb(*key, &aabb), "evicted {key:?} doesn't intersect AABB");
+        }
+
+        // The evicted slots must now be Queued (so the next
+        // submit_pending re-bakes them).
+        let post = s.stats();
+        assert!(post.queued >= evictions.len() as u32);
+        assert!(post.live <= live_before - evictions.len() as u32);
+    }
+
+    /// `invalidate_aabb` bumps generation on a Submitted slot so the
+    /// in-flight result is later discarded by `drain_completed`.
+    #[test]
+    fn invalidate_aabb_bumps_submitted_generation() {
+        let mut s = TileStreamer::new(1, 1);
+        let terrain = small_terrain();
+        let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
+        let _ = s.update_residency(&terrain, camera);
+
+        // Pick one slot and force it Submitted with a known generation.
+        let key = *s.tiles.keys().next().unwrap();
+        let g_before;
+        {
+            let slot = s.tiles.get_mut(&key).unwrap();
+            slot.state = TileState::Submitted;
+            slot.requested_generation = 7;
+            g_before = slot.requested_generation;
+        }
+
+        // Invalidate the WHOLE world.
+        let aabb = Aabb {
+            min: Vec3::splat(-1000.0),
+            max: Vec3::splat(1000.0),
+        };
+        let _ = s.invalidate_aabb(aabb);
+
+        let slot = s.tiles.get(&key).unwrap();
+        assert_eq!(slot.state, TileState::Queued);
+        assert_ne!(slot.requested_generation, g_before,
+            "generation should bump so the in-flight result is discarded");
+    }
+
+    /// `invalidate_aabb` on a Queued slot is a no-op — the pending
+    /// bake hasn't started, it'll naturally use the post-change stamps.
+    #[test]
+    fn invalidate_aabb_leaves_queued_slots_alone() {
+        let mut s = TileStreamer::new(1, 1);
+        let terrain = small_terrain();
+        let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
+        let _ = s.update_residency(&terrain, camera);
+
+        let key = *s.tiles.keys().next().unwrap();
+        let g_before = s.tiles[&key].requested_generation;
+
+        let aabb = Aabb {
+            min: Vec3::splat(-1000.0),
+            max: Vec3::splat(1000.0),
+        };
+        let _ = s.invalidate_aabb(aabb);
+
+        let slot = s.tiles.get(&key).unwrap();
+        assert_eq!(slot.state, TileState::Queued);
+        assert_eq!(slot.requested_generation, g_before, "Queued generation unchanged");
+    }
+
+    /// `invalidate_aabb` doesn't touch tiles outside the AABB.
+    #[test]
+    fn invalidate_aabb_ignores_tiles_outside_box() {
+        let mut s = TileStreamer::new(1, 1);
+        let terrain = small_terrain();
+        let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
+        let _ = s.update_residency(&terrain, camera);
+        let mut next_tok = 100u64;
+        for slot in s.tiles.values_mut() {
+            slot.state = TileState::Live;
+            slot.integrated_token = Some(next_tok);
+            next_tok += 1;
+        }
+        let live_before = s.stats().live;
+
+        // AABB far outside the bounded grid (~x = 10000 m).
+        let aabb = Aabb {
+            min: Vec3::new(10000.0, 0.0, 10000.0),
+            max: Vec3::new(10010.0, 64.0, 10010.0),
+        };
+        let evictions = s.invalidate_aabb(aabb);
+        assert!(evictions.is_empty(), "no tiles intersect; no evictions");
+        assert_eq!(s.stats().live, live_before);
     }
 }

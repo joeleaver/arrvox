@@ -8,6 +8,7 @@
 //! ownership across threads.
 
 use crate::baked_tile::BakedTile;
+use crate::stamp::{combine_heights, Stamp};
 use crate::terrain_fn::TerrainFn;
 use crate::tile_key::TileKey;
 use arvx_core::asset_file::build_mesh_sections_blob_haloed;
@@ -34,8 +35,8 @@ use glam::Vec3;
 const TILE_HALO_VOXELS: u32 = 2;
 
 /// Bake one terrain tile end-to-end: voxelize the `TerrainFn` across
-/// the tile's footprint, extract the surface mesh, and build the
-/// cluster DAG.
+/// the tile's footprint, compose Layer-2 stamps, extract the surface
+/// mesh, and build the cluster DAG.
 ///
 /// Returns `None` if voxelization fails (e.g., empty tile result the
 /// downstream `voxelize_to_artifact` rejects). For terrain this is
@@ -45,10 +46,24 @@ const TILE_HALO_VOXELS: u32 = 2;
 /// * `voxel_size_m` — the voxel size to use. Caller derives this from
 ///   the `Terrain` (typically `Terrain::voxel_size_for_level(key.level)`).
 /// * `terrain_fn` — the procedural source.
+/// * `stamps` — Layer-2 stamps overlapping this tile, in composition
+///   order. The streamer pre-filters the global `StampIndex` to just
+///   the tile-relevant subset before submitting the bake job, so this
+///   slice is typically small (zero in scenes with no stamps).
+///
+/// ## Heightmap composition contract
+///
+/// Each TerrainFn sample produces an `sd`. For heightmap-style
+/// TerrainFns this is `sd = wy - base_h(wx, wz)`. We recover
+/// `base_h = wy - sd`, fold stamps via `combine_heights`, and repack
+/// `sd = wy - composed_h`. V1 stamps are all heightmap kinds — this
+/// is the right shape. V2 volumetric stamps will skip this and apply
+/// their SD contribution directly (a future overload).
 pub fn bake_tile(
     key: TileKey,
     voxel_size_m: f32,
     terrain_fn: &dyn TerrainFn,
+    stamps: &[Stamp],
 ) -> Option<BakedTile> {
     let t0 = std::time::Instant::now();
 
@@ -63,13 +78,43 @@ pub fn bake_tile(
     };
 
     // SDF callback: receives a batch of absolute-world positions from
-    // the voxelizer, translates each to tile-local, asks the TerrainFn.
+    // the voxelizer, translates each to tile-local, asks the TerrainFn,
+    // and folds Layer-2 stamps over the heightmap before repacking.
     let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
         positions
             .iter()
             .map(|&world_pos| {
                 let local = world_pos - tile_origin_world;
-                let s = terrain_fn.sample(key, local, voxel_size_m);
+                let mut s = terrain_fn.sample(key, local, voxel_size_m);
+
+                // Layer 2 — heightmap-style stamps.
+                if !stamps.is_empty() {
+                    let wy = world_pos.y;
+                    let mut h = wy - s.sd;
+                    let mut mat_override: Option<u16> = None;
+                    for stamp in stamps {
+                        if let Some(target_h) =
+                            stamp.sample_height(world_pos.x, world_pos.z)
+                        {
+                            h = combine_heights(
+                                h,
+                                target_h,
+                                stamp.combine_op,
+                                stamp.position.y,
+                            );
+                            if let Some(m) = stamp.material_override {
+                                mat_override = Some(m);
+                            }
+                        }
+                    }
+                    s.sd = wy - h;
+                    if let Some(m) = mat_override {
+                        s.primary_mat = m;
+                        s.secondary_mat = m;
+                        s.blend = 0.0;
+                    }
+                }
+
                 let blend_u4 = (s.blend.clamp(0.0, 1.0) * 15.0).round() as u8;
                 (s.sd, s.primary_mat, s.secondary_mat, blend_u4, 0)
             })
@@ -108,6 +153,7 @@ pub fn bake_tile(
 mod tests {
     use super::*;
     use crate::fbm::FbmTerrainFn;
+    use crate::stamp::{FalloffCurve, StampKind};
     use crate::terrain::Terrain;
     use crate::terrain_fn::TerrainSample;
 
@@ -158,7 +204,7 @@ mod tests {
     fn bake_all_sky_returns_empty_mesh() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
-        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &AllSky).expect("bake");
+        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &AllSky, &[]).expect("bake");
         assert_eq!(
             baked.vertex_count(),
             0,
@@ -171,7 +217,7 @@ mod tests {
     fn bake_all_solid_returns_empty_mesh() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
-        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &AllSolid).expect("bake");
+        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &AllSolid, &[]).expect("bake");
         // All-solid means no air-solid boundary inside the tile.
         // Surface extraction emits zero triangles.
         assert_eq!(baked.vertex_count(), 0);
@@ -181,7 +227,7 @@ mod tests {
     fn bake_flat_half_produces_surface_mesh() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
-        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf).expect("bake");
+        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[]).expect("bake");
         assert!(
             baked.vertex_count() > 0,
             "flat plane bisecting tile must produce vertices; got {}",
@@ -200,7 +246,7 @@ mod tests {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
         let fbm = FbmTerrainFn::default();
-        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm).expect("bake");
+        let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[]).expect("bake");
         assert!(
             baked.vertex_count() > 100,
             "FBM in a 64m tile should produce many surface vertices; got {}",
@@ -240,8 +286,8 @@ mod tests {
         // surface at local y = 32 m → world y = 32 (both tiles see
         // identical SDF since `sd = l.y - 32` is a pure local
         // formula).
-        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &surface).expect("bake A");
-        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &surface).expect("bake B");
+        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &surface, &[]).expect("bake A");
+        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &surface, &[]).expect("bake B");
 
         // For a horizontal surface (no X-edge crossings), each cube's
         // vertex sits at x = (cube_lo.x + 1) · voxel_size. The
@@ -310,8 +356,8 @@ mod tests {
         let vs = t.voxel_size_for_level(0);
         let fbm = FbmTerrainFn::default();
 
-        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm).expect("bake A");
-        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm).expect("bake B");
+        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[]).expect("bake A");
+        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm, &[]).expect("bake B");
 
         // For watertightness we only need to verify that vertices
         // landing exactly at the shared `x = 64 m` plane match
@@ -428,8 +474,8 @@ mod tests {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
         let fbm = FbmTerrainFn::default();
-        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm).expect("bake A");
-        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm).expect("bake B");
+        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[]).expect("bake A");
+        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm, &[]).expect("bake B");
 
         let stride = 32usize;
         let i_stride = 4usize;
@@ -534,5 +580,183 @@ mod tests {
             }
         }
         eprintln!("B→A: max distance = {max_d2:.5}m, count over 1 mm = {count_over_1mm2}");
+    }
+
+    // ── Phase 5.3 — stamp composition through bake_tile ───────────────────
+
+    /// Return (min_y, max_y) of LOD-0 vertices in a baked tile.
+    fn lod0_y_range(baked: &BakedTile) -> (f32, f32) {
+        let v_stride = 32usize;
+        let i_stride = 4usize;
+        let lod0_n = baked.mesh.lod0_index_count as usize;
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for i in 0..lod0_n {
+            let base = i * i_stride;
+            let id = u32::from_le_bytes(
+                baked.mesh.indices[base..base + i_stride].try_into().unwrap(),
+            );
+            if !seen.insert(id) {
+                continue;
+            }
+            let vbase = id as usize * v_stride;
+            let y = f32::from_le_bytes(
+                baked.mesh.vertices[vbase + 4..vbase + 8].try_into().unwrap(),
+            );
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+        (min_y, max_y)
+    }
+
+    /// Bake with no stamps vs the same base + a mountain stamp — the
+    /// surface MUST rise inside the stamp's footprint. Verifies the
+    /// per-voxel stamp composition path in `bake_tile`.
+    #[test]
+    fn mountain_stamp_raises_surface() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+
+        let baseline =
+            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[]).expect("baseline");
+        let (_, base_max_y) = lod0_y_range(&baseline);
+
+        // Mountain at tile centre, lifting 15 m above the flat plane.
+        let stamp = crate::stamp::Stamp::new(
+            StampKind::Mountain {
+                h_max: 15.0,
+                radius: 16.0,
+                falloff: FalloffCurve::Smoothstep,
+            },
+            Vec3::new(32.0, 32.0, 32.0),
+        );
+        let stamped = bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[stamp])
+            .expect("stamped");
+        let (_, stamped_max_y) = lod0_y_range(&stamped);
+
+        assert!(
+            stamped_max_y > base_max_y + 5.0,
+            "mountain stamp should raise the surface by ~h_max; baseline max y = {base_max_y}, stamped max y = {stamped_max_y}",
+        );
+        // FlatHalf surface is at y=32, mountain peak target = 32+15=47.
+        // Allow some discretisation slack ±1 voxel.
+        assert!(
+            (stamped_max_y - 47.0).abs() < vs * 2.0,
+            "stamped max y {stamped_max_y} should be near peak target 47.0",
+        );
+    }
+
+    /// Bake with no stamps vs the same base + a lake stamp — the
+    /// surface MUST drop inside the stamp's footprint.
+    #[test]
+    fn lake_stamp_lowers_surface() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+
+        let baseline =
+            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[]).expect("baseline");
+        let (base_min_y, _) = lod0_y_range(&baseline);
+
+        let stamp = crate::stamp::Stamp::new(
+            StampKind::Lake {
+                depth: 10.0,
+                radius: 16.0,
+                falloff: FalloffCurve::Smoothstep,
+            },
+            // FlatHalf surface is at world y = 32. Place the lake surface there
+            // so the basin floor lands at y = 22.
+            Vec3::new(32.0, 32.0, 32.0),
+        );
+        let stamped = bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[stamp])
+            .expect("stamped");
+        let (stamped_min_y, _) = lod0_y_range(&stamped);
+
+        assert!(
+            stamped_min_y < base_min_y - 3.0,
+            "lake stamp should lower the surface; baseline min y = {base_min_y}, stamped min y = {stamped_min_y}",
+        );
+        // Basin floor target = 32 - 10 = 22. Allow ±1 voxel slack.
+        assert!(
+            (stamped_min_y - 22.0).abs() < vs * 2.0,
+            "stamped min y {stamped_min_y} should be near basin floor 22.0",
+        );
+    }
+
+    /// Flatten stamp + Replace op forces a target Y regardless of base.
+    /// Bake with a wildly varying FBM and a Flatten over the whole tile
+    /// XZ extent — the resulting surface should land near `position.y`
+    /// everywhere LOD-0 vertices fall inside the rectangle.
+    #[test]
+    fn flatten_stamp_forces_target_y() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+        let fbm = FbmTerrainFn::default();
+
+        let target_y = 16.0;
+        // Half-extents 40 m covers the full tile (64 m) + slack so every
+        // sample lands inside the rect.
+        let stamp = crate::stamp::Stamp::new(
+            StampKind::Flatten {
+                half_extents: glam::Vec2::new(40.0, 40.0),
+            },
+            Vec3::new(32.0, target_y, 32.0),
+        );
+        let stamped = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[stamp])
+            .expect("stamped");
+
+        let (min_y, max_y) = lod0_y_range(&stamped);
+        // All LOD-0 vertices must land within ±1 voxel of target_y.
+        // The Replace op snaps the heightmap to target_y everywhere
+        // inside the rect; surface-nets puts the surface at that Y.
+        assert!(
+            (min_y - target_y).abs() < vs * 2.0 && (max_y - target_y).abs() < vs * 2.0,
+            "flatten should force y ≈ {target_y}; got min={min_y}, max={max_y}",
+        );
+    }
+
+    /// Multiple stamps compose in priority order. A Lake with priority -1
+    /// applies first; a Mountain with priority +1 applies on top. The
+    /// combined surface should show BOTH effects in their respective
+    /// XZ regions.
+    #[test]
+    fn multiple_stamps_compose_in_order() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+
+        // Lake in the western half of the tile.
+        let mut lake = crate::stamp::Stamp::new(
+            StampKind::Lake {
+                depth: 8.0,
+                radius: 14.0,
+                falloff: FalloffCurve::Smoothstep,
+            },
+            Vec3::new(16.0, 32.0, 32.0),
+        );
+        lake.priority = -1;
+        // Mountain in the eastern half.
+        let mut mountain = crate::stamp::Stamp::new(
+            StampKind::Mountain {
+                h_max: 12.0,
+                radius: 14.0,
+                falloff: FalloffCurve::Smoothstep,
+            },
+            Vec3::new(48.0, 32.0, 32.0),
+        );
+        mountain.priority = 1;
+
+        let baked = bake_tile(
+            TileKey::level0(0, 0, 0),
+            vs,
+            &FlatHalf,
+            &[lake, mountain],
+        )
+        .expect("bake");
+        let (min_y, max_y) = lod0_y_range(&baked);
+
+        // Both stamps must show through: min_y around basin floor,
+        // max_y around mountain peak.
+        assert!(min_y < 30.0, "lake should pull min y below 30; got {min_y}");
+        assert!(max_y > 38.0, "mountain should push max y above 38; got {max_y}");
     }
 }
