@@ -180,15 +180,24 @@ pub struct ArvxSceneManager {
     /// Reset implicitly on stroke change (see [`sculpt_stroke_seq`]).
     pub(super) sculpt_stroke_touched: rustc_hash::FxHashSet<glam::UVec3>,
     /// Previous stamp's brush center in **object-local grid units**,
-    /// per the current sculpt stroke. The kernel takes this through
-    /// `BrushOp::segment_start` to evaluate cells against the swept
-    /// capsule from the previous stamp to the current one — without
-    /// it, adjacent stamp spheres along a drag produce visible
-    /// meeting-circle creases on the carved/eroded surface.
-    /// `None` between strokes and on the first stamp of a stroke (the
-    /// first stamp degenerates to a sphere because `segment_start ==
-    /// center`).
-    pub(super) sculpt_stroke_prev_center: Option<glam::Vec3>,
+    /// per the current sculpt stroke, stored in **world coords**. The
+    /// kernel takes this (re-projected to the current asset's local
+    /// grid frame) through `BrushOp::segment_start` to evaluate cells
+    /// against the swept capsule from the previous stamp to the
+    /// current one — without it, adjacent stamp spheres along a drag
+    /// produce visible meeting-circle creases on the carved/eroded
+    /// surface. `None` between strokes and on the first stamp of a
+    /// stroke (the first stamp degenerates to a sphere because
+    /// `segment_start == center`).
+    ///
+    /// Stored in world coords (not grid coords) so a single brush
+    /// stamp that dispatches across multiple terrain tiles records
+    /// the same world position for every tile in the dispatch — each
+    /// tile then converts to its own grid frame. Grid-coord storage
+    /// (the prior implementation) leaked the first tile's grid frame
+    /// into the second tile's capsule, producing a stamp segment
+    /// that spanned the entire neighbour tile.
+    pub(super) sculpt_stroke_prev_center_world: Option<glam::Vec3>,
 }
 
 impl ArvxSceneManager {
@@ -209,7 +218,7 @@ impl ArvxSceneManager {
             sculpt_extract_scratch: SculptExtractScratch::new(),
             sculpt_stroke_seq: 0,
             sculpt_stroke_touched: rustc_hash::FxHashSet::default(),
-            sculpt_stroke_prev_center: None,
+            sculpt_stroke_prev_center_world: None,
         }
     }
 

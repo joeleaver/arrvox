@@ -237,7 +237,7 @@ impl ArvxSceneManager {
             // First stamp of a new stroke has no previous center — the
             // kernel evaluates a degenerate capsule (sphere) by
             // setting `segment_start == center` below.
-            self.sculpt_stroke_prev_center = None;
+            self.sculpt_stroke_prev_center_world = None;
         }
         if brush_radius <= 0.0 {
             return None;
@@ -289,9 +289,20 @@ impl ArvxSceneManager {
             // (Deflate drag showed this most clearly). The first
             // stamp of a stroke degenerates to a sphere because
             // `segment_start == center`.
-            let segment_start = self
-                .sculpt_stroke_prev_center
-                .unwrap_or(center_grid);
+            //
+            // `sculpt_stroke_prev_center_world` is stored in WORLD
+            // coords so this conversion runs per-call against the
+            // current asset's local grid frame. A single brush
+            // stamp that dispatches across multiple terrain tiles
+            // therefore evaluates the same world-space capsule on
+            // each tile (just expressed in the tile's own grid).
+            let segment_start = match self.sculpt_stroke_prev_center_world {
+                Some(prev_world) => {
+                    let prev_local = inv_world.transform_point3(prev_world);
+                    (prev_local - asset_grid_origin) / base_vs
+                }
+                None => center_grid,
+            };
             let op = BrushOp {
                 center: center_grid,
                 segment_start,
@@ -637,11 +648,14 @@ impl ArvxSceneManager {
 
         let allocated_leaf_attr_ids: Vec<u32> =
             applied.allocated_slots.iter().map(|(s, _)| *s).collect();
-        // Record this stamp's center so the NEXT stamp in the stroke
-        // can sweep a capsule from here. Recorded only after the stamp
-        // has successfully applied — a no-op stamp (out of bounds,
-        // empty footprint) shouldn't advance the segment.
-        self.sculpt_stroke_prev_center = Some(op.center);
+        // Record this stamp's WORLD-space center so the NEXT stamp
+        // in the stroke can sweep a capsule from here. Recorded only
+        // after the stamp has successfully applied — a no-op stamp
+        // (out of bounds, empty footprint) shouldn't advance the
+        // segment. We re-record on every call (including subsequent
+        // tiles in a multi-tile dispatch) — the value is the same
+        // world position, so idempotent.
+        self.sculpt_stroke_prev_center_world = Some(world_pos);
         Some(SculptApplyResult {
             removed_leaf_attr_ids: removed,
             allocated_leaf_attr_ids,
@@ -1849,6 +1863,69 @@ mod tests {
         // by descent through c1_x. Chain Y untouched.
         assert_eq!(marked, 4);
         assert_eq!(dirty_set(&entry), vec![0, 1, 4, 6]);
+    }
+
+    /// Regression test for cross-tile capsule sweep.
+    ///
+    /// Bug repro: brush stamp at world_pos = (64.0, 0, 0), which is
+    /// the boundary between tile A (grid origin 0) and tile B (grid
+    /// origin 64). Pre-fix, tile A's `apply_sculpt_brush` recorded
+    /// the stamp's CENTER (in A's grid frame, ≈ cell 256 with vs=0.25)
+    /// in `sculpt_stroke_prev_center`. The same stamp's dispatch to
+    /// tile B then read that grid-coord value as if it lived in B's
+    /// frame — but B's grid coords for the same world point are
+    /// shifted by -S cells. The capsule swept the entire width of B,
+    /// applying a stroke "all the way across" the neighbour.
+    ///
+    /// Post-fix, `sculpt_stroke_prev_center_world` stores the world
+    /// position. Each tile's per-call conversion to its own grid
+    /// frame produces a segment_start coincident with `center` —
+    /// degenerate capsule (a point at the boundary). Both tiles see
+    /// a single-stamp sphere.
+    ///
+    /// This is a pure-math reproduction of the per-tile conversion;
+    /// it doesn't invoke `apply_sculpt_brush` (which would need a
+    /// full octree + brick / leaf_attr pool set-up) but it does
+    /// verify the conversion the post-fix code performs.
+    #[test]
+    fn cross_tile_capsule_uses_world_coord_prev_center() {
+        use glam::Vec3;
+        let base_vs: f32 = 0.25;
+        let tile_size_m: f32 = 64.0;
+        // Brush at the boundary between tiles A (origin 0) and B
+        // (origin 64).
+        let world_pos = Vec3::new(tile_size_m, 0.0, 0.0);
+        // Simulate the engine dispatching the same stamp to A first,
+        // then B. After A's apply: `prev_center_world = Some(world_pos)`.
+        let prev_center_world = Some(world_pos);
+        // Tile B's grid frame.
+        let asset_grid_origin_b = Vec3::new(tile_size_m, 0.0, 0.0);
+        // Per-call grid-frame conversion (mirrors the apply_sculpt_brush
+        // body at the call site that built `segment_start`):
+        let center_grid_b = (world_pos - asset_grid_origin_b) / base_vs;
+        let segment_start_grid_b = match prev_center_world {
+            Some(prev_world) => (prev_world - asset_grid_origin_b) / base_vs,
+            None => center_grid_b,
+        };
+        assert_eq!(
+            segment_start_grid_b, center_grid_b,
+            "segment_start in B's grid frame must coincide with center for a \
+             single-stamp boundary brush; otherwise the capsule spans B"
+        );
+        // Sanity: the pre-fix bug would have given
+        // `segment_start_grid_b = center_grid_a = (world_pos - 0)/vs = 256`,
+        // while `center_grid_b = 0` — a 256-cell-long capsule.
+        let pre_fix_segment_start = (world_pos - Vec3::ZERO) / base_vs;
+        assert_ne!(
+            pre_fix_segment_start, center_grid_b,
+            "pre-fix value (A's grid frame leaked into B) is wrong by design",
+        );
+        assert_eq!(
+            (pre_fix_segment_start - center_grid_b).x.abs(),
+            tile_size_m / base_vs,
+            "pre-fix delta is exactly one tile width — what produces the \
+             cross-tile stroke",
+        );
     }
 
     #[test]
