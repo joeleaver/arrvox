@@ -114,11 +114,48 @@ impl super::state::EngineState {
         }
 
         if let Some(aabb) = invalidate_aabb {
+            let debug = std::env::var("ARVX_TERRAIN_DEBUG").is_ok();
+            let pre_world_tile_count = if debug {
+                self.world
+                    .query::<&arvx_terrain::TerrainTile>()
+                    .iter()
+                    .count()
+            } else {
+                0
+            };
             let Some(runtime) = self.terrain.as_mut() else { return };
             let evictions = runtime.streamer.invalidate_aabb(aabb);
+            let pre_live = runtime.live_tiles.len();
+            let pre_keys = runtime.tile_keys.len();
+            if debug {
+                eprintln!(
+                    "[stamp-sync] aabb=({:.1},{:.1},{:.1})..({:.1},{:.1},{:.1}) \
+                     evictions={} pre_live_tiles={} pre_tile_keys={} world_TerrainTile_count={}",
+                    aabb.min.x, aabb.min.y, aabb.min.z,
+                    aabb.max.x, aabb.max.y, aabb.max.z,
+                    evictions.len(), pre_live, pre_keys, pre_world_tile_count,
+                );
+                for (k, t) in &evictions {
+                    eprintln!(
+                        "[stamp-sync]   evict tile ({},{},{},lvl{}) token={}",
+                        k.x, k.y, k.z, k.level, t,
+                    );
+                }
+            }
             if !evictions.is_empty() {
                 self.evict_terrain_tiles_for_stamp_change(&evictions);
                 self.gpu_objects_dirty.mark_all();
+            }
+            if debug {
+                let post_world_tile_count = self
+                    .world
+                    .query::<&arvx_terrain::TerrainTile>()
+                    .iter()
+                    .count();
+                eprintln!(
+                    "[stamp-sync] after evict: world_TerrainTile_count={} (was {})",
+                    post_world_tile_count, pre_world_tile_count,
+                );
             }
         }
     }

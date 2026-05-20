@@ -189,7 +189,22 @@ impl super::state::EngineState {
         let token = runtime.next_token;
         runtime.next_token = runtime.next_token.wrapping_add(1);
         runtime.live_tiles.insert(token, (entity, asset_handle));
-        runtime.tile_keys.insert(key, (entity, asset_handle));
+        // DIAGNOSTIC — Phase 5 stamp bug hunt: if tile_keys already
+        // has an entry for this key, the old entity got orphaned
+        // (still in the ECS world, no longer tracked → never
+        // despawned). Log so we can confirm.
+        if let Some((prev_entity, prev_handle)) =
+            runtime.tile_keys.insert(key, (entity, asset_handle))
+        {
+            if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
+                eprintln!(
+                    "[integrate] WARN tile ({},{},{},lvl{}) was already \
+                     in tile_keys — prev entity={:?} prev_handle={:?} \
+                     (orphaned; old mesh stays in scene)",
+                    key.x, key.y, key.z, key.level, prev_entity, prev_handle,
+                );
+            }
+        }
         // Silence "unused import" if EditorMetadata isn't used here.
         let _ = std::any::type_name::<EditorMetadata>();
         Some(token)
