@@ -160,7 +160,7 @@ pub(super) fn run_pre_frame(
         let t_mesh_start = std::time::Instant::now();
         let mut mesh_bytes_total: u64 = 0;
         let mut mesh_asset_count: usize = 0;
-        for (handle, vertices, indices, indices_dirty, lod0_index_count)
+        for (handle, vertices, indices, vertices_dirty, indices_dirty, lod0_index_count)
             in sm.iter_loaded_asset_meshes()
         {
             let bytes = state.renderer.upload_mesh_for_asset(
@@ -168,6 +168,7 @@ pub(super) fn run_pre_frame(
                 handle.raw(),
                 vertices,
                 indices,
+                vertices_dirty,
                 indices_dirty,
                 lod0_index_count,
             );

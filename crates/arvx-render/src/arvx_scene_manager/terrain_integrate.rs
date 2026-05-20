@@ -293,6 +293,18 @@ impl ArvxSceneManager {
         if total_bytes > 0 {
             mesh_indices_dirty.mark_full(total_bytes);
         }
+        // Phase 5.6 fix: mark the VBO fully dirty so the renderer's
+        // tail-only-append optimisation doesn't reuse stale prefix
+        // bytes from a previous asset at the same recycled handle.
+        // Terrain stamp move evicts + re-integrates tiles continuously,
+        // and the freed handle slot's GPU VBO holds the previous
+        // asset's vertices until we mark them all dirty.
+        let mut mesh_vertices_dirty = arvx_core::DirtyRanges::new();
+        let vbo_total_bytes = (mesh_vertices.len()
+            * std::mem::size_of::<crate::mesh_pass::MeshVertex>()) as u32;
+        if vbo_total_bytes > 0 {
+            mesh_vertices_dirty.mark_full(vbo_total_bytes);
+        }
 
         // ── Construct + insert the cache entry ─────────────────────────
         let actual_cell_count = artifact.voxel_count;
@@ -318,6 +330,7 @@ impl ArvxSceneManager {
             mesh_indices_free_list: Vec::new(),
             mesh_indices_next_free,
             mesh_indices_dirty,
+            mesh_vertices_dirty,
             mesh_lod0_index_count: mesh.lod0_index_count,
             bake_time_cluster_count: meshlet_clusters.len() as u32,
             meshlet_clusters,

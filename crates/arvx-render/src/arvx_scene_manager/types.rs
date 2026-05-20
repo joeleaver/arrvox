@@ -134,6 +134,25 @@ pub(super) struct AssetEntry {
     /// one `queue.write_buffer` per range. Cleared on upload via
     /// [`super::ArvxSceneManager::mark_loaded_asset_uploads_clean`].
     pub(super) mesh_indices_dirty: DirtyRanges,
+    /// Byte-range dirty tracker over `mesh_vertices`. Mirrors
+    /// `mesh_indices_dirty` for the VBO side.
+    ///
+    /// **Why this exists:** the renderer's earlier VBO upload path
+    /// assumed the CPU-side vertex buffer was append-only (sculpt's
+    /// `mesh_vertices.extend_from_slice` pattern) and only re-uploaded
+    /// the tail. That assumption breaks when an `AssetHandle` is
+    /// recycled by a fresh integrate — terrain stamp move evicts a
+    /// tile and re-bakes it; the new asset takes the freed slot with
+    /// a completely different vertex set, but `vbo_uploaded_bytes`
+    /// from the previous asset still pointed past the new bytes the
+    /// tail-only upload would write, leaving stale prefix vertices on
+    /// the GPU that the new IBO then indexed into → fully-replaced
+    /// triangles with stale vertex positions = the visible
+    /// "spider-leg" mesh-shard corruption on stamp drag (Phase 5.6
+    /// 2026-05-19). Switching to explicit dirty-range tracking — full
+    /// re-mark on integrate, append-only mark on sculpt — keeps the
+    /// upload behaviour correct for every writer.
+    pub(super) mesh_vertices_dirty: DirtyRanges,
     /// Index count of the LOD-0 prefix in `mesh_indices`. Equal to
     /// `mesh_indices.len()` for empty-DAG assets (single-triangle,
     /// pre-Phase-6 behaviour); otherwise strictly less. Phase 6.1's
@@ -798,6 +817,7 @@ mod slab_tests {
             mesh_indices_free_list: Vec::new(),
             mesh_indices_next_free: initial.len() as u32,
             mesh_indices_dirty: DirtyRanges::new(),
+            mesh_vertices_dirty: DirtyRanges::new(),
             mesh_lod0_index_count: 0,
             bake_time_cluster_count: 0,
             meshlet_clusters: Vec::new(),
@@ -1001,6 +1021,7 @@ mod slab_tests {
             mesh_indices_free_list: Vec::new(),
             mesh_indices_next_free: 0,
             mesh_indices_dirty: DirtyRanges::new(),
+            mesh_vertices_dirty: DirtyRanges::new(),
             mesh_lod0_index_count: 0,
             bake_time_cluster_count: bake,
             meshlet_clusters: clusters,

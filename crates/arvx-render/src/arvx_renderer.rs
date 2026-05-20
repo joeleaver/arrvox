@@ -406,6 +406,7 @@ impl ArvxRenderer {
         handle_raw: u32,
         vertices: &[MeshVertex],
         indices: &[u32],
+        vertices_dirty: &arvx_core::DirtyRanges,
         indices_dirty: &arvx_core::DirtyRanges,
         dispatch_index_count: u32,
     ) -> u64 {
@@ -425,22 +426,29 @@ impl ArvxRenderer {
         let mut bytes_written: u64 = 0;
 
         // Take ownership of the existing entry (if any) so we can decide
-        // tail-only vs full upload below.
+        // grow-or-reuse below.
         let existing = self.mesh_buffers[idx].take();
-        let (vbo, vbo_uploaded_bytes) = if let Some(e) = existing.as_ref() {
-            if e.vbo.size() >= vbo_needed && vbo_needed >= e.vbo_uploaded_bytes {
-                // Buffer fits and the CPU side only grew → tail-only.
-                // Also handles the `equal` case (skip the write entirely).
-                // VBO stays tail-only: sculpt only appends new patch
-                // verts to `mesh_vertices`, never rewrites interior.
-                if vbo_needed > e.vbo_uploaded_bytes {
-                    let tail = &vbo_bytes[e.vbo_uploaded_bytes as usize..];
-                    queue.write_buffer(&e.vbo, e.vbo_uploaded_bytes, tail);
-                    bytes_written += tail.len() as u64;
+        // VBO upload — driven by `vertices_dirty`, parallel to the IBO
+        // path below. integrate_baked_tile marks the full range dirty on
+        // fresh asset entries; sculpt's append path marks just the new
+        // tail. This avoids the "stale-prefix-on-recycled-handle" bug
+        // where a tail-only upload assumed the GPU buffer's prefix
+        // matched the CPU side — true for sculpt append, false when
+        // terrain stamp move evicts + re-integrates at the same handle.
+        let vbo = if let Some(e) = existing.as_ref() {
+            if e.vbo.size() >= vbo_needed {
+                for (off, len) in vertices_dirty.iter() {
+                    let start = off as usize;
+                    let end = start + len as usize;
+                    if end <= vbo_bytes.len() {
+                        queue.write_buffer(&e.vbo, off as u64, &vbo_bytes[start..end]);
+                        bytes_written += len as u64;
+                    }
                 }
-                (e.vbo.clone(), vbo_needed)
+                e.vbo.clone()
             } else {
-                // CPU side shrunk OR exceeded buffer capacity → reset.
+                // Capacity exceeded → grow + full upload regardless of
+                // dirty ranges. Every byte just got written.
                 let buf = grow_with_full_upload(
                     &self.device, queue,
                     Some(e.vbo.size()),
@@ -449,7 +457,7 @@ impl ArvxRenderer {
                     vbo_bytes,
                 );
                 bytes_written += vbo_needed;
-                (buf, vbo_needed)
+                buf
             }
         } else {
             let buf = grow_with_full_upload(
@@ -460,8 +468,12 @@ impl ArvxRenderer {
                 vbo_bytes,
             );
             bytes_written += vbo_needed;
-            (buf, vbo_needed)
+            buf
         };
+        // `vbo_uploaded_bytes` is retained on the entry for diagnostics
+        // and legacy tail-only callers, but the upload no longer depends
+        // on it for correctness — `vertices_dirty` is authoritative.
+        let vbo_uploaded_bytes = vbo_needed;
 
         // IBO upload is driven by `indices_dirty` instead of tail-only.
         // The slab allocator over `mesh_indices` (see AssetEntry) does

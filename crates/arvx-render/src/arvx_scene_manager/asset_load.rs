@@ -826,6 +826,12 @@ impl ArvxSceneManager {
         if total_bytes > 0 {
             mesh_indices_dirty.mark_full(total_bytes);
         }
+        let mut mesh_vertices_dirty = arvx_core::DirtyRanges::new();
+        let vbo_total_bytes = (mesh_vertices.len()
+            * std::mem::size_of::<crate::mesh_pass::MeshVertex>()) as u32;
+        if vbo_total_bytes > 0 {
+            mesh_vertices_dirty.mark_full(vbo_total_bytes);
+        }
 
         Ok(AssetEntry {
             path: arvx_path.to_path_buf(),
@@ -844,6 +850,7 @@ impl ArvxSceneManager {
             mesh_indices_free_list: Vec::new(),
             mesh_indices_next_free,
             mesh_indices_dirty,
+            mesh_vertices_dirty,
             mesh_lod0_index_count,
             bake_time_cluster_count: meshlet_clusters.len() as u32,
             meshlet_clusters,
@@ -904,6 +911,7 @@ impl ArvxSceneManager {
             &[crate::mesh_pass::MeshVertex],
             &[u32],
             &arvx_core::DirtyRanges,
+            &arvx_core::DirtyRanges,
             u32,
         ),
     > {
@@ -920,6 +928,7 @@ impl ArvxSceneManager {
                     AssetHandle::from_raw(idx as u32),
                     entry.mesh_vertices.as_slice(),
                     entry.mesh_indices.as_slice(),
+                    &entry.mesh_vertices_dirty,
                     &entry.mesh_indices_dirty,
                     entry.mesh_lod0_index_count,
                 ))
@@ -964,6 +973,7 @@ impl ArvxSceneManager {
                 // `mesh_dirty` — they were just consumed by
                 // `upload_mesh_for_asset` to drive partial IBO writes.
                 entry.mesh_indices_dirty.clear();
+                entry.mesh_vertices_dirty.clear();
             }
         }
     }

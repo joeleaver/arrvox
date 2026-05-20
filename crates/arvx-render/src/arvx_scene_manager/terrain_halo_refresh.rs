@@ -415,6 +415,15 @@ impl ArvxSceneManager {
         entry.bake_time_cluster_count = entry.meshlet_clusters.len() as u32;
         entry.mesh_lod0_index_count = mesh_lod0_index_count;
         entry.reset_mesh_indices_slab();
+        // Full re-extract — mirror the IBO reset on the VBO side so the
+        // upload doesn't carry stale prefix bytes.
+        entry.mesh_vertices_dirty.clear();
+        let vbo_bytes = (entry.mesh_vertices.len()
+            * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
+            as u32;
+        if vbo_bytes > 0 {
+            entry.mesh_vertices_dirty.mark_full(vbo_bytes);
+        }
         entry.mesh_dirty = true;
         entry.clusters_dirty = true;
         entry

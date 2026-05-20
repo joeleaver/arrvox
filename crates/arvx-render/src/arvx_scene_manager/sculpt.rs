@@ -1064,7 +1064,22 @@ impl ArvxSceneManager {
 
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
             let vertex_offset = entry.mesh_vertices.len() as u32;
+            let append_start_bytes = (vertex_offset as usize
+                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
+                as u32;
             entry.mesh_vertices.extend_from_slice(&brush_verts);
+            // Mark the appended range as dirty so the renderer uploads
+            // just the new tail. (For terrain integrate the whole VBO
+            // is marked full-dirty instead; the dirty-range mechanism
+            // serves both cases uniformly.)
+            let append_len_bytes = (brush_verts.len()
+                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
+                as u32;
+            if append_len_bytes > 0 {
+                entry
+                    .mesh_vertices_dirty
+                    .mark(append_start_bytes, append_len_bytes);
+            }
 
             // Slab-allocate the patch's index range. If a prior stamp
             // freed a slot ≥ this size, we reuse it (interior write);
@@ -1370,6 +1385,16 @@ impl ArvxSceneManager {
         // it and mark the full new buffer dirty so the IBO upload
         // pushes the whole new layout to the GPU.
         entry.reset_mesh_indices_slab();
+        // Mirror: the VBO was fully replaced too. Mark the entire new
+        // vertex range dirty so the upload doesn't keep stale prefix
+        // bytes from the previous mesh under the same handle.
+        entry.mesh_vertices_dirty.clear();
+        let vbo_bytes = (entry.mesh_vertices.len()
+            * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
+            as u32;
+        if vbo_bytes > 0 {
+            entry.mesh_vertices_dirty.mark_full(vbo_bytes);
+        }
         entry.mesh_dirty = true;
         entry.clusters_dirty = true;
         // D7 — full re-extract replaced every cluster; rebuild the
@@ -1464,6 +1489,7 @@ mod tests {
             mesh_indices_free_list: Vec::new(),
             mesh_indices_next_free: 0,
             mesh_indices_dirty: arvx_core::DirtyRanges::new(),
+            mesh_vertices_dirty: arvx_core::DirtyRanges::new(),
             mesh_lod0_index_count: 0,
             bake_time_cluster_count: clusters.len() as u32,
             meshlet_clusters: clusters,
