@@ -74,8 +74,11 @@ impl super::state::EngineState {
     }
 
     /// Find the Terrain ECS entity, if one exists. There is at most
-    /// one — the `SpawnTerrain` handler enforces singleton.
-    fn find_terrain_entity(&self) -> Option<hecs::Entity> {
+    /// one — the `SpawnTerrain` handler enforces singleton. Public
+    /// to the crate so other ops modules (region_ops, etc.) reuse
+    /// this rather than re-declaring the same impl-fn (which Rust
+    /// rejects as a duplicate definition).
+    pub(crate) fn find_terrain_entity(&self) -> Option<hecs::Entity> {
         self.world
             .query::<&Terrain>()
             .iter()

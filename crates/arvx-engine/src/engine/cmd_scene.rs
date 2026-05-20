@@ -539,6 +539,9 @@ impl EngineState {
                     // invalidate the union(old, new) AABB so the streamer
                     // re-bakes affected tiles. No-op for non-stamps.
                     self.maybe_sync_stamp_after_transform(entity);
+                    // Phase 7: same hook for regions — biome regions
+                    // moving must re-bake the tiles they pass through.
+                    self.maybe_sync_region_after_transform(entity);
                 }
             }
 

@@ -163,6 +163,10 @@ impl EngineState {
         // because the Stamp component is gone after `world.despawn`.
         let stamp_aabb_to_invalidate =
             self.capture_stamp_aabb_before_delete(entity);
+        // Phase 7: same idea for regions — capture pre-delete so we
+        // can invalidate the tiles the deleted region was covering.
+        let region_aabb_to_invalidate =
+            self.capture_region_aabb_before_delete(entity);
 
         // If this is a generator entity, cancel any in-flight run and
         // recursively delete its owned children first. Children hold
@@ -269,6 +273,10 @@ impl EngineState {
         // invalidate the AABB we captured before despawn.
         if let Some(aabb) = stamp_aabb_to_invalidate {
             self.sync_terrain_stamps_and_invalidate(Some(aabb));
+        }
+        // Phase 7: mirror for regions.
+        if let Some(aabb) = region_aabb_to_invalidate {
+            self.sync_terrain_regions_and_invalidate(Some(aabb));
         }
 
         self.console.info(format!("Deleted '{name}'"));

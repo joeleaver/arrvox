@@ -108,6 +108,11 @@ impl EngineState {
                 // then commit" rhythm.
                 if matches!(self.gizmo.mode, crate::gizmo::GizmoMode::Translate) {
                     self.maybe_sync_stamp_after_transform(selected);
+                    // Phase 7: regions follow the same drag-end pattern
+                    // as stamps. Region.center is `Transform.position`,
+                    // and a moved region invalidates the union of old +
+                    // new AABBs against the live tile set.
+                    self.maybe_sync_region_after_transform(selected);
                 }
                 self.gizmo.end_drag();
             }

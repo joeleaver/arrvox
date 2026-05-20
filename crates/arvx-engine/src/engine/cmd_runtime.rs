@@ -89,6 +89,57 @@ impl EngineState {
                                         self.sync_terrain_stamps_and_invalidate(Some(aabb));
                                     }
                                 }
+                                // Phase 7: Inspector edits to a Region's
+                                // shape / falloff / priority OR its
+                                // BiomeRegion's material override change
+                                // what the bake sees. Re-sync + invalidate
+                                // the post-edit AABB (or both old and new
+                                // for Region itself — `maybe_sync_region`
+                                // would need a captured pre-edit AABB; for
+                                // V1 we conservatively invalidate the new
+                                // AABB only; the streamer's
+                                // `invalidate_aabb` is liberal enough that
+                                // a grown region still picks up its
+                                // newly-covered tiles).
+                                if component_name == "Region" {
+                                    let new_aabb = {
+                                        let region = self
+                                            .world
+                                            .get::<&arvx_regions::Region>(entity)
+                                            .ok()
+                                            .map(|r| *r);
+                                        let position = self
+                                            .world
+                                            .get::<&crate::components::Transform>(entity)
+                                            .ok()
+                                            .map(|t| t.position);
+                                        region.zip(position).map(|(r, p)| r.world_aabb(p))
+                                    };
+                                    if let Some(aabb) = new_aabb {
+                                        self.sync_terrain_regions_and_invalidate(Some(aabb));
+                                    }
+                                }
+                                if component_name == "BiomeRegion" {
+                                    // BiomeRegion has no AABB of its own —
+                                    // its reach is the host Region's. Use
+                                    // that.
+                                    let new_aabb = {
+                                        let region = self
+                                            .world
+                                            .get::<&arvx_regions::Region>(entity)
+                                            .ok()
+                                            .map(|r| *r);
+                                        let position = self
+                                            .world
+                                            .get::<&crate::components::Transform>(entity)
+                                            .ok()
+                                            .map(|t| t.position);
+                                        region.zip(position).map(|(r, p)| r.world_aabb(p))
+                                    };
+                                    if let Some(aabb) = new_aabb {
+                                        self.sync_terrain_regions_and_invalidate(Some(aabb));
+                                    }
+                                }
                             }
                         }
                     }
@@ -126,12 +177,26 @@ impl EngineState {
                         if component_name == "RigidBody" {
                             self.collider_caches_dirty.mark_all();
                         }
+                        // Phase 7: adding a BiomeRegion changes what
+                        // the bake sees for the host region. Re-sync
+                        // + invalidate against the region's AABB.
+                        if component_name == "BiomeRegion" {
+                            self.sync_terrain_regions_for_entity(entity);
+                        }
                     }
                 }
             }
 
             EngineCommand::RemoveComponent { entity_id, component_name } => {
                 if let Some(entity) = self.resolve_entity(&entity_id) {
+                    // Capture the region AABB BEFORE the remove if this
+                    // is going to drop a BiomeRegion — we still need to
+                    // invalidate the tiles it was contributing to.
+                    let biome_aabb_pre_remove = if component_name == "BiomeRegion" {
+                        self.capture_region_aabb_before_delete(entity)
+                    } else {
+                        None
+                    };
                     if let Some(entry) = self.registry.get(&component_name) {
                         if let Err(e) = (entry.remove)(&mut self.world, entity) {
                             eprintln!("[ArvxEngine] remove component failed: {e}");
@@ -148,6 +213,11 @@ impl EngineState {
                         self.gpu_objects_dirty.mark_all();
                         if component_name == "RigidBody" {
                             self.collider_caches_dirty.mark_all();
+                        }
+                        // Phase 7: BiomeRegion removed → tiles it
+                        // contributed to need to re-bake without it.
+                        if let Some(aabb) = biome_aabb_pre_remove {
+                            self.sync_terrain_regions_and_invalidate(Some(aabb));
                         }
                     }
                 }
