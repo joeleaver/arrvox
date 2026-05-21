@@ -61,6 +61,18 @@ pub struct Terrain {
     /// to make tile streaming visible in a normal editor session,
     /// large enough that motion doesn't constantly trip eviction.
     pub render_radius_m: f32,
+    /// V2 LOD pyramid: number of LOD levels to materialise.
+    /// `1` = level 0 only (V1 behavior, the default). `N` enables
+    /// levels `0..N` with each level using a 2× coarser voxel size
+    /// (one tier coarser per level via [`Self::voxel_size_for_level`]).
+    /// The streamer assigns levels via geometric distance-banding so
+    /// the inner-most band uses level 0 and the outer-most uses
+    /// level `N - 1`; bands divide `[0, render_radius_m)`.
+    ///
+    /// Clamped to `[1, 8]` by the Inspector — higher values would
+    /// saturate at Tier 0 (1 m voxels) via `voxel_size_for_level`'s
+    /// floor.
+    pub lod_levels: u8,
 }
 
 impl std::fmt::Debug for Terrain {
@@ -69,6 +81,7 @@ impl std::fmt::Debug for Terrain {
             .field("bounds", &self.bounds)
             .field("base_tier", &self.base_tier)
             .field("render_radius_m", &self.render_radius_m)
+            .field("lod_levels", &self.lod_levels)
             .field("stamps_count", &self.stamps.len())
             .field("regions_count", &self.regions.len())
             .field("terrain_fn", &"<Arc<dyn TerrainFn>>")
@@ -88,6 +101,7 @@ impl Default for Terrain {
             stamps: Arc::new(StampIndex::new()),
             regions: Arc::new(TerrainRegionSnapshot::new()),
             render_radius_m: 192.0,
+            lod_levels: 1,
         }
     }
 }
@@ -161,5 +175,13 @@ mod tests {
         let t = Terrain::default();
         // Beyond Tier 0 we can't go coarser — saturate.
         assert!((t.voxel_size_for_level(99) - 1.0).abs() < 1e-6);
+    }
+
+    /// V1 of the L-pyramid opt-in: default `lod_levels = 1` preserves
+    /// pre-pyramid behavior bit-identically (level 0 only).
+    #[test]
+    fn default_lod_levels_is_one() {
+        let t = Terrain::default();
+        assert_eq!(t.lod_levels, 1);
     }
 }

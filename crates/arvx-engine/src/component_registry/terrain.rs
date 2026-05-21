@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use super::{ComponentEntry, FieldMeta};
 use crate::inspector::{FieldType, FieldValue};
 
-static TERRAIN_FIELDS: [FieldMeta; 12] = [
+static TERRAIN_FIELDS: [FieldMeta; 13] = [
     FieldMeta {
         name: "bounded",
         field_type: FieldType::Bool,
@@ -81,6 +81,16 @@ static TERRAIN_FIELDS: [FieldMeta; 12] = [
         asset_filter: None,
         enum_options: None,
         scrub: true,
+    },
+    FieldMeta {
+        name: "lod_levels",
+        field_type: FieldType::Int,
+        range: Some((1.0, 8.0)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: false,
     },
     FieldMeta {
         name: "fbm_seed",
@@ -162,7 +172,14 @@ struct TerrainSerde {
     bounds: TerrainBounds,
     base_tier: usize,
     render_radius_m: f32,
+    /// Defaults to `1` if absent in older scene files (V1 behavior).
+    #[serde(default = "default_lod_levels")]
+    lod_levels: u8,
     spec: TerrainFnSpec,
+}
+
+fn default_lod_levels() -> u8 {
+    1
 }
 
 impl From<&Terrain> for TerrainSerde {
@@ -171,6 +188,7 @@ impl From<&Terrain> for TerrainSerde {
             bounds: t.bounds,
             base_tier: t.base_tier,
             render_radius_m: t.render_radius_m,
+            lod_levels: t.lod_levels,
             spec: t.spec.clone(),
         }
     }
@@ -236,6 +254,7 @@ pub fn terrain_entry() -> ComponentEntry {
                 "extent_y" => Ok(FieldValue::Int(extent(&t).map(|e| e.y as i64).unwrap_or(0))),
                 "extent_z" => Ok(FieldValue::Int(extent(&t).map(|e| e.z as i64).unwrap_or(0))),
                 "render_radius_m" => Ok(FieldValue::Float(t.render_radius_m as f64)),
+                "lod_levels" => Ok(FieldValue::Int(t.lod_levels as i64)),
                 "fbm_seed" => Ok(FieldValue::Int(
                     fbm(&t).map(|f| f.seed as i64).unwrap_or(0),
                 )),
@@ -309,6 +328,14 @@ pub fn terrain_entry() -> ComponentEntry {
                 "render_radius_m" => {
                     if let FieldValue::Float(v) = value {
                         t.render_radius_m = v as f32;
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "lod_levels" => {
+                    if let FieldValue::Int(v) = value {
+                        t.lod_levels = v.clamp(1, 8) as u8;
                         Ok(())
                     } else {
                         Err("type mismatch".into())
@@ -389,6 +416,7 @@ pub fn terrain_entry() -> ComponentEntry {
             t.bounds = s.bounds;
             t.base_tier = s.base_tier;
             t.render_radius_m = s.render_radius_m;
+            t.lod_levels = s.lod_levels.clamp(1, 8);
             t.set_spec(s.spec);
             world.insert_one(entity, t).map_err(|e| format!("{e}"))
         },

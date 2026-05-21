@@ -101,6 +101,39 @@ pub struct StreamerStats {
     pub worker_count: u32,
 }
 
+/// LOD band `[band_inner, band_outer)` for `level` in a pyramid of
+/// `lod_levels` total levels. The bands divide `[0, render_radius)`
+/// geometrically — each level reaches out to twice the previous
+/// level's far edge, so the band widths double per level (level 0 is
+/// the smallest, the outer-most level is the largest).
+///
+/// Closed form: `band_outer(k) = render_radius * (2^(k+1) - 1) /
+/// (2^N - 1)` where `N = lod_levels`. The geometric-series total
+/// `1 + 2 + 4 + ... + 2^(N-1) = 2^N - 1` ensures `band_outer(N-1) ==
+/// render_radius` regardless of N.
+///
+/// For `lod_levels == 1` this returns `(0, render_radius)`, matching
+/// the V1 single-level sweep bit-identically.
+#[inline]
+fn lod_band(render_radius: f32, lod_levels: u8, level: u8) -> (f32, f32) {
+    debug_assert!(level < lod_levels.max(1));
+    let n = lod_levels.max(1) as u32;
+    let denom = ((1u32 << n) - 1) as f32; // 2^N - 1
+    let lo_num = if level == 0 {
+        0u32
+    } else {
+        (1u32 << level) - 1
+    } as f32;
+    let hi_num = ((1u32 << (level + 1)) - 1) as f32;
+    let band_inner = render_radius * lo_num / denom;
+    let band_outer = if level + 1 == lod_levels {
+        render_radius
+    } else {
+        render_radius * hi_num / denom
+    };
+    (band_inner, band_outer)
+}
+
 /// True if a level-0 tile's full 3D cube intersects the query AABB.
 #[inline]
 fn tile_intersects_aabb(key: TileKey, q: &Aabb) -> bool {
@@ -305,10 +338,7 @@ impl TileStreamer {
         let camera_vec = camera_world.to_vec3();
         let radius = terrain.render_radius_m.max(0.0);
         let radius_sq = radius * radius;
-        let r_tiles = (radius / TILE_SIZE_M).ceil() as i32 + 1;
-        let cam_tile_x = (camera_vec.x / TILE_SIZE_M).floor() as i32;
-        let cam_tile_y = (camera_vec.y / TILE_SIZE_M).floor() as i32;
-        let cam_tile_z = (camera_vec.z / TILE_SIZE_M).floor() as i32;
+        let lod_levels = terrain.lod_levels.max(1);
 
         // Mark every loaded tile as "not yet seen this tick"; the
         // candidate sweep below restores camera_dist_sq for tiles
@@ -318,29 +348,65 @@ impl TileStreamer {
         }
 
         self.submit_scratch.clear();
-        for dx in -r_tiles..=r_tiles {
-            for dy in -r_tiles..=r_tiles {
-                for dz in -r_tiles..=r_tiles {
-                    let key = TileKey::level0(
-                        cam_tile_x + dx,
-                        cam_tile_y + dy,
-                        cam_tile_z + dz,
-                    );
-                    if !terrain.bounds.contains(key) {
-                        continue;
-                    }
-                    let centre = key.centre_world().to_vec3();
-                    let d_sq = (centre - camera_vec).length_squared();
-                    if d_sq > radius_sq {
-                        continue;
-                    }
-                    let slot = self
-                        .tiles
-                        .entry(key)
-                        .or_insert_with(TileSlot::new);
-                    slot.camera_dist_sq = d_sq;
-                    if slot.state == TileState::Queued {
-                        self.submit_scratch.push((key, d_sq));
+
+        // V2 L-pyramid: distance-banded multi-level residency. Each
+        // level covers `[band_inner, band_outer)` chosen by geometric
+        // split of `[0, render_radius)`. A tile is canonical owner of
+        // its footprint iff its CENTRE distance lies in its level's
+        // band — non-overlapping, no z-fight at boundaries. Visible
+        // cracks at the boundary are V1-of-L1 trade-off; later
+        // sessions add fine-ring overlap + Transvoxel.
+        //
+        // For `lod_levels = 1` this collapses to the V1 single-level
+        // sweep over `[0, render_radius_m)`.
+        for level in 0..lod_levels {
+            let (band_inner, band_outer) = lod_band(radius, lod_levels, level);
+            let band_inner_sq = band_inner * band_inner;
+            let band_outer_sq = if band_outer.is_finite() {
+                band_outer * band_outer
+            } else {
+                radius_sq // outer-most level capped at the residency radius
+            };
+
+            let tile_size_at_level = TILE_SIZE_M * (1u32 << level) as f32;
+            let r_tiles = (band_outer / tile_size_at_level).ceil() as i32 + 1;
+            let cam_tile_x = (camera_vec.x / tile_size_at_level).floor() as i32;
+            let cam_tile_y = (camera_vec.y / tile_size_at_level).floor() as i32;
+            let cam_tile_z = (camera_vec.z / tile_size_at_level).floor() as i32;
+
+            for dx in -r_tiles..=r_tiles {
+                for dy in -r_tiles..=r_tiles {
+                    for dz in -r_tiles..=r_tiles {
+                        let key = TileKey {
+                            level,
+                            x: cam_tile_x + dx,
+                            y: cam_tile_y + dy,
+                            z: cam_tile_z + dz,
+                        };
+                        if !terrain.bounds.contains(key) {
+                            continue;
+                        }
+                        let centre = key.centre_world().to_vec3();
+                        let d_sq = (centre - camera_vec).length_squared();
+                        // Half-open `[band_inner, band_outer)` against
+                        // tile centre — assigns each spatial position
+                        // to exactly one level. Compare with the
+                        // total residency radius too, so the outer-
+                        // most level still respects `render_radius_m`.
+                        if d_sq < band_inner_sq || d_sq >= band_outer_sq {
+                            continue;
+                        }
+                        if d_sq > radius_sq {
+                            continue;
+                        }
+                        let slot = self
+                            .tiles
+                            .entry(key)
+                            .or_insert_with(TileSlot::new);
+                        slot.camera_dist_sq = d_sq;
+                        if slot.state == TileState::Queued {
+                            self.submit_scratch.push((key, d_sq));
+                        }
                     }
                 }
             }
@@ -522,7 +588,9 @@ impl TileStreamer {
             };
             let job = BakeJob {
                 key,
-                voxel_size_m: terrain.voxel_size_for_level(0),
+                // V2 L-pyramid: each level uses one tier coarser than
+                // the previous. Was hardcoded to level 0 in V1.
+                voxel_size_m: terrain.voxel_size_for_level(key.level),
                 terrain_fn: Arc::clone(&terrain.terrain_fn),
                 generation: slot.requested_generation,
                 disk_path,
@@ -567,6 +635,7 @@ mod tests {
             stamps: Arc::new(crate::stamp_index::StampIndex::new()),
             regions: Arc::new(crate::TerrainRegionSnapshot::new()),
             render_radius_m: 200.0,
+            lod_levels: 1,
         }
     }
 
@@ -613,6 +682,7 @@ mod tests {
             stamps: Arc::new(crate::stamp_index::StampIndex::new()),
             regions: Arc::new(crate::TerrainRegionSnapshot::new()),
             render_radius_m: 80.0, // ~1 tile radius
+            lod_levels: 1,
         };
 
         // First residency pass — populate slots near origin.
@@ -830,6 +900,7 @@ mod tests {
             stamps: Arc::new(crate::stamp_index::StampIndex::new()),
             regions: Arc::new(crate::TerrainRegionSnapshot::new()),
             render_radius_m: 80.0,
+            lod_levels: 1,
         };
 
         let cam_a = WorldPosition::new(IVec3::ZERO, Vec3::ZERO);
@@ -934,5 +1005,103 @@ mod tests {
             }
             assert_eq!(slot.state, TileState::Queued);
         }
+    }
+
+    // ── V2 L-pyramid (Session 1 / L1) ───────────────────────────────────
+
+    /// Sanity: at `lod_levels = 1` the streamer behaves V1-style.
+    /// Every materialised tile is at level 0.
+    #[test]
+    fn residency_emits_only_level0_when_lod_levels_is_1() {
+        let mut s = TileStreamer::new(1, 1);
+        let mut terrain = small_terrain();
+        terrain.bounds = TerrainBounds::Unbounded;
+        terrain.render_radius_m = 256.0;
+        terrain.lod_levels = 1;
+        let cam = WorldPosition::new(IVec3::ZERO, Vec3::ZERO);
+        let _ = s.update_residency(&terrain, cam);
+        assert!(s.tiles.len() > 0, "expected some level-0 tiles");
+        for key in s.tiles.keys() {
+            assert_eq!(key.level, 0, "lod_levels=1 must produce level-0 keys only");
+        }
+    }
+
+    /// With `lod_levels = 2`, both level-0 (near) and level-1 (far) keys
+    /// must materialise. Inner band uses level 0; outer band uses level 1.
+    #[test]
+    fn residency_emits_multi_level_when_lod_levels_is_2() {
+        let mut s = TileStreamer::new(1, 1);
+        let mut terrain = small_terrain();
+        terrain.bounds = TerrainBounds::Unbounded;
+        // Pyramid radius reaches well past the level-0 band so level-1
+        // tiles exist around the residency edge.
+        terrain.render_radius_m = 384.0;
+        terrain.lod_levels = 2;
+        let cam = WorldPosition::new(IVec3::ZERO, Vec3::new(0.0, 0.0, 0.0));
+        let _ = s.update_residency(&terrain, cam);
+
+        let mut level0 = 0;
+        let mut level1 = 0;
+        for key in s.tiles.keys() {
+            match key.level {
+                0 => level0 += 1,
+                1 => level1 += 1,
+                _ => panic!("lod_levels=2 should not emit level {}", key.level),
+            }
+        }
+        assert!(level0 > 0, "expected level-0 tiles in the inner band");
+        assert!(level1 > 0, "expected level-1 tiles in the outer band");
+    }
+
+    /// The streamer's submit path must pass the LEVEL-aware voxel size
+    /// to `BakeJob` — V1 hardcoded `voxel_size_for_level(0)` for every
+    /// key, which would mis-bake any level > 0 tile.
+    ///
+    /// We can't easily intercept `BakeJob`s emitted by `submit_pending`
+    /// (the channel is internal to the worker pool). Instead test via
+    /// the formula that the level-aware lookup produces a coarser voxel
+    /// size at level 1 than level 0 — confirming the lookup is exposed
+    /// per-level. The wiring of `voxel_size_for_level(key.level)` into
+    /// `submit_pending` is verified by reading the source.
+    #[test]
+    fn voxel_size_for_level_is_monotone_coarsening() {
+        let terrain = small_terrain();
+        let vs0 = terrain.voxel_size_for_level(0);
+        let vs1 = terrain.voxel_size_for_level(1);
+        let vs2 = terrain.voxel_size_for_level(2);
+        assert!(vs1 > vs0, "level 1 must be coarser than level 0");
+        assert!(vs2 > vs1, "level 2 must be coarser than level 1");
+        assert!((vs1 / vs0 - 2.0).abs() < 1e-5, "each level should double voxel size");
+    }
+
+    /// `lod_band` closed form: at `lod_levels = N`, level `N - 1`'s outer
+    /// edge must equal `render_radius_m` and level 0's inner edge must
+    /// be 0. Total band coverage = `[0, render_radius)`.
+    #[test]
+    fn lod_band_covers_full_render_radius_geometrically() {
+        let r = 256.0;
+        for n in 1u8..=4 {
+            let (lo0, _) = lod_band(r, n, 0);
+            let (_, hi_last) = lod_band(r, n, n - 1);
+            assert_eq!(lo0, 0.0, "level 0 inner must start at 0 (N={n})");
+            assert!(
+                (hi_last - r).abs() < 1e-3,
+                "level N-1 outer must equal render_radius (N={n}, hi={hi_last})",
+            );
+        }
+
+        // Geometric-doubling property: each level's width is 2× the
+        // previous level's width. Check for N=3.
+        let (lo0, hi0) = lod_band(r, 3, 0);
+        let (lo1, hi1) = lod_band(r, 3, 1);
+        let (lo2, hi2) = lod_band(r, 3, 2);
+        let w0 = hi0 - lo0;
+        let w1 = hi1 - lo1;
+        let w2 = hi2 - lo2;
+        assert!((w1 / w0 - 2.0).abs() < 1e-3, "w1 must be 2× w0");
+        assert!((w2 / w1 - 2.0).abs() < 1e-3, "w2 must be 2× w1");
+        // Bands are contiguous, non-overlapping.
+        assert!((hi0 - lo1).abs() < 1e-3, "hi0 must meet lo1");
+        assert!((hi1 - lo2).abs() < 1e-3, "hi1 must meet lo2");
     }
 }
