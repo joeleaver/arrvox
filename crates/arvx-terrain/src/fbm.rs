@@ -93,13 +93,49 @@ impl Default for FbmTerrainFn {
 }
 
 impl FbmTerrainFn {
+    /// Nyquist-clamped octave count for a given voxel size.
+    ///
+    /// Octave `o` produces detail at wavelength `scale_m / 2^o`. Any
+    /// octave whose wavelength is shorter than `2 * voxel_size_m`
+    /// aliases when point-sampled at that voxel size — the
+    /// classic Nyquist-Shannon cutoff. Solving for the highest safe
+    /// octave: `o ≤ log2(scale_m / (2 * voxel_size_m))`.
+    ///
+    /// At the V1 default tier (vs = 0.25 m, scale_m = 120 m) the
+    /// cutoff is `log2(240) ≈ 7.9`, so all of the default 5 octaves
+    /// pass through unchanged. At a coarse LOD level (vs = 1 m for
+    /// level 2 on the default tier) the cutoff drops to `log2(60)
+    /// ≈ 5.9` → 6 octaves; at vs = 4 m → `log2(15) ≈ 3.9` → 4.
+    ///
+    /// `voxel_size_m <= 0` or `scale_m <= 0` short-circuit to
+    /// `self.octaves` (fall back to V1 behavior — no filtering).
+    pub fn octaves_for_voxel(&self, voxel_size_m: f32) -> u8 {
+        if voxel_size_m <= 0.0 || self.scale_m <= 0.0 {
+            return self.octaves;
+        }
+        let max_safe = (self.scale_m / (2.0 * voxel_size_m)).log2().floor() as i32 + 1;
+        let clamped = max_safe.max(1).min(self.octaves as i32) as u8;
+        clamped
+    }
+
     /// Evaluate the height field at a world-space (x, z). Returns the
     /// terrain surface Y in metres.
+    ///
+    /// Uses the full octave count from `self.octaves` — for
+    /// LOD-aware sampling that drops aliasing octaves, use
+    /// [`Self::height_at_with_octaves`].
     pub fn height_at(&self, x_m: f32, z_m: f32) -> f32 {
+        self.height_at_with_octaves(x_m, z_m, self.octaves)
+    }
+
+    /// Same as [`Self::height_at`] but with an explicit octave count.
+    /// Used by the LOD-pyramid bake to drop octaves that would alias
+    /// at the tile's voxel size (see [`Self::octaves_for_voxel`]).
+    pub fn height_at_with_octaves(&self, x_m: f32, z_m: f32, octaves: u8) -> f32 {
         let n = fbm_2d(
             x_m / self.scale_m,
             z_m / self.scale_m,
-            self.octaves,
+            octaves,
             self.seed,
         );
         self.base_height_m + n * self.amplitude_m
@@ -113,11 +149,29 @@ impl FbmTerrainFn {
     /// the surface `y = h(x, z)` the upward normal is
     /// `(-∂h/∂x, 1, -∂h/∂z)`, so the slope angle is
     /// `atan2(sqrt(∂h/∂x² + ∂h/∂z²), 1)`.
+    ///
+    /// Uses the full octave count from `self.octaves`. For LOD-aware
+    /// slope use [`Self::slope_degrees_at_with_octaves`].
     pub fn slope_degrees_at(&self, x_m: f32, z_m: f32) -> f32 {
+        self.slope_degrees_at_with_octaves(x_m, z_m, self.octaves)
+    }
+
+    /// Same as [`Self::slope_degrees_at`] but with an explicit octave
+    /// count. Threaded through by `sample` to keep slope-based
+    /// material assignment consistent with the LOD-filtered height
+    /// at the same voxel size.
+    pub fn slope_degrees_at_with_octaves(
+        &self,
+        x_m: f32,
+        z_m: f32,
+        octaves: u8,
+    ) -> f32 {
         let half = self.slope_probe_m.max(1e-3) * 0.5;
-        let dh_dx = (self.height_at(x_m + half, z_m) - self.height_at(x_m - half, z_m))
+        let dh_dx = (self.height_at_with_octaves(x_m + half, z_m, octaves)
+            - self.height_at_with_octaves(x_m - half, z_m, octaves))
             / (2.0 * half);
-        let dh_dz = (self.height_at(x_m, z_m + half) - self.height_at(x_m, z_m - half))
+        let dh_dz = (self.height_at_with_octaves(x_m, z_m + half, octaves)
+            - self.height_at_with_octaves(x_m, z_m - half, octaves))
             / (2.0 * half);
         let grad_mag = (dh_dx * dh_dx + dh_dz * dh_dz).sqrt();
         grad_mag.atan().to_degrees()
@@ -126,13 +180,29 @@ impl FbmTerrainFn {
     /// Pick the material id at a world-space `(x, y, z)` using the
     /// configured slope/height rules. Pure data — no SDF involvement.
     pub fn material_at(&self, x_m: f32, y_m: f32, z_m: f32) -> u16 {
+        self.material_at_with_octaves(x_m, y_m, z_m, self.octaves)
+    }
+
+    /// LOD-aware material lookup. The slope test uses
+    /// `slope_degrees_at_with_octaves(octaves)` so material assignment
+    /// stays consistent with the height field a coarse-LOD bake
+    /// actually emits.
+    pub fn material_at_with_octaves(
+        &self,
+        x_m: f32,
+        y_m: f32,
+        z_m: f32,
+        octaves: u8,
+    ) -> u16 {
         if y_m < self.sea_level_y {
             return self.sand_material;
         }
         if y_m > self.snow_level_y {
             return self.snow_material;
         }
-        if self.slope_degrees_at(x_m, z_m) > self.slope_rock_threshold_deg {
+        if self.slope_degrees_at_with_octaves(x_m, z_m, octaves)
+            > self.slope_rock_threshold_deg
+        {
             return self.rock_material;
         }
         self.grass_material
@@ -140,7 +210,7 @@ impl FbmTerrainFn {
 }
 
 impl TerrainFn for FbmTerrainFn {
-    fn sample(&self, tile: TileKey, local: Vec3, _voxel_size_m: f32) -> TerrainSample {
+    fn sample(&self, tile: TileKey, local: Vec3, voxel_size_m: f32) -> TerrainSample {
         // Tile-local → world-space x/z for the noise lookup.
         // `origin_world().to_vec3()` is f32-precision in absolute world
         // coords; fine for tiles near the origin. Phase 2 will switch
@@ -152,7 +222,12 @@ impl TerrainFn for FbmTerrainFn {
         let wy = world_origin.y + local.y;
         let wz = world_origin.z + local.z;
 
-        let surface_y = self.height_at(wx, wz);
+        // V2 LOD pyramid: drop aliasing octaves at coarse voxel sizes.
+        // Level 0 (fine) gets all octaves; level N gets fewer per the
+        // Nyquist clamp. Kills the "frequency pop" at LOD transitions.
+        let octaves = self.octaves_for_voxel(voxel_size_m);
+
+        let surface_y = self.height_at_with_octaves(wx, wz, octaves);
         // SDF: positive above the surface (empty), negative below (solid).
         let sd = wy - surface_y;
 
@@ -160,7 +235,10 @@ impl TerrainFn for FbmTerrainFn {
         // A column of voxels straddling the surface should all carry
         // the same material — the SDF picks which side of the surface
         // the voxel falls on, not what it's made of.
-        let mat = self.material_at(wx, surface_y, wz);
+        //
+        // Same octave count for the slope probe so the material rule
+        // matches the height field this bake will actually emit.
+        let mat = self.material_at_with_octaves(wx, surface_y, wz, octaves);
 
         TerrainSample {
             sd,
@@ -206,23 +284,34 @@ fn value_noise_2d(x: f32, z: f32, seed: u32) -> f32 {
 }
 
 /// Octave-summed FBM. Output is approximately in `[-1, 1]`.
+///
+/// Normalises by the GEOMETRIC-SERIES LIMIT `2.0` rather than the
+/// per-call partial sum. This is load-bearing for the V2 LOD-pyramid
+/// pre-filter: dropping high-frequency octaves (to avoid Nyquist
+/// aliasing at coarse voxel sizes) leaves the same low-frequency
+/// amplitude as the fine bake. The partial-sum normalisation would
+/// instead AMPLIFY the surviving low-freq octaves by the missing
+/// amplitude — turning the pre-filter into a brightness shift
+/// (coarse terrain ends up taller than fine).
+///
+/// Cost: outputs are at most ~3% smaller in absolute amplitude than
+/// the pre-fix normalisation (5 octaves: partial sum = 1.9375, vs
+/// limit 2.0 → 0.97× factor). Visually identical for V1 / V2 defaults.
 fn fbm_2d(x: f32, z: f32, octaves: u8, seed: u32) -> f32 {
     let mut sum = 0.0;
     let mut amplitude = 1.0;
     let mut frequency = 1.0;
-    let mut total = 0.0;
     for o in 0..octaves {
         let s = seed.wrapping_add((o as u32).wrapping_mul(0x9E37_79B9));
         sum += amplitude * value_noise_2d(x * frequency, z * frequency, s);
-        total += amplitude;
         amplitude *= 0.5;
         frequency *= 2.0;
     }
-    if total > 0.0 {
-        sum / total
-    } else {
-        0.0
-    }
+    // Infinite-series limit of 1 + 0.5 + 0.25 + ... = 2.0. Dividing by
+    // the limit makes low-freq amplitude invariant under octave-count
+    // changes (the LOD pre-filter is then a pure low-pass, not a
+    // re-amplifier).
+    sum / 2.0
 }
 
 #[cfg(test)]
@@ -402,5 +491,126 @@ mod tests {
         let k = TileKey::level0(0, 0, 0);
         let s = f.sample(k, Vec3::new(0.0, 50.0, 0.0), 0.25);
         assert_eq!(s.primary_mat, f.sand_material);
+    }
+
+    // ── V2 LOD pyramid: Nyquist octave clamp ──────────────────────────
+
+    /// `octaves_for_voxel` returns at most the octave count whose
+    /// shortest-wavelength octave is still ≥ 2× the voxel size.
+    #[test]
+    fn octaves_for_voxel_clamps_at_nyquist() {
+        let mut f = FbmTerrainFn::default();
+        f.scale_m = 120.0;
+        f.octaves = 12;
+        // vs = 1.0 m → log2(60) ≈ 5.9 → 6 octaves.
+        assert_eq!(f.octaves_for_voxel(1.0), 6);
+        // vs = 0.25 m → log2(240) ≈ 7.9 → 8 octaves.
+        assert_eq!(f.octaves_for_voxel(0.25), 8);
+        // vs = 4.0 m → log2(15) ≈ 3.9 → 4 octaves.
+        assert_eq!(f.octaves_for_voxel(4.0), 4);
+        // Coarse beyond the highest octave saturates at 1 (always at
+        // least one octave so the noise isn't fully silenced).
+        assert_eq!(f.octaves_for_voxel(1024.0), 1);
+    }
+
+    /// The clamp never RAISES the octave count above `self.octaves` —
+    /// it's a low-pass, not a re-amplification.
+    #[test]
+    fn octaves_for_voxel_never_exceeds_configured_octaves() {
+        let mut f = FbmTerrainFn::default();
+        f.scale_m = 120.0;
+        f.octaves = 3;
+        // Even at sub-voxel resolution where Nyquist would allow 10+
+        // octaves, we cap at `self.octaves`.
+        assert_eq!(f.octaves_for_voxel(0.01), 3);
+    }
+
+    /// Coarse sampling should produce LESS HIGH-FREQUENCY CONTENT than
+    /// fine sampling. We measure this by the mean-squared first
+    /// difference between adjacent samples at a tight (sub-voxel-fine)
+    /// step — the wiggle the highest octaves contribute.
+    ///
+    /// Overall variance is a bad metric here because it's dominated by
+    /// the low-frequency octaves (amplitudes 1, 1/2, 1/4 vastly bigger
+    /// than 1/64, 1/128). The high-pass content is what changes when
+    /// we drop high octaves.
+    #[test]
+    fn coarse_voxel_height_drops_high_frequency_content() {
+        let f = FbmTerrainFn {
+            seed: 42,
+            octaves: 8,
+            scale_m: 64.0,
+            amplitude_m: 16.0,
+            base_height_m: 0.0,
+            sea_level_y: -1000.0,
+            snow_level_y: 1000.0,
+            slope_rock_threshold_deg: 90.0,
+            slope_probe_m: 0.5,
+            grass_material: 1,
+            rock_material: 2,
+            snow_material: 3,
+            sand_material: 4,
+        };
+
+        let octs_fine = f.octaves_for_voxel(0.25);
+        let octs_coarse = f.octaves_for_voxel(4.0);
+        assert!(octs_coarse < octs_fine, "coarse must drop at least one octave");
+
+        // Tight step (1/8 m) is well below the Nyquist limit at vs=0.25
+        // (= 0.5 m), so we capture every octave the fine bake would.
+        let n = 64;
+        let step = 0.125_f32;
+
+        let mut mean_sq_first_diff = |octaves: u8| -> f64 {
+            let mut energy = 0.0;
+            let mut count = 0;
+            // Walk a 64-cell strip in x. The squared difference between
+            // adjacent samples is the discrete 1st-derivative energy
+            // — proportional to high-freq content.
+            for j in 0..n {
+                let mut prev = f.height_at_with_octaves(0.0, j as f32 * step, octaves);
+                for i in 1..n {
+                    let h = f.height_at_with_octaves(i as f32 * step, j as f32 * step, octaves);
+                    let d = (h - prev) as f64;
+                    energy += d * d;
+                    prev = h;
+                    count += 1;
+                }
+            }
+            energy / count as f64
+        };
+
+        let hf_fine = mean_sq_first_diff(octs_fine);
+        let hf_coarse = mean_sq_first_diff(octs_coarse);
+        // Coarse should have LESS first-difference energy because the
+        // wiggle from the dropped octaves is gone.
+        assert!(
+            hf_coarse < hf_fine * 0.9,
+            "coarse (octaves={octs_coarse}, hf={hf_coarse:.6}) should drop high-freq energy vs fine (octaves={octs_fine}, hf={hf_fine:.6})"
+        );
+    }
+
+    /// `sample` at a coarse voxel size produces the same height as
+    /// calling `height_at_with_octaves` with the clamped octave count.
+    #[test]
+    fn sample_uses_octaves_for_voxel() {
+        let f = FbmTerrainFn::default();
+        let k = TileKey::level0(0, 0, 0);
+        let local = Vec3::new(13.7, 0.0, 42.1);
+        let world_origin = k.origin_world().to_vec3();
+        let wx = world_origin.x + local.x;
+        let wz = world_origin.z + local.z;
+
+        let vs_coarse = 4.0;
+        let octs = f.octaves_for_voxel(vs_coarse);
+        let s = f.sample(k, local, vs_coarse);
+        let expected_surface_y = f.height_at_with_octaves(wx, wz, octs);
+        // sample's `sd` is `wy - surface_y`; we sampled at wy = local.y
+        // (= 0), so surface_y = -sd.
+        let surface_y_from_sample = local.y + world_origin.y - s.sd;
+        assert!(
+            (surface_y_from_sample - expected_surface_y).abs() < 1e-4,
+            "sample(vs={vs_coarse}) must use octaves_for_voxel={octs}"
+        );
     }
 }
