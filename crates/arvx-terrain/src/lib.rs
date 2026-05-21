@@ -20,6 +20,7 @@ pub mod fbm;
 pub mod persist;
 pub mod physics_policy;
 pub mod region_snapshot;
+pub mod sculpt_diff;
 pub mod stamp;
 pub mod stamp_index;
 pub mod streamer;
@@ -43,6 +44,7 @@ pub use physics_policy::{
     RebuildDecision, ResidencyContext, TileSet, TrajectoryContext,
 };
 pub use region_snapshot::{TerrainRegionSnapshot, TerrainRegionSnapshotHandle};
+pub use sculpt_diff::SculptDiff;
 pub use stamp::{combine_heights, CombineOp, FalloffCurve, Stamp, StampKind};
 pub use stamp_index::{StampIndex, StampIndexHandle};
 pub use streamer::{StreamerStats, TileSlot, TileState, TileStreamer};

@@ -35,7 +35,7 @@ use arvx_core::mesh_extract::{
 use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sculpt::{
     apply_delta, brush_cell_range, compute_brush_edits_in_stroke, BrushMode, BrushOp,
-    LeafEditOp,
+    LeafEdit, LeafEditOp,
 };
 use arvx_core::sparse_octree::{is_brick, is_leaf, leaf_slot, brick_id};
 use arvx_core::brick_pool::{BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
@@ -67,6 +67,17 @@ pub struct SculptApplyResult {
     /// How many Add edits were skipped (Phase B). Logged so the user
     /// gets feedback if they switch to Raise while it's disabled.
     pub leaves_add_skipped: usize,
+    /// Edits the brush emitted, captured verbatim from the kernel's
+    /// `SculptDelta` so callers can persist them into a per-tile
+    /// `SculptDiff` for bake-replay.
+    ///
+    /// SetNormal edits are filtered out here because they carry a
+    /// pre-resolved `LeafAttrPool` slot id that won't survive replay
+    /// onto a freshly-baked octree. The terrain layer's `SculptDiff`
+    /// applies the same filter on `append_delta`, but we drop them at
+    /// the source so callers that don't go through SculptDiff (e.g.,
+    /// test fixtures) get the same guarantee.
+    pub captured_edits: Vec<LeafEdit>,
 }
 
 /// Float-AABB intersection test in object-local coordinates.
@@ -662,6 +673,17 @@ impl ArvxSceneManager {
 
         let allocated_leaf_attr_ids: Vec<u32> =
             applied.allocated_slots.iter().map(|(s, _)| *s).collect();
+        // Capture the kernel's edits for `SculptDiff` persistence.
+        // SetNormal is dropped because its slot id is per-octree (the
+        // terrain bake-replay path needs replay-stable ops only). The
+        // `SculptDiff::append_delta` consumer applies the same filter,
+        // but dropping at the source keeps the contract local.
+        let captured_edits: Vec<LeafEdit> = delta
+            .edits
+            .iter()
+            .filter(|e| !matches!(e.op, LeafEditOp::SetNormal { .. }))
+            .copied()
+            .collect();
         // Record this stamp's WORLD-space center so the NEXT stamp
         // in the stroke can sweep a capsule from here. Recorded only
         // after the stamp has successfully applied — a no-op stamp
@@ -675,6 +697,161 @@ impl ArvxSceneManager {
             allocated_leaf_attr_ids,
             leaves_removed,
             leaves_add_skipped,
+            captured_edits,
+        })
+    }
+
+    /// Replay a list of pre-computed `LeafEdit`s onto an asset.
+    ///
+    /// This is the **bake-replay path** for terrain `SculptDiff`s:
+    /// the brush captures edits at stamp time, the engine stashes
+    /// them in `TerrainRuntime::diffs`, and this method re-applies
+    /// them when the tile re-bakes from procedural source — after
+    /// eviction, during coarse-LOD ancestor materialisation, or on
+    /// scene reload via the `.arvxsculpt` sidecar.
+    ///
+    /// Returns `None` for unknown handles or empty inputs. Returns
+    /// `Some(SculptApplyResult)` on success; the result mirrors
+    /// [`Self::apply_sculpt_brush`] so callers can route through the
+    /// same overlay / dirty-tracking bookkeeping. `captured_edits` is
+    /// always empty in the returned value — replay doesn't re-capture
+    /// (the source diff already holds them).
+    ///
+    /// **Mesh re-extract:** does a full asset re-extract via
+    /// [`Self::rebuild_asset_mesh`], not the brush's per-cluster
+    /// dirty path. Replay typically runs once per integration with
+    /// a potentially asset-wide edit set, so the per-cluster intersect
+    /// test would mostly hit; the full path is simpler and the tile
+    /// is fresh (no GPU upload yet) so the cost is negligible.
+    pub fn apply_diff_to_handle(
+        &mut self,
+        handle: AssetHandle,
+        edits: &[LeafEdit],
+    ) -> Option<SculptApplyResult> {
+        if edits.is_empty() || self.asset_cache.get(handle).is_none() {
+            return None;
+        }
+
+        // ── Resolve Removes to leaf_attr_ids (mirrors brush Phase 3).
+        let mut removed: Vec<u32> = Vec::new();
+        for edit in edits {
+            if !matches!(edit.op, LeafEditOp::Remove | LeafEditOp::Empty) {
+                continue;
+            }
+            let entry = self.asset_cache.get(handle)?;
+            let Some(node) = entry.cpu_octree.lookup(edit.coord) else {
+                continue;
+            };
+            if is_leaf(node) {
+                removed.push(leaf_slot(node));
+            } else if is_brick(node) {
+                let bid = brick_id(node);
+                let mask = BRICK_DIM - 1;
+                let cx = edit.coord.x & mask;
+                let cy = edit.coord.y & mask;
+                let cz = edit.coord.z & mask;
+                let cell = self.brick_pool.get_cell(bid, cx, cy, cz);
+                if cell == BRICK_EMPTY || cell == BRICK_INTERIOR {
+                    continue;
+                }
+                removed.push(cell);
+            }
+        }
+        let leaves_removed = removed.len();
+        removed.sort_unstable();
+        removed.dedup();
+
+        // ── apply_delta (mirrors brush Phase 4). Build a transient
+        // SculptDelta wrapping the edit slice; the kernel doesn't
+        // care about the timing fields.
+        let delta = arvx_core::sculpt::SculptDelta {
+            edits: edits.to_vec(),
+            ..Default::default()
+        };
+        let applied = {
+            let Self {
+                asset_cache,
+                brick_pool,
+                leaf_attr_pool,
+                ..
+            } = self;
+            let entry = asset_cache.get_mut(handle)?;
+            let octree = &mut entry.cpu_octree;
+            apply_delta(octree, brick_pool, &delta, || {
+                leaf_attr_pool
+                    .allocate()
+                    .expect("leaf_attr_pool exhausted during diff apply")
+            })
+        };
+
+        // ── Sync octree mutations to GPU (mirrors brush Phase 4b).
+        {
+            let entry = self.asset_cache.get_mut(handle)?;
+            let spatial = entry.spatial_handle;
+            let new_node_count = entry.cpu_octree.node_count() as u32;
+            if applied.octree_log.grew(new_node_count) {
+                let extended = self.octree.try_extend_in_slack(&spatial, new_node_count);
+                match extended {
+                    Some(new_handle) => {
+                        let entry = self.asset_cache.get_mut(handle)?;
+                        entry.spatial_handle = new_handle;
+                        self.octree.apply_mutation_log(&new_handle, &applied.octree_log);
+                    }
+                    None => {
+                        eprintln!(
+                            "[sculpt-diff] octree slack exhausted ({} → {} nodes) — re-allocating slot",
+                            applied.octree_log.initial_node_count, new_node_count,
+                        );
+                        self.octree.deallocate(spatial);
+                        let entry = self.asset_cache.get_mut(handle)?;
+                        let new_handle = self.octree.allocate_with_slack(&entry.cpu_octree, 1.5);
+                        let entry = self.asset_cache.get_mut(handle)?;
+                        entry.spatial_handle = new_handle;
+                    }
+                }
+            } else if !applied.octree_log.is_empty() {
+                self.octree.apply_mutation_log(&spatial, &applied.octree_log);
+            }
+        }
+
+        // ── LeafAttr writes for Add slots (mirrors brush Phase 5).
+        for (slot, attrs) in &applied.allocated_slots {
+            *self.leaf_attr_pool.get_mut(*slot) = attrs.to_leaf_attr();
+            self.leaf_attr_pool.set_color(*slot, 0);
+            let entry = self.asset_cache.get_mut(handle)?;
+            let base_lo = entry.leaf_attr_slot_start;
+            let base_hi = base_lo + entry.leaf_attr_slot_count;
+            if *slot < base_lo || *slot >= base_hi {
+                entry.sculpt_extra_slots.insert(*slot);
+            }
+            entry.sculpt_owned_slots.insert(*slot);
+        }
+        for (slot, normal) in &applied.renormalized_slots {
+            let attr = self.leaf_attr_pool.get_mut(*slot);
+            attr.normal_oct = arvx_core::pack_oct(*normal);
+        }
+        for slot in &applied.freed_slots {
+            self.leaf_attr_pool.deallocate_range(*slot, 1);
+            if let Some(entry) = self.asset_cache.get_mut(handle) {
+                entry.sculpt_extra_slots.remove(slot);
+                entry.sculpt_owned_slots.remove(slot);
+            }
+        }
+
+        // ── Full asset re-extract (no BrushOp available, and the tile
+        // typically just integrated so per-cluster narrowing isn't
+        // worth the bookkeeping).
+        self.rebuild_asset_mesh(handle);
+        self.bump_geometry_epoch();
+
+        let allocated_leaf_attr_ids: Vec<u32> =
+            applied.allocated_slots.iter().map(|(s, _)| *s).collect();
+        Some(SculptApplyResult {
+            removed_leaf_attr_ids: removed,
+            allocated_leaf_attr_ids,
+            leaves_removed,
+            leaves_add_skipped: 0,
+            captured_edits: Vec::new(),
         })
     }
 
@@ -1947,6 +2124,113 @@ mod tests {
             "pre-fix delta is exactly one tile width — what produces the \
              cross-tile stroke",
         );
+    }
+
+    /// Resolve a coord to its surface slot id, whether the octree chose
+    /// LEAF or BRICK encoding. Returns None for EMPTY / INTERIOR.
+    fn resolve_surface_slot(
+        entry: &AssetEntry,
+        brick_pool: &arvx_core::brick_pool::BrickPool,
+        coord: glam::UVec3,
+    ) -> Option<u32> {
+        use arvx_core::sparse_octree::{is_brick, is_leaf, leaf_slot, brick_id};
+        let node = entry.cpu_octree.lookup(coord)?;
+        if is_leaf(node) {
+            return Some(leaf_slot(node));
+        }
+        if is_brick(node) {
+            let bid = brick_id(node);
+            let mask = BRICK_DIM - 1;
+            let cell = brick_pool.get_cell(bid, coord.x & mask, coord.y & mask, coord.z & mask);
+            if cell == BRICK_EMPTY || cell == BRICK_INTERIOR {
+                return None;
+            }
+            return Some(cell);
+        }
+        None
+    }
+
+    /// V2 LOD pyramid: `apply_diff_to_handle` adds a surface cell into
+    /// an empty asset's octree. Verifies the Add path produces a live
+    /// surface slot (LEAF or BRICK cell) with the right material.
+    #[test]
+    fn apply_diff_to_handle_add_creates_surface_cell() {
+        use arvx_core::sculpt::LeafEditOp;
+        use glam::UVec3;
+
+        let mut sm = ArvxSceneManager::new(16);
+        let handle = sm
+            .asset_cache
+            .insert(make_entry(vec![cluster([0.0; 3], [1.0; 3], 0)], 4));
+
+        let edits = vec![LeafEdit {
+            coord: UVec3::new(2, 3, 4),
+            op: LeafEditOp::Add {
+                material: 7,
+                normal: Vec3::Y,
+            },
+        }];
+        let result = sm
+            .apply_diff_to_handle(handle, &edits)
+            .expect("non-empty edit list should produce a result");
+        assert_eq!(result.allocated_leaf_attr_ids.len(), 1);
+
+        let entry = sm.asset_cache.get(handle).expect("asset still live");
+        let slot = resolve_surface_slot(entry, &sm.brick_pool, UVec3::new(2, 3, 4))
+            .expect("Add must produce a live surface cell");
+        let attr = sm.leaf_attr_pool.get(slot);
+        assert_eq!(
+            attr.material_primary, 7,
+            "added cell must carry the diff's material"
+        );
+    }
+
+    /// Add then Remove the same coord — the cell should be EMPTY again.
+    #[test]
+    fn apply_diff_to_handle_remove_undoes_add() {
+        use arvx_core::sculpt::LeafEditOp;
+        use glam::UVec3;
+
+        let mut sm = ArvxSceneManager::new(16);
+        let handle = sm
+            .asset_cache
+            .insert(make_entry(vec![cluster([0.0; 3], [1.0; 3], 0)], 4));
+
+        sm.apply_diff_to_handle(
+            handle,
+            &[LeafEdit {
+                coord: UVec3::new(1, 0, 0),
+                op: LeafEditOp::Add {
+                    material: 1,
+                    normal: Vec3::Y,
+                },
+            }],
+        )
+        .expect("add result");
+        sm.apply_diff_to_handle(
+            handle,
+            &[LeafEdit {
+                coord: UVec3::new(1, 0, 0),
+                op: LeafEditOp::Remove,
+            }],
+        )
+        .expect("remove result");
+
+        let entry = sm.asset_cache.get(handle).expect("asset live");
+        assert!(
+            resolve_surface_slot(entry, &sm.brick_pool, UVec3::new(1, 0, 0)).is_none(),
+            "Removed coord must not resolve to a surface slot"
+        );
+    }
+
+    /// Empty edit list short-circuits — no octree mutation, no result.
+    #[test]
+    fn apply_diff_to_handle_empty_edits_is_none() {
+        let mut sm = ArvxSceneManager::new(16);
+        let handle = sm
+            .asset_cache
+            .insert(make_entry(vec![cluster([0.0; 3], [1.0; 3], 0)], 4));
+        assert!(sm.apply_diff_to_handle(handle, &[]).is_none());
     }
 
     #[test]

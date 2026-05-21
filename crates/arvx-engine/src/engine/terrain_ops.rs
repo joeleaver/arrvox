@@ -283,7 +283,108 @@ impl super::state::EngineState {
         }
         // Silence "unused import" if EditorMetadata isn't used here.
         let _ = std::any::type_name::<EditorMetadata>();
+
+        // V2 LOD pyramid follow-up: replay any persistent sculpt diff
+        // applicable to this tile. Three cases produce a non-empty
+        // replay:
+        //
+        //   * Level-0 tile after eviction → re-load: `runtime.diffs`
+        //     still holds the per-tile diff (eviction touches only
+        //     the streamer slot, never the diff map). Replay restores
+        //     the sculpt onto the fresh procedural bake.
+        //   * Level-N≥1 coarse-LOD ancestor: enumerate the 8^N
+        //     level-0 descendants present in `runtime.diffs`,
+        //     downsample each into the coarse grid, and replay the
+        //     composed diff so the sculpt appears at coarse LOD too.
+        //   * Scene reload after `.arvxsculpt` load (P6 lands this).
+        //
+        // `tile_keys` already holds the freshly-integrated handle
+        // (the `insert` above). We build the edit batch from the
+        // runtime borrow we hold, then briefly grab the scene_mgr
+        // lock to apply.
+        let replay_edits = self.gather_replay_edits(runtime, key);
+        if !replay_edits.is_empty() {
+            let mut sm = match self.scene_mgr.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            sm.apply_diff_to_handle(asset_handle, &replay_edits);
+            if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
+                eprintln!(
+                    "[terrain] replay sculpt diff: key=({},{},{},lvl{}) edits={}",
+                    key.x, key.y, key.z, key.level, replay_edits.len(),
+                );
+            }
+        }
+
         Some(token)
+    }
+
+    /// Build the LeafEdit batch that should be replayed onto `key`'s
+    /// freshly-baked asset. Level-0 returns the per-tile diff edits
+    /// verbatim; level-N≥1 enumerates every level-0 descendant key
+    /// present in `runtime.diffs` and downsamples each into the
+    /// coarse grid via [`arvx_terrain::SculptDiff::downsampled_to`].
+    ///
+    /// `&self` only — reads `runtime.diffs` and the Terrain entity's
+    /// `voxel_size_for_level` mapping. Empty vec when no diffs apply.
+    fn gather_replay_edits(
+        &self,
+        runtime: &TerrainRuntime,
+        key: arvx_terrain::TileKey,
+    ) -> Vec<arvx_core::sculpt::LeafEdit> {
+        if runtime.diffs.is_empty() {
+            return Vec::new();
+        }
+        if key.level == 0 {
+            return runtime
+                .diffs
+                .get(&key)
+                .map(|d| d.edits.clone())
+                .unwrap_or_default();
+        }
+        let (fine_vs, coarse_vs) = match self
+            .world
+            .get::<&arvx_terrain::Terrain>(runtime.terrain_entity)
+        {
+            Ok(t) => (
+                t.voxel_size_for_level(0),
+                t.voxel_size_for_level(key.level),
+            ),
+            Err(_) => return Vec::new(),
+        };
+
+        // Coarse tile (level=N, x, y, z) covers level-0 tiles in
+        // `(x*span..(x+1)*span)` along each axis. The lod_levels
+        // clamp caps `key.level` at 7, so worst-case span = 128 (≈2M
+        // descendants); typical N=1..=3 gives 8..512 candidates per
+        // coarse bake, each a `runtime.diffs.get` hash lookup.
+        let span = 1i32 << key.level;
+        let base_x = key.x * span;
+        let base_y = key.y * span;
+        let base_z = key.z * span;
+
+        let mut combined: Vec<arvx_core::sculpt::LeafEdit> = Vec::new();
+        for dz in 0..span {
+            for dy in 0..span {
+                for dx in 0..span {
+                    let fine = arvx_terrain::TileKey::level0(
+                        base_x + dx,
+                        base_y + dy,
+                        base_z + dz,
+                    );
+                    let Some(diff) = runtime.diffs.get(&fine) else {
+                        continue;
+                    };
+                    if diff.is_empty() {
+                        continue;
+                    }
+                    let ds = diff.downsampled_to(fine, fine_vs, key, coarse_vs);
+                    combined.extend(ds.edits);
+                }
+            }
+        }
+        combined
     }
 
     /// Phase 4.3: write every dirty terrain tile as `.arvxtile`

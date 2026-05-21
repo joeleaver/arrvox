@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use arvx_render::AssetHandle;
-use arvx_terrain::{TileKey, TileStreamer};
+use arvx_terrain::{SculptDiff, TileKey, TileStreamer};
 
 /// Engine-side runtime state for the active Terrain.
 ///
@@ -54,6 +54,24 @@ pub struct TerrainRuntime {
     /// has been edited this session. Cleared on
     /// `revert_terrain_in_aabb`.
     pub divergent_tiles: HashSet<TileKey>,
+    /// V2 LOD pyramid follow-up: persistent per-tile sculpt diffs,
+    /// captured at brush time and replayed by the bake pipeline so:
+    ///
+    /// 1. **Re-bakes preserve sculpt.** When a tile evicts and later
+    ///    re-loads (or invalidation re-runs the bake), the diff is
+    ///    replayed against the fresh procedural octree.
+    /// 2. **Coarse LOD shows sculpts too.** Level-N≥1 ancestor tiles
+    ///    enumerate every level-0 descendant key present in this map,
+    ///    downsample each into the coarse grid via
+    ///    [`SculptDiff::downsampled_to`], and replay post-integrate.
+    /// 3. **Scene reload preserves sculpts.** The save path writes a
+    ///    `.arvxsculpt` sidecar per non-empty entry; the load path
+    ///    populates this map before the streamer ticks.
+    ///
+    /// Keyed by **fine (level-0) `TileKey`** — that's the diff's
+    /// authoritative coordinate system. Empty entries are pruned to
+    /// keep the map size proportional to actually-sculpted regions.
+    pub diffs: HashMap<TileKey, SculptDiff>,
     /// Monotonic token counter — the streamer doesn't generate these
     /// itself.
     pub next_token: u64,
@@ -70,6 +88,7 @@ impl TerrainRuntime {
             tile_keys: HashMap::new(),
             dirty_tiles: HashSet::new(),
             divergent_tiles: HashSet::new(),
+            diffs: HashMap::new(),
             next_token: 1,
         }
     }
@@ -81,5 +100,99 @@ impl TerrainRuntime {
     pub fn mark_dirty(&mut self, key: TileKey) {
         self.dirty_tiles.insert(key);
         self.divergent_tiles.insert(key);
+    }
+
+    /// Append a sculpt-stamp's captured `LeafEdit`s into the per-tile
+    /// diff. SetNormal edits should already be filtered by the
+    /// caller (`SculptApplyResult::captured_edits` does this), but
+    /// `SculptDiff::append_delta` re-filters defensively.
+    ///
+    /// `key` must be the level-0 tile that owned the brush stamp;
+    /// downsampling to coarser ancestors happens at bake time.
+    pub fn append_sculpt_edits(
+        &mut self,
+        key: TileKey,
+        edits: &[arvx_core::sculpt::LeafEdit],
+    ) {
+        if edits.is_empty() {
+            return;
+        }
+        // Wrap in a transient SculptDelta so we go through the same
+        // filter SculptDiff::append_delta applies to bare deltas —
+        // single source of truth for the SetNormal-drop rule.
+        let delta = arvx_core::sculpt::SculptDelta {
+            edits: edits.to_vec(),
+            ..Default::default()
+        };
+        self.diffs.entry(key).or_default().append_delta(&delta);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arvx_core::sculpt::{LeafEdit, LeafEditOp};
+    use glam::{UVec3, Vec3};
+
+    fn make_runtime() -> TerrainRuntime {
+        // Entity::DANGLING is fine for runtime state we don't tick;
+        // these tests cover diff bookkeeping only.
+        TerrainRuntime::new(hecs::Entity::DANGLING)
+    }
+
+    fn add(coord: UVec3) -> LeafEdit {
+        LeafEdit {
+            coord,
+            op: LeafEditOp::Add {
+                material: 1,
+                normal: Vec3::Y,
+            },
+        }
+    }
+
+    #[test]
+    fn append_sculpt_edits_creates_per_tile_diff_entry() {
+        let mut rt = make_runtime();
+        let key = TileKey::level0(2, 0, 1);
+        rt.append_sculpt_edits(key, &[add(UVec3::new(0, 0, 0))]);
+        assert_eq!(rt.diffs.len(), 1);
+        assert_eq!(rt.diffs[&key].len(), 1);
+    }
+
+    #[test]
+    fn append_sculpt_edits_accumulates_across_calls() {
+        let mut rt = make_runtime();
+        let key = TileKey::level0(0, 0, 0);
+        rt.append_sculpt_edits(key, &[add(UVec3::new(0, 0, 0))]);
+        rt.append_sculpt_edits(key, &[add(UVec3::new(1, 0, 0))]);
+        assert_eq!(rt.diffs[&key].len(), 2);
+    }
+
+    #[test]
+    fn append_sculpt_edits_empty_is_no_op() {
+        let mut rt = make_runtime();
+        rt.append_sculpt_edits(TileKey::level0(0, 0, 0), &[]);
+        assert!(rt.diffs.is_empty());
+    }
+
+    /// SetNormal carries a per-octree slot id and can't be replayed.
+    /// `SculptDiff::append_delta` filters it; `append_sculpt_edits`
+    /// delegates so the same filter applies.
+    #[test]
+    fn append_sculpt_edits_filters_set_normal() {
+        let mut rt = make_runtime();
+        let key = TileKey::level0(0, 0, 0);
+        let edits = vec![
+            add(UVec3::new(0, 0, 0)),
+            LeafEdit {
+                coord: UVec3::new(1, 0, 0),
+                op: LeafEditOp::SetNormal {
+                    slot: 42,
+                    normal: Vec3::Y,
+                },
+            },
+        ];
+        rt.append_sculpt_edits(key, &edits);
+        assert_eq!(rt.diffs[&key].len(), 1);
     }
 }

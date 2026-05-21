@@ -497,6 +497,12 @@ impl EngineState {
         // a fresh TerrainFn bake. Tiles in the brush AABB but with
         // no actual cell changes don't enter the set.
         let mut touched_keys: Vec<arvx_terrain::TileKey> = Vec::new();
+        // Per-tile captured `LeafEdit`s, drained into
+        // `TerrainRuntime::diffs` at the end so the bake-replay path
+        // can re-apply this sculpt onto a fresh procedural octree
+        // (after eviction, for coarse-LOD ancestors, on scene reload).
+        let mut captured: Vec<(arvx_terrain::TileKey, Vec<arvx_core::sculpt::LeafEdit>)> =
+            Vec::new();
 
         for (key, entity, asset_handle) in targets {
             // Per-tile brush stamp. Tile entities sit at world-frame
@@ -522,6 +528,9 @@ impl EngineState {
             };
             total_removed += result.leaves_removed;
             touched_keys.push(key);
+            if !result.captured_edits.is_empty() {
+                captured.push((key, result.captured_edits.clone()));
+            }
 
             // Mirror the asset path's per-entity bookkeeping for the
             // tile's entity. See `apply_sculpt_stamp` for rationale on
@@ -568,6 +577,9 @@ impl EngineState {
         if let Some(runtime) = self.terrain.as_mut() {
             for k in &touched_keys {
                 runtime.mark_dirty(*k);
+            }
+            for (k, edits) in &captured {
+                runtime.append_sculpt_edits(*k, edits);
             }
         }
 
