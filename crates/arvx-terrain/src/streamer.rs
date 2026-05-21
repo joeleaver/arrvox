@@ -134,27 +134,6 @@ fn lod_band(render_radius: f32, lod_levels: u8, level: u8) -> (f32, f32) {
     (band_inner, band_outer)
 }
 
-/// True if `key`'s world cube overlaps any AABB in `aabbs`. Used by
-/// the sculpt-pin residency rule to suppress coarse candidates that
-/// would draw over a pinned-fine sculpted region.
-#[inline]
-fn tile_aabb_overlaps_any(key: TileKey, aabbs: &[Aabb]) -> bool {
-    if aabbs.is_empty() {
-        return false;
-    }
-    let origin = key.origin_world().to_vec3();
-    let extent = key.extent_m();
-    let max = origin + Vec3::splat(extent);
-    aabbs.iter().any(|q| {
-        max.x > q.min.x
-            && origin.x < q.max.x
-            && max.y > q.min.y
-            && origin.y < q.max.y
-            && max.z > q.min.z
-            && origin.z < q.max.z
-    })
-}
-
 /// True if a level-0 tile's full 3D cube intersects the query AABB.
 #[inline]
 fn tile_intersects_aabb(key: TileKey, q: &Aabb) -> bool {
@@ -362,6 +341,13 @@ impl TileStreamer {
         self.update_residency_with_pinned(terrain, camera_world, &HashSet::new())
     }
 
+    /// Recompute the desired-tile set against the current camera +
+    /// terrain config, with `dirty_pinned` extending the always-load
+    /// set so sculpted level-0 tiles stay resident at fine LOD even
+    /// past `render_radius_m`. Coarse-LOD ancestors are NOT
+    /// suppressed in V2 LOD pyramid + diff-propagation builds —
+    /// they coexist with the pinned fine tile and render the
+    /// downsampled sculpt via the engine's post-integrate replay.
     pub fn update_residency_with_pinned(
         &mut self,
         terrain: &Terrain,
@@ -382,30 +368,16 @@ impl TileStreamer {
 
         self.submit_scratch.clear();
 
-        // V2 L-pyramid: sculpt-pinned dirty tiles. Sculpted level-0
-        // tiles must stay loaded at fine LOD regardless of distance —
-        // re-baking them at a coarser level would lose the in-RAM
-        // sculpt diff (the bake reads `TerrainFn + stamps`, never the
-        // sculpt diff). Build a list of pinned world AABBs so the
-        // level>=1 emission loop below can suppress any coarse
-        // candidate that overlaps a sculpted region.
-        let pinned_aabbs: Vec<Aabb> = if dirty_pinned.is_empty() {
-            Vec::new()
-        } else {
-            dirty_pinned
-                .iter()
-                .map(|key| {
-                    let origin = key.origin_world().to_vec3();
-                    let max = origin + Vec3::splat(key.extent_m());
-                    Aabb { min: origin, max }
-                })
-                .collect()
-        };
-
-        // Pin emission: every dirty tile materialises unconditionally
-        // with its current camera distance. The band check is bypassed
-        // — sculpted tiles stay loaded at fine LOD even past
-        // `render_radius_m` (which is fine: pinning trumps eviction).
+        // V2 L-pyramid: dirty-tile pin. Sculpted level-0 tiles stay
+        // loaded at fine LOD regardless of distance so the user keeps
+        // seeing their sculpt at brush resolution near the camera even
+        // if the camera briefly drifts past `render_radius_m`. The
+        // bake-replay path (engine's `gather_replay_edits` after
+        // `integrate_baked_tile`) makes eviction itself safe — diffs
+        // live in `TerrainRuntime::diffs`, persistent across the
+        // streamer's tile lifecycle — so the pin is purely a
+        // "keep fine detail visible without a re-bake hiccup" comfort
+        // rule, no longer a correctness requirement.
         for key in dirty_pinned {
             let centre = key.centre_world().to_vec3();
             let d_sq = (centre - camera_vec).length_squared();
@@ -466,20 +438,19 @@ impl TileStreamer {
                         if d_sq > radius_sq {
                             continue;
                         }
-                        // V2 sculpt-pin: suppress coarse candidates
-                        // whose footprint overlaps any pinned dirty
-                        // tile's AABB. The pinned level-0 tiles cover
-                        // that region at fine detail; rendering a
-                        // coarse tile over the same space would
-                        // z-fight and visually wipe the sculpt edits.
-                        //
-                        // Level 0 is never suppressed — same-level
-                        // overlap between a pinned tile and a band-
-                        // selected tile is harmless (they're at the
-                        // same key, the HashMap entry is idempotent).
-                        if level >= 1 && tile_aabb_overlaps_any(key, &pinned_aabbs) {
-                            continue;
-                        }
+                        // V2 sculpt-pin coarse-LOD suppression was
+                        // removed when `SculptDiff` propagation landed:
+                        // the engine's `gather_replay_edits` post-
+                        // integrate hook now downsamples every level-0
+                        // descendant diff into the coarse tile's grid,
+                        // so a coarse ancestor carries the sculpt at
+                        // its resolution. Skipping it would hide the
+                        // sculpt at coarse LOD, which was the prior
+                        // V1 limitation this propagation phase exists
+                        // to close. Where the dirty-tile pin keeps a
+                        // level-0 tile resident in the coarse band,
+                        // both render in overlap — accepted tradeoff
+                        // for the visible coarse-LOD sculpt.
                         let slot = self
                             .tiles
                             .entry(key)
@@ -1222,11 +1193,14 @@ mod tests {
         );
     }
 
-    /// A level-1 tile whose footprint overlaps a pinned level-0 tile is
-    /// SUPPRESSED. The fine pinned tile owns the region; the coarse
-    /// tile would z-fight + wipe the sculpt.
+    /// A level-1 tile whose footprint overlaps a pinned level-0 tile
+    /// **coexists** with the pin under V2 diff propagation. Before
+    /// `SculptDiff` propagation we suppressed the coarse ancestor to
+    /// avoid z-fight; now the engine's post-integrate replay puts the
+    /// downsampled sculpt into the coarse tile too, so we keep it
+    /// loaded and accept the overlap.
     #[test]
-    fn sculpt_pinned_suppresses_overlapping_coarse() {
+    fn sculpt_pinned_does_not_suppress_overlapping_coarse() {
         let mut s = TileStreamer::new(1, 1);
         let mut terrain = small_terrain();
         terrain.bounds = TerrainBounds::Unbounded;
@@ -1244,23 +1218,27 @@ mod tests {
 
         let _ = s.update_residency_with_pinned(&terrain, cam, &pinned);
 
-        // Level-1 tile (2, 0, 0) covers world [256, 384) × [0, 128)² —
-        // overlaps pinned_l0's footprint [256, 320) × [0, 64)² × [0, 64).
-        // Must be suppressed.
-        let suppressed_l1 = TileKey { level: 1, x: 2, y: 0, z: 0 };
+        // The pinned level-0 must be present.
         assert!(
-            !s.tiles.contains_key(&suppressed_l1),
-            "level-1 tile overlapping a pinned level-0 must be suppressed"
+            s.tiles.contains_key(&pinned_l0),
+            "pinned level-0 tile must be present"
         );
 
-        // The pinned level-0 must still be present.
-        assert!(s.tiles.contains_key(&pinned_l0));
+        // Level-1 tile (2, 0, 0) covers world [256, 384) × [0, 128)² —
+        // overlaps pinned_l0's footprint [256, 320) × [0, 64)² × [0, 64).
+        // It must ALSO be present so the engine bakes it and replays
+        // the descendant diff into the coarse grid.
+        let overlap_l1 = TileKey { level: 1, x: 2, y: 0, z: 0 };
+        assert!(
+            s.tiles.contains_key(&overlap_l1),
+            "level-1 tile overlapping a pinned level-0 must coexist \
+             (no suppression — the diff-propagation path renders the \
+             sculpt at coarse LOD too)"
+        );
 
         // A level-1 tile elsewhere (no overlap) is still emitted normally.
         // Tile (-3, 0, 0) covers [-384, -256) on x — no overlap with pinned.
         let unaffected_l1 = TileKey { level: 1, x: -3, y: 0, z: 0 };
-        // Only present if it falls inside render_radius — the centre at
-        // (-320, 64, 64) is at distance ~320 m, in level-1 band.
         assert!(
             s.tiles.contains_key(&unaffected_l1),
             "non-overlapping level-1 tile should still emit"
