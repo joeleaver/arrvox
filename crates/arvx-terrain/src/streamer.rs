@@ -134,6 +134,27 @@ fn lod_band(render_radius: f32, lod_levels: u8, level: u8) -> (f32, f32) {
     (band_inner, band_outer)
 }
 
+/// True if `key`'s world cube overlaps any AABB in `aabbs`. Used by
+/// the sculpt-pin residency rule to suppress coarse candidates that
+/// would draw over a pinned-fine sculpted region.
+#[inline]
+fn tile_aabb_overlaps_any(key: TileKey, aabbs: &[Aabb]) -> bool {
+    if aabbs.is_empty() {
+        return false;
+    }
+    let origin = key.origin_world().to_vec3();
+    let extent = key.extent_m();
+    let max = origin + Vec3::splat(extent);
+    aabbs.iter().any(|q| {
+        max.x > q.min.x
+            && origin.x < q.max.x
+            && max.y > q.min.y
+            && origin.y < q.max.y
+            && max.z > q.min.z
+            && origin.z < q.max.z
+    })
+}
+
 /// True if a level-0 tile's full 3D cube intersects the query AABB.
 #[inline]
 fn tile_intersects_aabb(key: TileKey, q: &Aabb) -> bool {
@@ -330,10 +351,22 @@ impl TileStreamer {
     /// Caller despawns + releases each returned `(key, token)`. The
     /// slot is already removed from the streamer by the time this
     /// returns — no `record_evicted` callback needed.
+    /// Convenience: like [`Self::update_residency_with_pinned`] but
+    /// passes an empty pinned-tile set. Kept for tests + callers that
+    /// don't have a sculpt-dirty set to thread through.
     pub fn update_residency(
         &mut self,
         terrain: &Terrain,
         camera_world: WorldPosition,
+    ) -> Vec<(TileKey, u64)> {
+        self.update_residency_with_pinned(terrain, camera_world, &HashSet::new())
+    }
+
+    pub fn update_residency_with_pinned(
+        &mut self,
+        terrain: &Terrain,
+        camera_world: WorldPosition,
+        dirty_pinned: &HashSet<TileKey>,
     ) -> Vec<(TileKey, u64)> {
         let camera_vec = camera_world.to_vec3();
         let radius = terrain.render_radius_m.max(0.0);
@@ -348,6 +381,40 @@ impl TileStreamer {
         }
 
         self.submit_scratch.clear();
+
+        // V2 L-pyramid: sculpt-pinned dirty tiles. Sculpted level-0
+        // tiles must stay loaded at fine LOD regardless of distance —
+        // re-baking them at a coarser level would lose the in-RAM
+        // sculpt diff (the bake reads `TerrainFn + stamps`, never the
+        // sculpt diff). Build a list of pinned world AABBs so the
+        // level>=1 emission loop below can suppress any coarse
+        // candidate that overlaps a sculpted region.
+        let pinned_aabbs: Vec<Aabb> = if dirty_pinned.is_empty() {
+            Vec::new()
+        } else {
+            dirty_pinned
+                .iter()
+                .map(|key| {
+                    let origin = key.origin_world().to_vec3();
+                    let max = origin + Vec3::splat(key.extent_m());
+                    Aabb { min: origin, max }
+                })
+                .collect()
+        };
+
+        // Pin emission: every dirty tile materialises unconditionally
+        // with its current camera distance. The band check is bypassed
+        // — sculpted tiles stay loaded at fine LOD even past
+        // `render_radius_m` (which is fine: pinning trumps eviction).
+        for key in dirty_pinned {
+            let centre = key.centre_world().to_vec3();
+            let d_sq = (centre - camera_vec).length_squared();
+            let slot = self.tiles.entry(*key).or_insert_with(TileSlot::new);
+            slot.camera_dist_sq = d_sq;
+            if slot.state == TileState::Queued {
+                self.submit_scratch.push((*key, d_sq));
+            }
+        }
 
         // V2 L-pyramid: distance-banded multi-level residency. Each
         // level covers `[band_inner, band_outer)` chosen by geometric
@@ -397,6 +464,20 @@ impl TileStreamer {
                             continue;
                         }
                         if d_sq > radius_sq {
+                            continue;
+                        }
+                        // V2 sculpt-pin: suppress coarse candidates
+                        // whose footprint overlaps any pinned dirty
+                        // tile's AABB. The pinned level-0 tiles cover
+                        // that region at fine detail; rendering a
+                        // coarse tile over the same space would
+                        // z-fight and visually wipe the sculpt edits.
+                        //
+                        // Level 0 is never suppressed — same-level
+                        // overlap between a pinned tile and a band-
+                        // selected tile is harmless (they're at the
+                        // same key, the HashMap entry is idempotent).
+                        if level >= 1 && tile_aabb_overlaps_any(key, &pinned_aabbs) {
                             continue;
                         }
                         let slot = self
@@ -1103,5 +1184,104 @@ mod tests {
         // Bands are contiguous, non-overlapping.
         assert!((hi0 - lo1).abs() < 1e-3, "hi0 must meet lo1");
         assert!((hi1 - lo2).abs() < 1e-3, "hi1 must meet lo2");
+    }
+
+    // ── V2 sculpt-pinned residency ─────────────────────────────────────
+
+    /// A dirty-pinned level-0 tile materialises even when it sits far
+    /// beyond the level-0 band — sculpted regions can't drop to a
+    /// coarser LOD without losing the sculpt diff.
+    #[test]
+    fn sculpt_pinned_dirty_tile_loads_beyond_band() {
+        let mut s = TileStreamer::new(1, 1);
+        let mut terrain = small_terrain();
+        terrain.bounds = TerrainBounds::Unbounded;
+        terrain.render_radius_m = 384.0;
+        terrain.lod_levels = 2;
+        // Tile at (12, 0, 0) sits at world centre (800, 32, 32) —
+        // distance ~800 m from origin, well past `render_radius_m = 384`.
+        let far_pinned = TileKey::level0(12, 0, 0);
+        let mut pinned = HashSet::new();
+        pinned.insert(far_pinned);
+        let cam = WorldPosition::new(IVec3::ZERO, Vec3::ZERO);
+
+        let _ = s.update_residency_with_pinned(&terrain, cam, &pinned);
+
+        assert!(
+            s.tiles.contains_key(&far_pinned),
+            "dirty-pinned tile must materialise regardless of distance"
+        );
+        let slot = &s.tiles[&far_pinned];
+        assert!(
+            slot.camera_dist_sq > terrain.render_radius_m * terrain.render_radius_m,
+            "pinned tile's distance should be past render_radius — confirms pin bypass"
+        );
+    }
+
+    /// A level-1 tile whose footprint overlaps a pinned level-0 tile is
+    /// SUPPRESSED. The fine pinned tile owns the region; the coarse
+    /// tile would z-fight + wipe the sculpt.
+    #[test]
+    fn sculpt_pinned_suppresses_overlapping_coarse() {
+        let mut s = TileStreamer::new(1, 1);
+        let mut terrain = small_terrain();
+        terrain.bounds = TerrainBounds::Unbounded;
+        terrain.render_radius_m = 512.0;
+        terrain.lod_levels = 2;
+        // Pin a level-0 tile that falls inside what would otherwise be
+        // a level-1 band region. Pick a level-0 tile at the +X side
+        // beyond the level-0 band's outer edge.
+        // band_outer(0) at lod_levels=2 = render_radius * 1/3 ≈ 170 m
+        // Tile (4, 0, 0) has centre (288, 32, 32) → ~290 m: in level-1 band.
+        let pinned_l0 = TileKey::level0(4, 0, 0);
+        let mut pinned = HashSet::new();
+        pinned.insert(pinned_l0);
+        let cam = WorldPosition::new(IVec3::ZERO, Vec3::ZERO);
+
+        let _ = s.update_residency_with_pinned(&terrain, cam, &pinned);
+
+        // Level-1 tile (2, 0, 0) covers world [256, 384) × [0, 128)² —
+        // overlaps pinned_l0's footprint [256, 320) × [0, 64)² × [0, 64).
+        // Must be suppressed.
+        let suppressed_l1 = TileKey { level: 1, x: 2, y: 0, z: 0 };
+        assert!(
+            !s.tiles.contains_key(&suppressed_l1),
+            "level-1 tile overlapping a pinned level-0 must be suppressed"
+        );
+
+        // The pinned level-0 must still be present.
+        assert!(s.tiles.contains_key(&pinned_l0));
+
+        // A level-1 tile elsewhere (no overlap) is still emitted normally.
+        // Tile (-3, 0, 0) covers [-384, -256) on x — no overlap with pinned.
+        let unaffected_l1 = TileKey { level: 1, x: -3, y: 0, z: 0 };
+        // Only present if it falls inside render_radius — the centre at
+        // (-320, 64, 64) is at distance ~320 m, in level-1 band.
+        assert!(
+            s.tiles.contains_key(&unaffected_l1),
+            "non-overlapping level-1 tile should still emit"
+        );
+    }
+
+    /// When the pinned set is empty, residency behaves bit-identically
+    /// to the no-pin version (regression guard).
+    #[test]
+    fn empty_pinned_set_matches_unpinned_behavior() {
+        let mut s_pinned = TileStreamer::new(1, 1);
+        let mut s_plain = TileStreamer::new(1, 1);
+        let mut terrain = small_terrain();
+        terrain.bounds = TerrainBounds::Unbounded;
+        terrain.render_radius_m = 256.0;
+        terrain.lod_levels = 2;
+        let cam = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
+
+        let _ = s_pinned.update_residency_with_pinned(&terrain, cam, &HashSet::new());
+        let _ = s_plain.update_residency(&terrain, cam);
+
+        let keys_pinned: std::collections::HashSet<TileKey> =
+            s_pinned.tiles.keys().copied().collect();
+        let keys_plain: std::collections::HashSet<TileKey> =
+            s_plain.tiles.keys().copied().collect();
+        assert_eq!(keys_pinned, keys_plain, "empty pinned set must be a no-op");
     }
 }

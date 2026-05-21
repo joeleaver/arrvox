@@ -111,8 +111,15 @@ impl super::state::EngineState {
             }
         }
 
-        // Phase 2 — residency + eviction.
-        let evictions = runtime.streamer.update_residency(&terrain, camera_world);
+        // Phase 2 — residency + eviction. The dirty-tile set keeps
+        // sculpted level-0 tiles pinned at fine LOD regardless of
+        // distance, suppressing coarse tiles that would otherwise
+        // draw over the sculpted region with procedural geometry.
+        let evictions = runtime.streamer.update_residency_with_pinned(
+            &terrain,
+            camera_world,
+            &runtime.dirty_tiles,
+        );
         let evicted_any = !evictions.is_empty();
         self.evict_terrain_tiles(&mut runtime, &evictions);
 
