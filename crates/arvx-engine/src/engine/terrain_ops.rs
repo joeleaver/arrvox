@@ -486,6 +486,41 @@ impl super::state::EngineState {
             succeeded.len(),
             failed,
         ));
+
+        // V2 LOD pyramid: persist sculpt diffs as `.arvxsculpt`
+        // sidecars. Independent of the `.arvxtile` loop above —
+        // diffs live in `runtime.diffs` and survive tile eviction,
+        // so this loop persists every authored sculpt even for
+        // tiles that already evicted (the case the warning loop
+        // above logs as a known V1 limitation). On scene reload
+        // these diffs feed `runtime.diffs` again via
+        // `load_all_sculpt_diffs`, and the post-integrate replay
+        // hook puts the sculpt back onto fresh procedural bakes.
+        let mut sculpt_saved = 0usize;
+        let mut sculpt_failed = 0usize;
+        let mut sculpt_skipped_empty = 0usize;
+        for (key, diff) in &runtime.diffs {
+            if diff.is_empty() {
+                sculpt_skipped_empty += 1;
+                continue;
+            }
+            match arvx_terrain::save_sculpt_diff(scene_dir, *key, diff) {
+                Ok(_) => sculpt_saved += 1,
+                Err(e) => {
+                    self.console.warn(format!(
+                        "Save sculpt diff ({}, {}, {}, lvl {}) failed: {e}",
+                        key.x, key.y, key.z, key.level,
+                    ));
+                    sculpt_failed += 1;
+                }
+            }
+        }
+        if sculpt_saved + sculpt_failed > 0 {
+            self.console.info(format!(
+                "Terrain: persisted {sculpt_saved} sculpt diff(s) \
+                 ({sculpt_failed} failed, {sculpt_skipped_empty} empty)",
+            ));
+        }
     }
 
     /// Phase 9: invalidate every live terrain tile + the streamer's

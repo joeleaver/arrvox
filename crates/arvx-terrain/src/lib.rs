@@ -21,6 +21,7 @@ pub mod persist;
 pub mod physics_policy;
 pub mod region_snapshot;
 pub mod sculpt_diff;
+pub mod sculpt_diff_persist;
 pub mod stamp;
 pub mod stamp_index;
 pub mod streamer;
@@ -45,6 +46,10 @@ pub use physics_policy::{
 };
 pub use region_snapshot::{TerrainRegionSnapshot, TerrainRegionSnapshotHandle};
 pub use sculpt_diff::SculptDiff;
+pub use sculpt_diff_persist::{
+    load_all_sculpt_diffs, load_sculpt_diff, save_sculpt_diff, sculpt_path,
+    SCULPT_SUBDIR,
+};
 pub use stamp::{combine_heights, CombineOp, FalloffCurve, Stamp, StampKind};
 pub use stamp_index::{StampIndex, StampIndexHandle};
 pub use streamer::{StreamerStats, TileSlot, TileState, TileStreamer};

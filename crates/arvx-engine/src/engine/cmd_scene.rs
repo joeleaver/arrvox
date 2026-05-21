@@ -308,7 +308,23 @@ impl EngineState {
                     .and_then(|p| p.parent())
                     .map(|p| p.to_path_buf())
                 {
-                    runtime.streamer.set_scene_dir(Some(scene_dir));
+                    runtime.streamer.set_scene_dir(Some(scene_dir.clone()));
+                    // V2 LOD pyramid: hydrate the in-RAM diff map from
+                    // any `.arvxsculpt` sidecars saved alongside this
+                    // scene. The post-integrate replay path
+                    // (`gather_replay_edits`) will then re-apply each
+                    // diff onto the first matching bake — restoring
+                    // sculpts that were authored in a previous session
+                    // even when the corresponding `.arvxtile` is
+                    // missing (eviction-before-save case). No-op when
+                    // the `sculpt/` subdirectory doesn't exist.
+                    runtime.diffs = arvx_terrain::load_all_sculpt_diffs(&scene_dir);
+                    if !runtime.diffs.is_empty() {
+                        self.console.info(format!(
+                            "Terrain: loaded {} sculpt diff(s) from disk",
+                            runtime.diffs.len(),
+                        ));
+                    }
                 }
                 self.terrain = Some(runtime);
                 self.console.info(format!(
