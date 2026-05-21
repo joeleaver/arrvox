@@ -443,6 +443,31 @@ impl EngineState {
                     self.next_tree_order = max_loaded + 1.0;
                 }
 
+                // If the loaded scene contains a Terrain singleton,
+                // create its runtime so the streamer actually ticks.
+                // Without this, `tick_terrain_streamer` early-returns
+                // on `self.terrain.is_none()` and the user has to
+                // manually click "+ Terrain" (which the singleton
+                // check then rejects, leaving them stuck). The helper
+                // also hydrates `runtime.diffs` from any
+                // `.arvxsculpt` sidecars saved with this scene so
+                // prior-session sculpts replay onto the fresh bakes.
+                //
+                // Singleton enforced by taking the first match — the
+                // save path writes exactly one Terrain component, and
+                // `SpawnTerrain` rejects a second.
+                if self.terrain.is_none() {
+                    let terrain_entity: Option<hecs::Entity> = self
+                        .world
+                        .query::<&arvx_terrain::Terrain>()
+                        .iter()
+                        .next()
+                        .map(|(e, _)| e);
+                    if let Some(e) = terrain_entity {
+                        self.init_terrain_runtime(e);
+                    }
+                }
+
                 self.scene_dirty.mark_all();
                 self.gpu_objects_dirty.mark_all();
             }

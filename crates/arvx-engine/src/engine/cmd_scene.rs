@@ -293,40 +293,7 @@ impl EngineState {
                 self.assign_entity_uuid(entity);
                 self.scene_dirty.mark_entity(entity);
                 self.selected_entity = Some(entity);
-                let mut runtime = Box::new(
-                    crate::terrain_state::TerrainRuntime::new(entity),
-                );
-                // Phase 4.4: if the scene has a known save path, seed
-                // the streamer's scene_dir so newly-baked tiles
-                // prefer the on-disk `.arvxtile` over `TerrainFn`. A
-                // fresh `SpawnTerrain` on a previously-saved scene
-                // that has terrain tiles on disk will pick them up
-                // automatically.
-                if let Some(scene_dir) = self
-                    .scene_path
-                    .as_ref()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.to_path_buf())
-                {
-                    runtime.streamer.set_scene_dir(Some(scene_dir.clone()));
-                    // V2 LOD pyramid: hydrate the in-RAM diff map from
-                    // any `.arvxsculpt` sidecars saved alongside this
-                    // scene. The post-integrate replay path
-                    // (`gather_replay_edits`) will then re-apply each
-                    // diff onto the first matching bake — restoring
-                    // sculpts that were authored in a previous session
-                    // even when the corresponding `.arvxtile` is
-                    // missing (eviction-before-save case). No-op when
-                    // the `sculpt/` subdirectory doesn't exist.
-                    runtime.diffs = arvx_terrain::load_all_sculpt_diffs(&scene_dir);
-                    if !runtime.diffs.is_empty() {
-                        self.console.info(format!(
-                            "Terrain: loaded {} sculpt diff(s) from disk",
-                            runtime.diffs.len(),
-                        ));
-                    }
-                }
-                self.terrain = Some(runtime);
+                self.init_terrain_runtime(entity);
                 self.console.info(format!(
                     "Spawned '{name}' — streamer running with 2 workers, render radius 192 m"
                 ));

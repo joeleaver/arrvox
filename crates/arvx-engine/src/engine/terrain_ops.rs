@@ -136,6 +136,58 @@ impl super::state::EngineState {
         self.terrain = Some(runtime);
     }
 
+    /// Construct a fresh `TerrainRuntime` for `terrain_entity` and
+    /// install it on `self.terrain`. Seeds the streamer's
+    /// `scene_dir` from `self.scene_path` (so subsequent bakes
+    /// prefer on-disk `.arvxtile` files over re-running `TerrainFn`)
+    /// and hydrates `runtime.diffs` from any `.arvxsculpt` sidecars
+    /// already on disk for this scene.
+    ///
+    /// Two callers:
+    /// 1. The `SpawnTerrain` command, after creating the entity.
+    /// 2. Scene load completion, when the Terrain singleton was
+    ///    restored via the component registry and needs a runtime
+    ///    so the streamer actually ticks. Without this, a saved
+    ///    scene's terrain would silently fail to materialise on
+    ///    reload (the next tick `tick_terrain_streamer` early-
+    ///    returns on `self.terrain.is_none()`).
+    ///
+    /// Idempotent in spirit but NOT in effect — replacing an
+    /// existing runtime would lose in-flight bakes and live tile
+    /// state. Callers are expected to have enforced the singleton
+    /// already (`SpawnTerrain`'s explicit check; scene-load's
+    /// "only on first match" loop).
+    pub(crate) fn init_terrain_runtime(&mut self, terrain_entity: hecs::Entity) {
+        let mut runtime = Box::new(
+            crate::terrain_state::TerrainRuntime::new(terrain_entity),
+        );
+        if let Some(scene_dir) = self
+            .scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+        {
+            runtime.streamer.set_scene_dir(Some(scene_dir.clone()));
+            // V2 LOD pyramid: hydrate the in-RAM diff map from any
+            // `.arvxsculpt` sidecars saved alongside this scene.
+            // The post-integrate replay path
+            // (`gather_replay_edits`) then re-applies each diff
+            // onto the first matching bake — restoring sculpts
+            // authored in a previous session even when the
+            // corresponding `.arvxtile` is missing
+            // (eviction-before-save case). No-op when the
+            // `sculpt/` subdirectory doesn't exist.
+            runtime.diffs = arvx_terrain::load_all_sculpt_diffs(&scene_dir);
+            if !runtime.diffs.is_empty() {
+                self.console.info(format!(
+                    "Terrain: loaded {} sculpt diff(s) from disk",
+                    runtime.diffs.len(),
+                ));
+            }
+        }
+        self.terrain = Some(runtime);
+    }
+
     /// Integrate one finished bake. Returns the per-tile engine
     /// token on success, `None` on failure.
     fn integrate_terrain_tile(
