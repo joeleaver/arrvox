@@ -900,12 +900,20 @@ impl ArvxSceneManager {
 
     /// Iterator over `(AssetHandle, &[MeshVertex], &[u32],
     /// &DirtyRanges, lod0_index_count)` for every loaded asset that
-    /// produced a non-empty surface mesh. The `DirtyRanges` reference
-    /// targets `mesh_indices` byte offsets — the renderer iterates it
-    /// to drive partial IBO uploads when the slab allocator has done
+    /// is mesh-dirty. The `DirtyRanges` reference targets
+    /// `mesh_indices` byte offsets — the renderer iterates it to
+    /// drive partial IBO uploads when the slab allocator has done
     /// interior writes. Phase 6.1: `lod0_index_count` is the LOD-0
     /// prefix of the DAG IBO; the render thread caches it as the
     /// dispatch draw count.
+    ///
+    /// Empty-but-dirty entries are emitted: terrain hot-swap reuses
+    /// released `AssetHandle` slots, and an empty re-bake at a
+    /// previously-occupied slot must signal the renderer to set
+    /// `mesh_buffers[idx] = None`. Without this the stale OLD mesh
+    /// sits at the recycled slot and renders at the NEW entity's
+    /// world position — the "mountain-on-an-empty-tile" visual
+    /// corruption observed when stamping near a hot-swap boundary.
     pub fn iter_loaded_asset_meshes(
         &self,
     ) -> impl Iterator<
@@ -924,7 +932,7 @@ impl ArvxSceneManager {
             .enumerate()
             .filter_map(|(idx, slot)| {
                 let entry = slot.as_ref()?;
-                if entry.mesh_vertices.is_empty() || !entry.mesh_dirty {
+                if !entry.mesh_dirty {
                     return None;
                 }
                 Some((
@@ -939,9 +947,13 @@ impl ArvxSceneManager {
     }
 
     /// Iterator over `(AssetHandle, &[MeshletCluster])` for every
-    /// loaded asset whose surface mesh has clusters (Phase 5). The
-    /// render thread uploads these to a per-asset GPU storage buffer
-    /// once per geometry epoch, parallel to `iter_loaded_asset_meshes`.
+    /// cluster-dirty loaded asset. The render thread uploads these
+    /// to a per-asset GPU storage buffer once per geometry epoch,
+    /// parallel to `iter_loaded_asset_meshes`.
+    ///
+    /// Empty-but-dirty entries are emitted for the same reason as
+    /// the mesh iterator — an empty re-bake at a recycled handle
+    /// must clear `mesh_cluster_buffers[idx]`.
     pub fn iter_loaded_asset_clusters(
         &self,
     ) -> impl Iterator<Item = (AssetHandle, &[crate::mesh_pass::MeshletCluster])> {
@@ -951,7 +963,7 @@ impl ArvxSceneManager {
             .enumerate()
             .filter_map(|(idx, slot)| {
                 let entry = slot.as_ref()?;
-                if entry.meshlet_clusters.is_empty() || !entry.clusters_dirty {
+                if !entry.clusters_dirty {
                     return None;
                 }
                 Some((

@@ -183,22 +183,28 @@ impl TileStreamer {
 
     /// Iterate live tile keys + tokens. Used by the engine to release
     /// every tile when a Terrain is destroyed.
+    ///
+    /// Reports any slot with `integrated_token == Some(_)` — including
+    /// mid-hot-swap slots that have already invalidated but still
+    /// carry resident geometry from the previous bake.
     pub fn iter_live(&self) -> impl Iterator<Item = (TileKey, u64)> + '_ {
-        self.tiles.iter().filter_map(|(k, s)| match s.state {
-            TileState::Live => s.integrated_token.map(|t| (*k, t)),
-            _ => None,
-        })
+        self.tiles
+            .iter()
+            .filter_map(|(k, s)| s.integrated_token.map(|t| (*k, t)))
     }
 
     /// Drain every live tile's `(key, token)` and clear the slot
     /// map. The caller despawns + releases each pair. After this the
     /// streamer is back to its initial empty state.
+    ///
+    /// Emits eviction for any slot with `integrated_token == Some(_)`
+    /// regardless of its state — a slot mid-hot-swap (Queued/Submitted
+    /// with the previous token still set) still has live geometry in
+    /// the scene that needs releasing.
     pub fn drain_all_live(&mut self) -> Vec<(TileKey, u64)> {
         let mut out = Vec::new();
         for (key, slot) in self.tiles.drain() {
-            if let (TileState::Live, Some(token)) =
-                (slot.state, slot.integrated_token)
-            {
+            if let Some(token) = slot.integrated_token {
                 out.push((key, token));
             }
         }
@@ -243,24 +249,44 @@ impl TileStreamer {
     /// Caller reports a successful integrate. Transitions the slot
     /// `Submitted → Live` and stores `token` for later eviction
     /// callback.
-    pub fn record_integrated(&mut self, key: TileKey, token: u64) {
-        if let Some(slot) = self.tiles.get_mut(&key) {
-            slot.state = TileState::Live;
-            slot.integrated_token = Some(token);
-        }
+    ///
+    /// Returns `Some(prev_token)` when this integration is a **hot-swap**
+    /// — i.e. the slot was already Live (with `prev_token`) when an
+    /// invalidation queued a re-bake. The caller despawns / releases
+    /// the previous (entity, asset_handle) pair now that the fresh
+    /// geometry is in place. Returns `None` for first-time integrations.
+    ///
+    /// The collider system is keyed by `TileKey` and already handles
+    /// re-bake during the caller's `on_terrain_tile_added` step, so the
+    /// deferred eviction here MUST NOT also call `on_terrain_tile_evicted`
+    /// — it would drop the just-installed collider.
+    #[must_use = "the returned previous token must be evicted to complete the hot-swap"]
+    pub fn record_integrated(&mut self, key: TileKey, token: u64) -> Option<u64> {
+        let slot = self.tiles.get_mut(&key)?;
+        let prev = slot.integrated_token;
+        slot.state = TileState::Live;
+        slot.integrated_token = Some(token);
+        prev
     }
 
     /// Caller reports an integrate failure (e.g. pool exhaustion).
     /// Transitions the slot to `Failed`.
-    pub fn record_failed(&mut self, key: TileKey) {
-        if let Some(slot) = self.tiles.get_mut(&key) {
-            slot.state = TileState::Failed;
-            slot.integrated_token = None;
-            eprintln!(
-                "[arvx-terrain-streamer] integrate failed for tile ({}, {}, {}, lvl {})",
-                key.x, key.y, key.z, key.level,
-            );
-        }
+    ///
+    /// Returns the previous `integrated_token` (if any) so the caller
+    /// can evict any predecessor that was kept alive for hot-swap.
+    /// Without this the predecessor would orphan: residency eviction
+    /// uses `integrated_token` and we just cleared it.
+    #[must_use = "the returned previous token must be evicted"]
+    pub fn record_failed(&mut self, key: TileKey) -> Option<u64> {
+        let slot = self.tiles.get_mut(&key)?;
+        let prev = slot.integrated_token;
+        slot.state = TileState::Failed;
+        slot.integrated_token = None;
+        eprintln!(
+            "[arvx-terrain-streamer] integrate failed for tile ({}, {}, {}, lvl {})",
+            key.x, key.y, key.z, key.level,
+        );
+        prev
     }
 
     /// Phase 2 of the streamer tick: compute the desired tile set from
@@ -330,9 +356,13 @@ impl TileStreamer {
         let mut evicted: Vec<(TileKey, u64)> = Vec::new();
         for key in self.evict_scratch.drain(..) {
             if let Some(slot) = self.tiles.remove(&key) {
-                if let (TileState::Live, Some(token)) =
-                    (slot.state, slot.integrated_token)
-                {
+                // Emit eviction for any slot that has live geometry
+                // attached — including mid-hot-swap slots whose state
+                // is Queued/Submitted but still carry the previous
+                // `integrated_token`. Without this the old entity +
+                // asset would orphan if the camera moved out of range
+                // during a re-bake window.
+                if let Some(token) = slot.integrated_token {
                     evicted.push((key, token));
                 }
             }
@@ -344,12 +374,21 @@ impl TileStreamer {
     /// intersects `aabb` for re-bake under the current `Terrain` state
     /// (including the latest `terrain.stamps`).
     ///
+    /// **Hot-swap semantics.** Live tiles keep their `integrated_token`
+    /// across invalidation — their geometry stays resident in the
+    /// renderer until the re-bake completes and `record_integrated`
+    /// returns the previous token for deferred eviction. This kills
+    /// the 1–2 s "tile flickers out" window that the synchronous
+    /// eviction model produced when stamps moved.
+    ///
     /// State transitions:
-    /// - **Live** → `Queued` + the slot's `(key, token)` is returned
-    ///   for the caller to despawn. Generation bumped so any later
-    ///   `record_integrated` for the old token is a no-op.
+    /// - **Live** → `Queued`. `integrated_token` is preserved; the old
+    ///   ECS entity + asset handle stay resident. Generation bumped so
+    ///   any in-flight stale result is discarded.
     /// - **Submitted** → `Queued`. Generation bumped so the in-flight
     ///   stale result is discarded by `drain_completed`.
+    ///   `integrated_token` (if any, carried over from a prior hot-swap)
+    ///   stays put so the swap chain doesn't drop intermediate frames.
     /// - **Queued** → unchanged. The pending bake hasn't started; it
     ///   will read the latest stamp set when submitted.
     /// - **Failed** → `Queued`. Stamps may have changed the failure
@@ -358,43 +397,16 @@ impl TileStreamer {
     /// Caller is responsible for updating `terrain.stamps` BEFORE
     /// invoking this so the next `submit_pending` baked job sees the
     /// post-change stamp set.
-    ///
-    /// Returns evictions for the caller's despawn pass — same shape
-    /// as `update_residency` so the engine can reuse its eviction
-    /// path. V1 limitation: there's a one-bake gap between despawn
-    /// and re-integrate; tiles flicker out briefly. Hot-swap (keep
-    /// the live entity until the new bake lands) is a follow-up.
-    /// Evict every Live tile and re-queue it. Used by editor flows
-    /// that change the global terrain source (TerrainFn parameters,
-    /// base tier) — every loaded tile is now stale, so we throw
-    /// everything away and let the streamer rebuild from scratch on
-    /// the next residency tick.
-    ///
-    /// Same return shape as [`Self::invalidate_aabb`] so the engine's
-    /// eviction path is shared.
-    pub fn invalidate_all(&mut self) -> Vec<(TileKey, u64)> {
-        // f32::MAX would overflow into NaN arithmetic for slot AABB
-        // intersection; use a finite but enormous box that comfortably
-        // exceeds any plausible world extent (one billion metres on
-        // each side).
-        let huge = Aabb {
-            min: glam::Vec3::splat(-1.0e9),
-            max: glam::Vec3::splat(1.0e9),
-        };
-        self.invalidate_aabb(huge)
-    }
-
-    pub fn invalidate_aabb(&mut self, aabb: Aabb) -> Vec<(TileKey, u64)> {
-        let mut to_evict: Vec<(TileKey, u64)> = Vec::new();
+    pub fn invalidate_aabb(&mut self, aabb: Aabb) {
         for (key, slot) in self.tiles.iter_mut() {
             if !tile_intersects_aabb(*key, &aabb) {
                 continue;
             }
             match slot.state {
                 TileState::Live => {
-                    if let Some(tok) = slot.integrated_token.take() {
-                        to_evict.push((*key, tok));
-                    }
+                    // Hot-swap: keep `integrated_token`, just queue
+                    // the re-bake. Old geometry stays visible until
+                    // `record_integrated` surfaces the prev token.
                     slot.state = TileState::Queued;
                     slot.requested_generation =
                         slot.requested_generation.wrapping_add(1);
@@ -424,8 +436,23 @@ impl TileStreamer {
                 self.submit_scratch.push((*key, slot.camera_dist_sq));
             }
         }
+    }
 
-        to_evict
+    /// Invalidate every loaded tile. Used by editor flows that change
+    /// the global terrain source (TerrainFn parameters, base tier) —
+    /// every loaded tile is now stale and the streamer must rebuild
+    /// from scratch. Same hot-swap semantics as
+    /// [`Self::invalidate_aabb`].
+    pub fn invalidate_all(&mut self) {
+        // f32::MAX would overflow into NaN arithmetic for slot AABB
+        // intersection; use a finite but enormous box that comfortably
+        // exceeds any plausible world extent (one billion metres on
+        // each side).
+        let huge = Aabb {
+            min: glam::Vec3::splat(-1.0e9),
+            max: glam::Vec3::splat(1.0e9),
+        };
+        self.invalidate_aabb(huge);
     }
 
     /// Phase 3 of the streamer tick: submit fresh bake jobs to the
@@ -572,16 +599,17 @@ mod tests {
         assert!(!evicted.is_empty(), "expected at least one eviction");
     }
 
-    // ── Phase 5.4 — stamp invalidation ────────────────────────────────────
+    // ── Hot-swap invalidation ────────────────────────────────────────────
 
-    /// `invalidate_aabb` evicts Live tiles inside the AABB and bounces
-    /// them to Queued so the next submit_pending re-bakes them.
+    /// `invalidate_aabb` on a Live slot transitions it to Queued but
+    /// keeps `integrated_token` set so the old geometry remains
+    /// resident in the scene until the new bake lands. This is what
+    /// kills the stamp-move flicker.
     #[test]
-    fn invalidate_aabb_evicts_live_tiles_inside_box() {
+    fn invalidate_aabb_keeps_token_for_hot_swap() {
         let mut s = TileStreamer::new(1, 1);
         let terrain = small_terrain();
 
-        // Residency populates the slot map; force each to Live for the test.
         let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
         let _ = s.update_residency(&terrain, camera);
         let mut next_tok: u64 = 100;
@@ -593,49 +621,97 @@ mod tests {
         let live_before = s.stats().live;
         assert!(live_before > 0, "test setup: at least one live tile");
 
-        // Stamp at tile (0, 0, 0) centre — should hit tile 0,0,0 only.
+        // AABB centred on tile (0, 0, 0).
         let aabb = Aabb {
             min: Vec3::new(20.0, 0.0, 20.0),
             max: Vec3::new(40.0, 64.0, 40.0),
         };
-        let evictions = s.invalidate_aabb(aabb);
-        assert!(!evictions.is_empty(), "expected at least one eviction");
-        // Evicted tile keys must all intersect the AABB.
-        for (key, _tok) in &evictions {
-            assert!(tile_intersects_aabb(*key, &aabb), "evicted {key:?} doesn't intersect AABB");
-        }
+        s.invalidate_aabb(aabb);
 
-        // The evicted slots must now be Queued (so the next
-        // submit_pending re-bakes them).
-        let post = s.stats();
-        assert!(post.queued >= evictions.len() as u32);
-        assert!(post.live <= live_before - evictions.len() as u32);
+        // Slots intersecting the AABB are now Queued but still carry
+        // their `integrated_token` — the engine treats them as still
+        // resident in the renderer.
+        let mut queued_with_token = 0u32;
+        for (key, slot) in &s.tiles {
+            if tile_intersects_aabb(*key, &aabb) {
+                assert_eq!(slot.state, TileState::Queued);
+                assert!(
+                    slot.integrated_token.is_some(),
+                    "hot-swap must keep the previous integrated_token"
+                );
+                queued_with_token += 1;
+            }
+        }
+        assert!(queued_with_token > 0, "expected at least one hot-swap slot");
     }
 
-    /// Phase 9: `invalidate_all` evicts every Live tile, regardless
-    /// of its world position. Same as `invalidate_aabb` with a huge
-    /// box but exposes the "kill everything" semantic in one call.
+    /// `record_integrated` returns the previous live token when a
+    /// hot-swap completes — the engine uses this for deferred eviction
+    /// of the prior (entity, asset_handle) pair.
     #[test]
-    fn invalidate_all_evicts_every_live_tile() {
+    fn record_integrated_returns_prev_token_on_hot_swap() {
         let mut s = TileStreamer::new(1, 1);
         let terrain = small_terrain();
         let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
         let _ = s.update_residency(&terrain, camera);
 
-        // Force every slot to Live.
+        // Force one slot Live with a known token, then invalidate + submit + record.
+        let key = *s.tiles.keys().next().unwrap();
+        {
+            let slot = s.tiles.get_mut(&key).unwrap();
+            slot.state = TileState::Live;
+            slot.integrated_token = Some(7);
+        }
+        let aabb = Aabb { min: Vec3::splat(-1000.0), max: Vec3::splat(1000.0) };
+        s.invalidate_aabb(aabb);
+        // Simulate the worker picking up the queued tile.
+        s.tiles.get_mut(&key).unwrap().state = TileState::Submitted;
+
+        // New bake completes — record_integrated must surface the old token.
+        let prev = s.record_integrated(key, 99);
+        assert_eq!(prev, Some(7), "previous token must surface for deferred eviction");
+        let slot = &s.tiles[&key];
+        assert_eq!(slot.state, TileState::Live);
+        assert_eq!(slot.integrated_token, Some(99));
+    }
+
+    /// First-time `record_integrated` (no prior live token) returns `None`.
+    #[test]
+    fn record_integrated_returns_none_on_first_integrate() {
+        let mut s = TileStreamer::new(1, 1);
+        let terrain = small_terrain();
+        let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
+        let _ = s.update_residency(&terrain, camera);
+        let key = *s.tiles.keys().next().unwrap();
+        s.tiles.get_mut(&key).unwrap().state = TileState::Submitted;
+        assert_eq!(s.record_integrated(key, 1), None);
+    }
+
+    /// `invalidate_all` re-queues every loaded tile while preserving
+    /// each slot's `integrated_token` for hot-swap.
+    #[test]
+    fn invalidate_all_keeps_tokens_for_hot_swap() {
+        let mut s = TileStreamer::new(1, 1);
+        let terrain = small_terrain();
+        let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
+        let _ = s.update_residency(&terrain, camera);
+
         let mut next_tok: u64 = 100;
         for slot in s.tiles.values_mut() {
             slot.state = TileState::Live;
             slot.integrated_token = Some(next_tok);
             next_tok += 1;
         }
-        let live_before = s.stats().live;
-        assert!(live_before > 0);
+        let n = s.stats().live;
+        assert!(n > 0);
 
-        let evictions = s.invalidate_all();
-        assert_eq!(evictions.len() as u32, live_before);
+        s.invalidate_all();
         assert_eq!(s.stats().live, 0);
-        assert!(s.stats().queued >= live_before);
+        assert!(s.stats().queued >= n);
+        // Every slot still has its token.
+        for slot in s.tiles.values() {
+            assert!(slot.integrated_token.is_some());
+        }
     }
 
     /// `invalidate_aabb` bumps generation on a Submitted slot so the
@@ -647,7 +723,6 @@ mod tests {
         let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
         let _ = s.update_residency(&terrain, camera);
 
-        // Pick one slot and force it Submitted with a known generation.
         let key = *s.tiles.keys().next().unwrap();
         let g_before;
         {
@@ -657,12 +732,8 @@ mod tests {
             g_before = slot.requested_generation;
         }
 
-        // Invalidate the WHOLE world.
-        let aabb = Aabb {
-            min: Vec3::splat(-1000.0),
-            max: Vec3::splat(1000.0),
-        };
-        let _ = s.invalidate_aabb(aabb);
+        let aabb = Aabb { min: Vec3::splat(-1000.0), max: Vec3::splat(1000.0) };
+        s.invalidate_aabb(aabb);
 
         let slot = s.tiles.get(&key).unwrap();
         assert_eq!(slot.state, TileState::Queued);
@@ -682,11 +753,8 @@ mod tests {
         let key = *s.tiles.keys().next().unwrap();
         let g_before = s.tiles[&key].requested_generation;
 
-        let aabb = Aabb {
-            min: Vec3::splat(-1000.0),
-            max: Vec3::splat(1000.0),
-        };
-        let _ = s.invalidate_aabb(aabb);
+        let aabb = Aabb { min: Vec3::splat(-1000.0), max: Vec3::splat(1000.0) };
+        s.invalidate_aabb(aabb);
 
         let slot = s.tiles.get(&key).unwrap();
         assert_eq!(slot.state, TileState::Queued);
@@ -708,13 +776,46 @@ mod tests {
         }
         let live_before = s.stats().live;
 
-        // AABB far outside the bounded grid (~x = 10000 m).
         let aabb = Aabb {
             min: Vec3::new(10000.0, 0.0, 10000.0),
             max: Vec3::new(10010.0, 64.0, 10010.0),
         };
-        let evictions = s.invalidate_aabb(aabb);
-        assert!(evictions.is_empty(), "no tiles intersect; no evictions");
+        s.invalidate_aabb(aabb);
+        // Slots outside the AABB stay Live with their token.
         assert_eq!(s.stats().live, live_before);
+    }
+
+    /// A residency eviction during a hot-swap window must NOT orphan
+    /// the previous token — even if the slot is Queued/Submitted, the
+    /// engine still has live geometry attached.
+    #[test]
+    fn residency_eviction_during_hot_swap_emits_prev_token() {
+        let mut s = TileStreamer::new(1, 1);
+        let terrain = Terrain {
+            bounds: TerrainBounds::Unbounded,
+            base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
+            spec: crate::TerrainFnSpec::default(),
+            terrain_fn: Arc::new(AllSky),
+            stamps: Arc::new(crate::stamp_index::StampIndex::new()),
+            regions: Arc::new(crate::TerrainRegionSnapshot::new()),
+            render_radius_m: 80.0,
+        };
+
+        let cam_a = WorldPosition::new(IVec3::ZERO, Vec3::ZERO);
+        let _ = s.update_residency(&terrain, cam_a);
+        // Force every slot mid-hot-swap: Queued state, token still set.
+        for slot in s.tiles.values_mut() {
+            slot.state = TileState::Queued;
+            slot.integrated_token = Some(42);
+        }
+
+        // Camera moves far away — every previous slot must evict and
+        // surface its token so the engine releases the old geometry.
+        let cam_b = WorldPosition::new(IVec3::new(500 / 8, 0, 0), Vec3::ZERO);
+        let evicted = s.update_residency(&terrain, cam_b);
+        assert!(
+            evicted.iter().any(|(_, t)| *t == 42),
+            "residency eviction during hot-swap must surface the previous token"
+        );
     }
 }

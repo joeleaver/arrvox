@@ -97,47 +97,11 @@ impl super::state::EngineState {
         }
 
         if let Some(aabb) = invalidate_aabb {
+            // Hot-swap: queue intersecting tiles for re-bake, keep
+            // their resident geometry until each new bake lands.
+            // Deferred eviction happens in `tick_terrain_streamer`.
             let Some(runtime) = self.terrain.as_mut() else { return };
-            let evictions = runtime.streamer.invalidate_aabb(aabb);
-            if !evictions.is_empty() {
-                self.evict_terrain_tiles_for_region_change(&evictions);
-                self.gpu_objects_dirty.mark_all();
-            }
-        }
-    }
-
-    /// Eviction pass shared by the region-invalidation path. Cloned
-    /// from `stamp_ops::evict_terrain_tiles_for_stamp_change`; the
-    /// two could be unified into a generic helper but the duplication
-    /// is small and keeps lifecycle hooks straightforward to follow.
-    fn evict_terrain_tiles_for_region_change(
-        &mut self,
-        evictions: &[(arvx_terrain::TileKey, u64)],
-    ) {
-        let Some(runtime) = self.terrain.as_mut() else { return };
-        let mut to_drop: Vec<(hecs::Entity, arvx_render::AssetHandle)> = Vec::new();
-        for (key, token) in evictions {
-            runtime.tile_keys.remove(key);
-            if let Some(pair) = runtime.live_tiles.remove(token) {
-                to_drop.push(pair);
-            }
-        }
-        for (entity, asset_handle) in to_drop {
-            let _ = self.world.despawn(entity);
-            self.sculpt_overlays.remove(&entity);
-            let mut sm = match self.scene_mgr.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            sm.release_asset(asset_handle);
-        }
-        // Phase 8: drop colliders for each evicted tile while play
-        // mode is active — `on_terrain_tile_added` rebuilds them
-        // when the next bake completes.
-        if let Some(ref mut play) = self.play_state {
-            for (key, _) in evictions {
-                play.on_terrain_tile_evicted(*key);
-            }
+            runtime.streamer.invalidate_aabb(aabb);
         }
     }
 

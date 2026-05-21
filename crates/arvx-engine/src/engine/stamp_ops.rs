@@ -117,86 +117,20 @@ impl super::state::EngineState {
         }
 
         if let Some(aabb) = invalidate_aabb {
-            let debug = std::env::var("ARVX_TERRAIN_DEBUG").is_ok();
-            let pre_world_tile_count = if debug {
-                self.world
-                    .query::<&arvx_terrain::TerrainTile>()
-                    .iter()
-                    .count()
-            } else {
-                0
-            };
+            // Hot-swap: bounce intersecting Live tiles back to Queued,
+            // but keep their `integrated_token` so the old entity +
+            // asset stay resident in the scene. The deferred eviction
+            // in `tick_terrain_streamer`'s integrate path releases the
+            // predecessor pair once the fresh bake lands.
             let Some(runtime) = self.terrain.as_mut() else { return };
-            let evictions = runtime.streamer.invalidate_aabb(aabb);
-            let pre_live = runtime.live_tiles.len();
-            let pre_keys = runtime.tile_keys.len();
-            if debug {
+            runtime.streamer.invalidate_aabb(aabb);
+            if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
                 eprintln!(
                     "[stamp-sync] aabb=({:.1},{:.1},{:.1})..({:.1},{:.1},{:.1}) \
-                     evictions={} pre_live_tiles={} pre_tile_keys={} world_TerrainTile_count={}",
+                     hot-swap queued (no synchronous evict)",
                     aabb.min.x, aabb.min.y, aabb.min.z,
                     aabb.max.x, aabb.max.y, aabb.max.z,
-                    evictions.len(), pre_live, pre_keys, pre_world_tile_count,
                 );
-                for (k, t) in &evictions {
-                    eprintln!(
-                        "[stamp-sync]   evict tile ({},{},{},lvl{}) token={}",
-                        k.x, k.y, k.z, k.level, t,
-                    );
-                }
-            }
-            if !evictions.is_empty() {
-                self.evict_terrain_tiles_for_stamp_change(&evictions);
-                self.gpu_objects_dirty.mark_all();
-            }
-            if debug {
-                let post_world_tile_count = self
-                    .world
-                    .query::<&arvx_terrain::TerrainTile>()
-                    .iter()
-                    .count();
-                eprintln!(
-                    "[stamp-sync] after evict: world_TerrainTile_count={} (was {})",
-                    post_world_tile_count, pre_world_tile_count,
-                );
-            }
-        }
-    }
-
-    /// Eviction pass shared by the stamp-invalidation path. Equivalent
-    /// to the residency eviction in `tick_terrain_streamer` but
-    /// without the surrounding tick.
-    fn evict_terrain_tiles_for_stamp_change(
-        &mut self,
-        evictions: &[(arvx_terrain::TileKey, u64)],
-    ) {
-        let Some(runtime) = self.terrain.as_mut() else { return };
-        // Snapshot the runtime fields we mutate so we can release
-        // the `&mut self.terrain` borrow before touching world / scene_mgr.
-        let mut to_drop: Vec<(hecs::Entity, arvx_render::AssetHandle)> = Vec::new();
-        for (key, token) in evictions {
-            runtime.tile_keys.remove(key);
-            if let Some(pair) = runtime.live_tiles.remove(token) {
-                to_drop.push(pair);
-            }
-        }
-        // Now safe to mutate world + scene_mgr.
-        for (entity, asset_handle) in to_drop {
-            let _ = self.world.despawn(entity);
-            self.sculpt_overlays.remove(&entity);
-            let mut sm = match self.scene_mgr.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            sm.release_asset(asset_handle);
-        }
-        // Phase 8: drop colliders for each evicted tile if play mode
-        // is active. `on_terrain_tile_added` will rebuild on the next
-        // re-bake; wake-on-rebuild fires then, not here (the new
-        // geometry is what matters for bodies, not the disappearance).
-        if let Some(ref mut play) = self.play_state {
-            for (key, _) in evictions {
-                play.on_terrain_tile_evicted(*key);
             }
         }
     }

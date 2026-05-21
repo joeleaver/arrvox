@@ -50,6 +50,36 @@ impl EngineState {
                 if let Some(entity) = self.resolve_entity(&entity_id) {
                     if let Some(entry) = self.registry.get(&component_name) {
                         if let Ok(fv) = serde_json::from_str::<crate::inspector::FieldValue>(&value) {
+                            // Capture pre-edit AABB for terrain-affecting
+                            // components so the post-edit invalidate can
+                            // pass union(old, new). Without this, a stamp
+                            // whose radius SHRINKS leaves stale geometry
+                            // in the (old - new) ring of tiles.
+                            let pre_edit_stamp_aabb = if component_name == "Stamp" {
+                                self.world
+                                    .get::<&arvx_terrain::Stamp>(entity)
+                                    .ok()
+                                    .map(|s| s.aabb())
+                            } else {
+                                None
+                            };
+                            let pre_edit_region_aabb = if component_name == "Region"
+                                || component_name == "BiomeRegion"
+                            {
+                                let region = self
+                                    .world
+                                    .get::<&arvx_regions::Region>(entity)
+                                    .ok()
+                                    .map(|r| *r);
+                                let position = self
+                                    .world
+                                    .get::<&crate::components::Transform>(entity)
+                                    .ok()
+                                    .map(|t| t.position);
+                                region.zip(position).map(|(r, p)| r.world_aabb(p))
+                            } else {
+                                None
+                            };
                             if let Err(e) = (entry.set_field)(&mut self.world, entity, &field_name, fv) {
                                 eprintln!("[ArvxEngine] set_field failed: {e}");
                             } else {
@@ -75,32 +105,37 @@ impl EngineState {
                                 // Phase 5.6: Inspector edits to a stamp's
                                 // amplitude / radius / priority change its
                                 // contribution to the heightmap. Re-sync the
-                                // index + invalidate the stamp's AABB so the
-                                // streamer re-bakes affected tiles. AABB might
-                                // have grown (bigger radius / amplitude), so
-                                // compute it AFTER the set_field write.
+                                // index + invalidate the union of (old, new)
+                                // AABB so a SHRUNK stamp's old-ring tiles
+                                // also re-bake — without this they keep
+                                // stale geometry and the hot-swap path's
+                                // lack of flicker makes the inconsistency
+                                // visible (corrupted-looking tile that's
+                                // really just out-of-date).
                                 if component_name == "Stamp" {
-                                    if let Some(aabb) = self
+                                    let new_aabb = self
                                         .world
                                         .get::<&arvx_terrain::Stamp>(entity)
                                         .ok()
-                                        .map(|s| s.aabb())
-                                    {
+                                        .map(|s| s.aabb());
+                                    let combined = match (pre_edit_stamp_aabb, new_aabb) {
+                                        (Some(o), Some(n)) => Some(arvx_core::Aabb {
+                                            min: o.min.min(n.min),
+                                            max: o.max.max(n.max),
+                                        }),
+                                        (None, Some(n)) | (Some(n), None) => Some(n),
+                                        (None, None) => None,
+                                    };
+                                    if let Some(aabb) = combined {
                                         self.sync_terrain_stamps_and_invalidate(Some(aabb));
                                     }
                                 }
                                 // Phase 7: Inspector edits to a Region's
                                 // shape / falloff / priority OR its
                                 // BiomeRegion's material override change
-                                // what the bake sees. Re-sync + invalidate
-                                // the post-edit AABB (or both old and new
-                                // for Region itself — `maybe_sync_region`
-                                // would need a captured pre-edit AABB; for
-                                // V1 we conservatively invalidate the new
-                                // AABB only; the streamer's
-                                // `invalidate_aabb` is liberal enough that
-                                // a grown region still picks up its
-                                // newly-covered tiles).
+                                // what the bake sees. Invalidate the union
+                                // of (old, new) AABB so a SHRUNK region's
+                                // old-ring tiles also re-bake.
                                 if component_name == "Region" {
                                     let new_aabb = {
                                         let region = self
@@ -115,14 +150,19 @@ impl EngineState {
                                             .map(|t| t.position);
                                         region.zip(position).map(|(r, p)| r.world_aabb(p))
                                     };
-                                    if let Some(aabb) = new_aabb {
+                                    let combined = match (pre_edit_region_aabb, new_aabb) {
+                                        (Some(o), Some(n)) => Some(arvx_core::Aabb {
+                                            min: o.min.min(n.min),
+                                            max: o.max.max(n.max),
+                                        }),
+                                        (None, Some(n)) | (Some(n), None) => Some(n),
+                                        (None, None) => None,
+                                    };
+                                    if let Some(aabb) = combined {
                                         self.sync_terrain_regions_and_invalidate(Some(aabb));
                                     }
                                 }
                                 if component_name == "BiomeRegion" {
-                                    // BiomeRegion has no AABB of its own —
-                                    // its reach is the host Region's. Use
-                                    // that.
                                     let new_aabb = {
                                         let region = self
                                             .world
@@ -136,7 +176,15 @@ impl EngineState {
                                             .map(|t| t.position);
                                         region.zip(position).map(|(r, p)| r.world_aabb(p))
                                     };
-                                    if let Some(aabb) = new_aabb {
+                                    let combined = match (pre_edit_region_aabb, new_aabb) {
+                                        (Some(o), Some(n)) => Some(arvx_core::Aabb {
+                                            min: o.min.min(n.min),
+                                            max: o.max.max(n.max),
+                                        }),
+                                        (None, Some(n)) | (Some(n), None) => Some(n),
+                                        (None, None) => None,
+                                    };
+                                    if let Some(aabb) = combined {
                                         self.sync_terrain_regions_and_invalidate(Some(aabb));
                                     }
                                 }

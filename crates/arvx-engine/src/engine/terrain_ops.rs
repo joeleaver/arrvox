@@ -66,14 +66,48 @@ impl super::state::EngineState {
 
         let camera_world: arvx_core::WorldPosition = self.camera.position.into();
 
-        // Phase 1 — drain completed bakes and integrate each.
+        // Phase 1 — drain completed bakes and integrate each. The
+        // streamer's `record_integrated` returns the *previous* live
+        // token when this integration is a hot-swap (stamp / region /
+        // Inspector edit re-queued an already-live tile). The
+        // deferred eviction releases the old entity / asset *after*
+        // the new one is in place so the renderer never sees a gap.
         let completed = runtime.streamer.drain_completed();
         let integrated_any = !completed.is_empty();
+        let debug_hotswap = std::env::var("ARVX_TERRAIN_DEBUG").is_ok();
         for (key, baked) in completed {
             let token = self.integrate_terrain_tile(&mut runtime, key, baked);
             match token {
-                Some(tok) => runtime.streamer.record_integrated(key, tok),
-                None => runtime.streamer.record_failed(key),
+                Some(tok) => {
+                    let prev = runtime.streamer.record_integrated(key, tok);
+                    if debug_hotswap {
+                        eprintln!(
+                            "[hot-swap] tile ({},{},{},lvl{}) new_token={} prev_token={:?}",
+                            key.x, key.y, key.z, key.level, tok, prev,
+                        );
+                    }
+                    if let Some(prev_tok) = prev {
+                        self.evict_hot_swap_predecessor(&mut runtime, key, prev_tok);
+                    }
+                }
+                None => {
+                    let prev = runtime.streamer.record_failed(key);
+                    if debug_hotswap {
+                        eprintln!(
+                            "[hot-swap] INTEGRATE FAILED tile ({},{},{},lvl{}) prev_token={:?}",
+                            key.x, key.y, key.z, key.level, prev,
+                        );
+                    }
+                    if let Some(prev_tok) = prev {
+                        // Integrate failed but a predecessor was being
+                        // hot-swapped — evict the old pair so it
+                        // doesn't orphan. Use the full
+                        // `evict_terrain_tiles` path (includes
+                        // `on_terrain_tile_evicted`) since no fresh
+                        // collider replaced it.
+                        self.evict_terrain_tiles(&mut runtime, &[(key, prev_tok)]);
+                    }
+                }
             }
         }
 
@@ -221,21 +255,24 @@ impl super::state::EngineState {
                 runtime.divergent_tiles.insert(key);
             }
         }
-        // DIAGNOSTIC — Phase 5 stamp bug hunt: if tile_keys already
-        // has an entry for this key, the old entity got orphaned
-        // (still in the ECS world, no longer tracked → never
-        // despawned). Log so we can confirm.
-        if let Some((prev_entity, prev_handle)) =
-            runtime.tile_keys.insert(key, (entity, asset_handle))
-        {
-            if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
-                eprintln!(
-                    "[integrate] WARN tile ({},{},{},lvl{}) was already \
-                     in tile_keys — prev entity={:?} prev_handle={:?} \
-                     (orphaned; old mesh stays in scene)",
-                    key.x, key.y, key.z, key.level, prev_entity, prev_handle,
-                );
-            }
+        // Hot-swap: `tile_keys` may already hold a (prev_entity,
+        // prev_handle) pair from the pre-rebake integration. The
+        // insert overwrites it with the fresh pair; the deferred
+        // eviction in `evict_hot_swap_predecessor` will release the
+        // old pair (sourced from `live_tiles` via `record_integrated`'s
+        // returned previous token). The replaced value here is the
+        // same pair but resolved key-side — discarded as we already
+        // own the eviction via the token path.
+        let prev_pair = runtime.tile_keys.insert(key, (entity, asset_handle));
+        if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
+            eprintln!(
+                "[integrate] tile ({},{},{},lvl{}) new=(entity={:?}, handle={}) prev={:?} \
+                 root_offset={} voxels={}",
+                key.x, key.y, key.z, key.level,
+                entity, asset_handle.raw(),
+                prev_pair.map(|(e, h)| (e, h.raw())),
+                root_offset, info.voxel_count,
+            );
         }
         // Silence "unused import" if EditorMetadata isn't used here.
         let _ = std::any::type_name::<EditorMetadata>();
@@ -346,41 +383,18 @@ impl super::state::EngineState {
     /// Phase 9: invalidate every live terrain tile + the streamer's
     /// view. Used after Terrain Inspector edits change the world's
     /// procedural source — every loaded tile is stale and needs to
-    /// be re-baked under the new parameters. The streamer
-    /// republishes them on the next residency tick.
+    /// be re-baked under the new parameters.
+    ///
+    /// Hot-swap: the existing tile geometry stays resident in the
+    /// scene until each new bake completes; the deferred eviction
+    /// inside `tick_terrain_streamer`'s integrate path releases the
+    /// old (entity, asset) pair once the fresh tile is in place. No
+    /// "tiles flicker out" window.
     pub(crate) fn invalidate_all_terrain_tiles(&mut self) {
         let Some(runtime) = self.terrain.as_mut() else {
             return;
         };
-        let evictions = runtime.streamer.invalidate_all();
-        if evictions.is_empty() {
-            return;
-        }
-        // Process evictions through the shared collider-aware path.
-        // The streamer already bumped its slot states; we just need
-        // to drop the live entity / asset / collider for each one.
-        let mut to_drop: Vec<(arvx_terrain::TileKey, hecs::Entity, arvx_render::AssetHandle)> =
-            Vec::new();
-        for (key, token) in &evictions {
-            runtime.tile_keys.remove(key);
-            if let Some((entity, asset_handle)) = runtime.live_tiles.remove(token) {
-                to_drop.push((*key, entity, asset_handle));
-            }
-        }
-        for (key, entity, asset_handle) in to_drop {
-            let _ = self.world.despawn(entity);
-            self.sculpt_overlays.remove(&entity);
-            let mut sm = match self.scene_mgr.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            sm.release_asset(asset_handle);
-            drop(sm);
-            if let Some(ref mut play) = self.play_state {
-                play.on_terrain_tile_evicted(key);
-            }
-        }
-        self.gpu_objects_dirty.mark_all();
+        runtime.streamer.invalidate_all();
     }
 
     /// Phase 9b: revert sculpt edits inside `aabb`. Two steps:
@@ -424,49 +438,39 @@ impl super::state::EngineState {
             }
         }
 
-        // Step 2 — invalidate every live tile inside the AABB. Reuses
-        // the collider-aware eviction path from `invalidate_all_terrain_tiles`.
-        let evictions = {
+        // Step 2 — invalidate every live tile inside the AABB. Hot-swap:
+        // existing geometry stays resident until each fresh bake lands;
+        // the deferred eviction in `tick_terrain_streamer` releases the
+        // previous (entity, asset) pair after the new tile is in place.
+        // We still clear `dirty_tiles` + `divergent_tiles` immediately so
+        // the heatmap drops the reverted region in the same frame.
+        let invalidated: usize = {
             let runtime = self.terrain.as_mut().unwrap();
-            runtime.streamer.invalidate_aabb(aabb)
+            let intersecting: Vec<arvx_terrain::TileKey> = runtime
+                .tile_keys
+                .keys()
+                .copied()
+                .filter(|k| {
+                    let origin = k.origin_world().to_vec3();
+                    let extent = k.extent_m();
+                    let max = origin + glam::Vec3::splat(extent);
+                    aabb.max.x >= origin.x
+                        && aabb.min.x <= max.x
+                        && aabb.max.y >= origin.y
+                        && aabb.min.y <= max.y
+                        && aabb.max.z >= origin.z
+                        && aabb.min.z <= max.z
+                })
+                .collect();
+            for key in &intersecting {
+                runtime.dirty_tiles.remove(key);
+                runtime.divergent_tiles.remove(key);
+            }
+            runtime.streamer.invalidate_aabb(aabb);
+            intersecting.len()
         };
-        if !evictions.is_empty() {
-            let mut to_drop: Vec<(arvx_terrain::TileKey, hecs::Entity, arvx_render::AssetHandle)> =
-                Vec::new();
-            {
-                let runtime = self.terrain.as_mut().unwrap();
-                for (key, token) in &evictions {
-                    runtime.tile_keys.remove(key);
-                    if let Some((entity, asset_handle)) = runtime.live_tiles.remove(token) {
-                        to_drop.push((*key, entity, asset_handle));
-                    }
-                    runtime.dirty_tiles.remove(key);
-                    // Phase 9b: revert wipes the edit history for
-                    // this tile, so it drops out of the heatmap.
-                    // (The next bake will run the procedural baseline
-                    // since we deleted the `.arvxtile` above.)
-                    runtime.divergent_tiles.remove(key);
-                }
-            }
-            for (key, entity, asset_handle) in to_drop {
-                let _ = self.world.despawn(entity);
-                self.sculpt_overlays.remove(&entity);
-                let mut sm = match self.scene_mgr.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                sm.release_asset(asset_handle);
-                drop(sm);
-                if let Some(ref mut play) = self.play_state {
-                    play.on_terrain_tile_evicted(key);
-                }
-            }
-            self.gpu_objects_dirty.mark_all();
-        }
         self.console.info(format!(
-            "Terrain: reverted {} live tile(s), deleted {} .arvxtile file(s)",
-            evictions.len(),
-            deleted,
+            "Terrain: reverted {invalidated} live tile(s), deleted {deleted} .arvxtile file(s)",
         ));
     }
 
@@ -739,6 +743,47 @@ impl super::state::EngineState {
             min: glam::Vec3::new(cp.x - r, y_lo, cp.z - r),
             max: glam::Vec3::new(cp.x + r, y_hi, cp.z + r),
         }
+    }
+
+    /// Hot-swap deferred eviction: drop the previous (entity, asset)
+    /// pair for `key` now that the fresh integration is in place.
+    /// Used only on the hot-swap path — the `on_terrain_tile_added`
+    /// step during the fresh integrate already replaced the
+    /// `TileKey`-keyed collider, so we MUST NOT call
+    /// `on_terrain_tile_evicted` here (that would drop the
+    /// just-installed new collider).
+    ///
+    /// `runtime.tile_keys[key]` was already overwritten with the new
+    /// pair during integrate, so we drive the lookup off `prev_token`
+    /// via `runtime.live_tiles` instead.
+    fn evict_hot_swap_predecessor(
+        &mut self,
+        runtime: &mut TerrainRuntime,
+        key: arvx_terrain::TileKey,
+        prev_token: u64,
+    ) {
+        let Some((prev_entity, prev_handle)) = runtime.live_tiles.remove(&prev_token)
+        else {
+            return;
+        };
+        let _ = self.world.despawn(prev_entity);
+        self.sculpt_overlays.remove(&prev_entity);
+        let mut sm = match self.scene_mgr.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        sm.release_asset(prev_handle);
+        drop(sm);
+        if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
+            eprintln!(
+                "[hot-swap] tile ({},{},{},lvl{}) replaced prev entity={:?} \
+                 handle={:?} (new entity already wired)",
+                key.x, key.y, key.z, key.level, prev_entity, prev_handle,
+            );
+        }
+        // Deliberate: no `on_terrain_tile_evicted(key)` here — the
+        // fresh integrate's `on_terrain_tile_added(key)` already
+        // replaced the collider for this `TileKey`.
     }
 
     /// Despawn + release_asset for every `(key, token)` pair.
