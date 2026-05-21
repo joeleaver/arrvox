@@ -390,11 +390,19 @@ impl super::state::EngineState {
     /// inside `tick_terrain_streamer`'s integrate path releases the
     /// old (entity, asset) pair once the fresh tile is in place. No
     /// "tiles flicker out" window.
+    ///
+    /// Sculpt preservation: dirty tiles are excluded — Inspector edits
+    /// to TerrainFn don't drop authored sculpts. User must Revert a
+    /// tile to re-apply the procedural baseline. See
+    /// `stamp_ops::sync_terrain_stamps_and_invalidate` for the full
+    /// rationale.
     pub(crate) fn invalidate_all_terrain_tiles(&mut self) {
         let Some(runtime) = self.terrain.as_mut() else {
             return;
         };
-        runtime.streamer.invalidate_all();
+        runtime
+            .streamer
+            .invalidate_all_excluding(&runtime.dirty_tiles);
     }
 
     /// Phase 9b: revert sculpt edits inside `aabb`. Two steps:

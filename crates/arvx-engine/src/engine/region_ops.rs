@@ -100,8 +100,15 @@ impl super::state::EngineState {
             // Hot-swap: queue intersecting tiles for re-bake, keep
             // their resident geometry until each new bake lands.
             // Deferred eviction happens in `tick_terrain_streamer`.
+            //
+            // Sculpt preservation: dirty tiles are excluded so the
+            // worker's re-bake doesn't drop in-RAM sculpt edits. See
+            // `stamp_ops::sync_terrain_stamps_and_invalidate` for the
+            // full rationale; same design applies here.
             let Some(runtime) = self.terrain.as_mut() else { return };
-            runtime.streamer.invalidate_aabb(aabb);
+            runtime
+                .streamer
+                .invalidate_aabb_excluding(aabb, &runtime.dirty_tiles);
         }
     }
 

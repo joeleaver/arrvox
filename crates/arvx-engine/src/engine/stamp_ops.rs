@@ -122,12 +122,24 @@ impl super::state::EngineState {
             // asset stay resident in the scene. The deferred eviction
             // in `tick_terrain_streamer`'s integrate path releases the
             // predecessor pair once the fresh bake lands.
+            //
+            // Sculpt preservation: dirty tiles (in-RAM sculpt edits not
+            // yet persisted to .arvxtile) are excluded from invalidation.
+            // Re-baking them would drop the sculpt since the worker
+            // bakes from `TerrainFn + stamps` (or the saved disk file),
+            // neither of which carry the live sculpt diff. The tile
+            // stays frozen at the sculpted state until the user
+            // explicitly Reverts. Matches the Phase 4.3 edit-overlay
+            // design in `docs/TERRAIN.md`.
             let Some(runtime) = self.terrain.as_mut() else { return };
-            runtime.streamer.invalidate_aabb(aabb);
+            let dirty_count = runtime.dirty_tiles.len();
+            runtime
+                .streamer
+                .invalidate_aabb_excluding(aabb, &runtime.dirty_tiles);
             if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
                 eprintln!(
                     "[stamp-sync] aabb=({:.1},{:.1},{:.1})..({:.1},{:.1},{:.1}) \
-                     hot-swap queued (no synchronous evict)",
+                     hot-swap queued (no synchronous evict), excluded {dirty_count} dirty tiles",
                     aabb.min.x, aabb.min.y, aabb.min.z,
                     aabb.max.x, aabb.max.y, aabb.max.z,
                 );

@@ -28,7 +28,7 @@
 //! sparse-octree variant lands when V2 introduces `level > 0` and
 //! the per-tile mix justifies the indirection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arvx_core::{Aabb, WorldPosition};
@@ -398,8 +398,32 @@ impl TileStreamer {
     /// invoking this so the next `submit_pending` baked job sees the
     /// post-change stamp set.
     pub fn invalidate_aabb(&mut self, aabb: Aabb) {
+        self.invalidate_aabb_excluding(aabb, &HashSet::new());
+    }
+
+    /// Same as [`Self::invalidate_aabb`] but tiles whose `TileKey` is
+    /// in `exclude` are left alone.
+    ///
+    /// **Why exclude.** Sculpt edits live in the in-RAM `AssetEntry`'s
+    /// octree, not on disk (until the user saves the scene). Re-baking
+    /// a sculpted tile in response to a stamp / region / Inspector
+    /// change would drop the sculpt — the new bake reads from
+    /// `TerrainFn + stamps` (or the saved `.arvxtile` from the LAST
+    /// save), neither of which carry the in-RAM sculpt diff. The
+    /// engine passes its `dirty_tiles` set here so sculpted tiles
+    /// stay frozen at their authored state until the user explicitly
+    /// Reverts them. Matches the `docs/TERRAIN.md` Phase 4.3 edit-
+    /// persistence design ("Full baked tile when edited").
+    pub fn invalidate_aabb_excluding(
+        &mut self,
+        aabb: Aabb,
+        exclude: &HashSet<TileKey>,
+    ) {
         for (key, slot) in self.tiles.iter_mut() {
             if !tile_intersects_aabb(*key, &aabb) {
+                continue;
+            }
+            if exclude.contains(key) {
                 continue;
             }
             match slot.state {
@@ -444,6 +468,13 @@ impl TileStreamer {
     /// from scratch. Same hot-swap semantics as
     /// [`Self::invalidate_aabb`].
     pub fn invalidate_all(&mut self) {
+        self.invalidate_all_excluding(&HashSet::new());
+    }
+
+    /// Same as [`Self::invalidate_all`] but tiles in `exclude` are
+    /// left alone. See [`Self::invalidate_aabb_excluding`] for the
+    /// rationale.
+    pub fn invalidate_all_excluding(&mut self, exclude: &HashSet<TileKey>) {
         // f32::MAX would overflow into NaN arithmetic for slot AABB
         // intersection; use a finite but enormous box that comfortably
         // exceeds any plausible world extent (one billion metres on
@@ -452,7 +483,7 @@ impl TileStreamer {
             min: glam::Vec3::splat(-1.0e9),
             max: glam::Vec3::splat(1.0e9),
         };
-        self.invalidate_aabb(huge);
+        self.invalidate_aabb_excluding(huge, exclude);
     }
 
     /// Phase 3 of the streamer tick: submit fresh bake jobs to the
@@ -817,5 +848,91 @@ mod tests {
             evicted.iter().any(|(_, t)| *t == 42),
             "residency eviction during hot-swap must surface the previous token"
         );
+    }
+
+    /// `invalidate_aabb_excluding` must NOT change state on excluded
+    /// keys. Sculpt-dirty tiles are excluded so the engine's
+    /// stamp/region/Inspector invalidations don't drop in-RAM sculpt
+    /// edits.
+    #[test]
+    fn invalidate_aabb_excluding_skips_listed_keys() {
+        let mut s = TileStreamer::new(1, 1);
+        let terrain = small_terrain();
+        let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
+        let _ = s.update_residency(&terrain, camera);
+
+        // Force every slot Live with a known token.
+        let mut tok: u64 = 100;
+        for slot in s.tiles.values_mut() {
+            slot.state = TileState::Live;
+            slot.integrated_token = Some(tok);
+            tok += 1;
+        }
+        // Pick one key as the "sculpt-dirty" tile.
+        let excluded_key = *s.tiles.keys().next().unwrap();
+        let excluded_token = s.tiles[&excluded_key].integrated_token;
+        let mut exclude = HashSet::new();
+        exclude.insert(excluded_key);
+
+        // Invalidate a giant AABB covering every slot.
+        let aabb = Aabb { min: Vec3::splat(-1e6), max: Vec3::splat(1e6) };
+        s.invalidate_aabb_excluding(aabb, &exclude);
+
+        // The excluded slot must remain Live with its token intact.
+        let excluded_slot = &s.tiles[&excluded_key];
+        assert_eq!(
+            excluded_slot.state,
+            TileState::Live,
+            "excluded key must stay Live"
+        );
+        assert_eq!(
+            excluded_slot.integrated_token, excluded_token,
+            "excluded key must keep its integrated_token unchanged"
+        );
+
+        // Every other slot must transition to Queued (hot-swap with
+        // token preserved).
+        for (key, slot) in &s.tiles {
+            if *key == excluded_key {
+                continue;
+            }
+            assert_eq!(slot.state, TileState::Queued, "non-excluded key {key:?} should be Queued");
+            assert!(slot.integrated_token.is_some(), "non-excluded key keeps token for hot-swap");
+        }
+    }
+
+    /// `invalidate_all_excluding` mirrors `invalidate_aabb_excluding`
+    /// but covers every tile in the streamer regardless of AABB.
+    #[test]
+    fn invalidate_all_excluding_skips_listed_keys() {
+        let mut s = TileStreamer::new(1, 1);
+        let terrain = small_terrain();
+        let camera = WorldPosition::new(IVec3::ZERO, Vec3::new(32.0, 32.0, 32.0));
+        let _ = s.update_residency(&terrain, camera);
+
+        let mut tok: u64 = 200;
+        for slot in s.tiles.values_mut() {
+            slot.state = TileState::Live;
+            slot.integrated_token = Some(tok);
+            tok += 1;
+        }
+        let excluded_keys: Vec<TileKey> = s.tiles.keys().take(2).copied().collect();
+        let exclude: HashSet<TileKey> = excluded_keys.iter().copied().collect();
+
+        s.invalidate_all_excluding(&exclude);
+
+        for key in &excluded_keys {
+            assert_eq!(
+                s.tiles[key].state,
+                TileState::Live,
+                "excluded key {key:?} must stay Live under invalidate_all_excluding"
+            );
+        }
+        for (key, slot) in &s.tiles {
+            if exclude.contains(key) {
+                continue;
+            }
+            assert_eq!(slot.state, TileState::Queued);
+        }
     }
 }
