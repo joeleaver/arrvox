@@ -18,7 +18,13 @@ use std::collections::HashSet;
 use glam::{IVec3, UVec3, Vec3};
 
 use arvx_core::brick_pool::{BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
-use arvx_core::mesh_extract::{extract_surface_mesh_haloed, CELL_INTERIOR};
+use arvx_core::mesh_cluster::{
+    MeshletCluster, CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE, PARENT_GROUP_ERROR_ROOT,
+};
+use arvx_core::mesh_extract::{
+    collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
+    extract_surface_mesh_haloed, CELL_INTERIOR,
+};
 use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sparse_octree::{brick_id, is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE};
 use arvx_core::LeafAttr;
@@ -80,7 +86,15 @@ impl ArvxSceneManager {
 
         let changed = self.refresh_halo_face(op.target, op.target_face, op.source)?;
         if changed > 0 {
-            self.rebuild_asset_mesh_haloed(op.target);
+            // Phase 4.2b — slab path by default. Env-gated fallback
+            // routes through the full-tile re-extract for sanity
+            // comparison and as a safety valve if the slab path
+            // produces a visual regression in the field.
+            if std::env::var("ARVX_TERRAIN_HALO_FULL_REEXTRACT").is_ok() {
+                self.rebuild_asset_mesh_haloed(op.target);
+            } else {
+                self.rebuild_face_band_clusters(op.target, op.target_face);
+            }
             // Mesh changed → bump the geometry epoch so render-side
             // caches (skinning_data cache, asset_has_glass cache,
             // painted-walk snapshot) invalidate on the next tick.
@@ -350,6 +364,347 @@ impl ArvxSceneManager {
         Some(new_slot)
     }
 
+    /// Phase 4.2b — slab-only re-extract on halo refresh.
+    ///
+    /// Replaces `rebuild_asset_mesh_haloed`'s full-tile re-extract
+    /// (hundreds of ms on a Tier-2 tile) with a face-band slab
+    /// re-extract that mirrors the sculpt V2 per-cluster patch pattern
+    /// in [`super::sculpt::ArvxSceneManager::rebuild_dirty_clusters`].
+    ///
+    /// Steps:
+    /// 1. Query the cluster spatial index for LOD-0 clusters whose grid
+    ///    AABB overlaps the face-band slab (cube-coord AABB).
+    /// 2. Rayon-parallel filter each cluster's tris — drop any tri with
+    ///    a vertex inside the slab obj-local AABB. In-place rewrite the
+    ///    kept indices at the cluster's existing `index_offset`; return
+    ///    the unused tail to the slab allocator via `free_index_range`.
+    /// 3. Re-extract the slab region via [`collect_cell_map_in_region`]
+    ///    + [`extract_mesh_region_from_cells_pooled_haloed`] — the same
+    ///    pipeline the sculpt V2 patch uses, scoped to the slab's
+    ///    cell range.
+    /// 4. Append the extracted verts + indices as a single LOD-0 patch
+    ///    cluster (`CLUSTER_FLAG_LOD_DIRTY`, `DAG_GROUP_NONE`) and
+    ///    insert it into the cluster spatial index.
+    /// 5. CC-walk LOD_DIRTY marking via
+    ///    [`super::sculpt::mark_lod_dirty_chains`] over the slab AABB
+    ///    so the shader's LOD selector drops LOD>0 ancestors at the
+    ///    face band and admits the new patch unconditionally.
+    ///
+    /// **What the slab covers.** The halo refresh updates cells at the
+    /// face band (e.g. `coord.x ∈ [S, S+halo)` for `target_face = PX`).
+    /// SN cubes whose corners include any of these cells have changed
+    /// vertex positions: `cube.x = S-1` (one interior corner + one halo
+    /// corner) and `cube.x = S` (both halo corners — only emitted in
+    /// the initial bake via halo-cell iteration, not in our slab
+    /// re-extract).
+    ///
+    /// **Filter slab** (cube-coord vertex bounds, used for the per-tri
+    /// drop test): `cube.x ∈ [S-3, S+1)` for `PX`, accounting for
+    /// (a) all cube positions the slab extract emits (cube.x ∈ {S-3,
+    /// S-2, S-1} from interior cells in the pad range), plus (b) halo
+    /// cubes (cube.x = S) that the initial bake produced but the slab
+    /// won't re-emit. Kept-cluster tris with all 3 verts strictly
+    /// outside the AABB stay; the rest are dropped and the slab
+    /// extract's emission fills in.
+    ///
+    /// **Extract region** (cell coords, narrower than the filter):
+    /// `cell.x ∈ [S-1, S+1)` for `PX`. The extractor's automatic +1
+    /// pad expands to `[S-2, S+2)`, so interior solid cells at
+    /// `C.x ∈ {S-2, S-1}` iterate and contribute the changed cube
+    /// vertices.
+    ///
+    /// **Seam coverage at cube.x = S.** Initial-bake halo emissions
+    /// (cube.x = S, generated from `halo_cells` iterating in
+    /// `extract_surface_mesh_haloed`) are filtered out and NOT
+    /// re-emitted here. Sufficient seam coverage remains from the
+    /// neighbour (source) tile's own emissions at the shared boundary.
+    /// Trade-off accepted for V1 — see
+    /// `project_terrain_phase4_session_endpoint` for the 4.2b followup
+    /// this implements.
+    fn rebuild_face_band_clusters(&mut self, handle: AssetHandle, target_face: u8) {
+        let t0 = std::time::Instant::now();
+
+        // Resolve asset geometry config + slab corners.
+        let (
+            depth,
+            base_vs,
+            grid_origin,
+            extract_lo,
+            extract_hi,
+            filter_lo,
+            filter_hi,
+            slab_aabb_min_obj,
+            slab_aabb_max_obj,
+        ) = {
+            let Some(entry) = self.asset_cache.get(handle) else { return };
+            if entry.meshlet_clusters.is_empty() {
+                return;
+            }
+            let depth = entry.spatial_handle.depth;
+            let base_vs = entry.spatial_handle.base_voxel_size;
+            let extent_f = (1u32 << depth) as f32 * base_vs;
+            let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+            let grid_origin = aabb_center - Vec3::splat(extent_f * 0.5);
+
+            let s = 1i32 << depth;
+            let (extract_lo, extract_hi, filter_lo, filter_hi) =
+                slab_grid_for_face(target_face, s);
+
+            // Obj-local AABB for the per-vertex filter test. filter_lo /
+            // filter_hi are in cube coords; a vertex from SN cube `C`
+            // has position in `[C, C+1) * vs + grid_origin`, so the
+            // inclusive AABB `[filter_lo * vs + grid_origin,
+            // filter_hi * vs + grid_origin]` catches every vertex
+            // whose source cube is in the cube range `[filter_lo,
+            // filter_hi)`.
+            let slab_min = grid_origin + filter_lo.as_vec3() * base_vs;
+            let slab_max = grid_origin + filter_hi.as_vec3() * base_vs;
+
+            (
+                depth, base_vs, grid_origin, extract_lo, extract_hi,
+                filter_lo, filter_hi, slab_min, slab_max,
+            )
+        };
+
+        // Phase 1: query LOD-0 clusters overlapping the slab.
+        let dirty = self.clusters_in_brush_grid_aabb(handle, filter_lo, filter_hi);
+
+        // Phase 2: rayon-parallel per-tri filter on dirty clusters.
+        // Drops tris with any vertex inside the slab AABB; kept tris
+        // get rewritten in-place at the cluster's existing slot.
+        let results: Vec<(u32, Vec<u32>)> = if dirty.is_empty() {
+            Vec::new()
+        } else {
+            use rayon::prelude::*;
+            let Some(entry) = self.asset_cache.get(handle) else { return };
+            let clusters = &entry.meshlet_clusters;
+            let indices = &entry.mesh_indices;
+            let verts = &entry.mesh_vertices;
+            dirty
+                .par_iter()
+                .filter_map(|&cid| {
+                    let c = &clusters[cid as usize];
+                    let start = c.index_offset as usize;
+                    let count = c.index_count as usize;
+                    // Cluster-AABB rejection: skip clusters whose AABB
+                    // is fully outside the slab AABB. Mirrors the
+                    // sphere-AABB rejection in sculpt's V2 patch.
+                    let cluster_aabb_min = Vec3::from(c.aabb_min);
+                    let cluster_aabb_max = Vec3::from(c.aabb_max);
+                    if cluster_aabb_max.x < slab_aabb_min_obj.x
+                        || cluster_aabb_min.x > slab_aabb_max_obj.x
+                        || cluster_aabb_max.y < slab_aabb_min_obj.y
+                        || cluster_aabb_min.y > slab_aabb_max_obj.y
+                        || cluster_aabb_max.z < slab_aabb_min_obj.z
+                        || cluster_aabb_min.z > slab_aabb_max_obj.z
+                    {
+                        return None;
+                    }
+
+                    let inside = |p: Vec3| -> bool {
+                        p.x >= slab_aabb_min_obj.x
+                            && p.x <= slab_aabb_max_obj.x
+                            && p.y >= slab_aabb_min_obj.y
+                            && p.y <= slab_aabb_max_obj.y
+                            && p.z >= slab_aabb_min_obj.z
+                            && p.z <= slab_aabb_max_obj.z
+                    };
+
+                    let mut out = Vec::with_capacity(count);
+                    for tri_start in (start..start + count).step_by(3) {
+                        let i0 = indices[tri_start];
+                        let i1 = indices[tri_start + 1];
+                        let i2 = indices[tri_start + 2];
+                        let p0 = Vec3::from(verts[i0 as usize].local_pos);
+                        let p1 = Vec3::from(verts[i1 as usize].local_pos);
+                        let p2 = Vec3::from(verts[i2 as usize].local_pos);
+                        if !inside(p0) && !inside(p1) && !inside(p2) {
+                            out.push(i0);
+                            out.push(i1);
+                            out.push(i2);
+                        }
+                    }
+                    Some((cid, out))
+                })
+                .collect()
+        };
+
+        // Phase 3: sequential merge — write each cluster's kept indices
+        // back in-place at its original slot, return the freed tail to
+        // the slab allocator.
+        let mut total_dropped_tris = 0usize;
+        let mut total_kept_tris = 0usize;
+        {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return };
+            for (cid, kept) in &results {
+                let cluster = &entry.meshlet_clusters[*cid as usize];
+                let old_offset = cluster.index_offset;
+                let old_count = cluster.index_count;
+                let new_count = kept.len() as u32;
+                total_kept_tris += (new_count as usize) / 3;
+                total_dropped_tris += ((old_count - new_count) as usize) / 3;
+                if new_count > 0 {
+                    entry.mesh_indices_write_at(old_offset, kept);
+                }
+                if new_count < old_count {
+                    entry.free_index_range(old_offset + new_count, old_count - new_count);
+                }
+                entry.meshlet_clusters[*cid as usize].index_count = new_count;
+            }
+        }
+
+        // Phase 4: re-extract slab region.
+        let (slab_verts, slab_indices, cells_count) = {
+            let Some(entry) = self.asset_cache.get(handle) else { return };
+            // Pad collect by +3 each side so the extractor's pad gets
+            // boundary cells for 8-corner classification (mirrors
+            // sculpt.rs's `cells_min = brush_lo - IVec3::splat(3)`).
+            let cells_lo = extract_lo - IVec3::splat(3);
+            let cells_hi = extract_hi + IVec3::splat(3);
+            let cells = collect_cell_map_in_region(
+                entry.cpu_octree.as_slice(),
+                depth,
+                self.brick_pool.as_slice(),
+                cells_lo,
+                cells_hi,
+            );
+            let cells_count = cells.len();
+            let (verts, indices) = extract_mesh_region_from_cells_pooled_haloed(
+                &mut self.sculpt_extract_scratch,
+                &cells,
+                extract_lo,
+                extract_hi,
+                entry.cpu_octree.as_slice(),
+                depth,
+                base_vs,
+                grid_origin,
+                self.brick_pool.as_slice(),
+                self.leaf_attr_pool.as_slice(),
+                self.leaf_attr_pool.bones_as_slice(),
+                &entry.halo_cells,
+                Some(&entry.sculpt_owned_slots),
+            );
+            (verts, indices, cells_count)
+        };
+
+        // Phase 5: append slab as a fresh LOD-0 patch cluster.
+        let patch_indices_count = slab_indices.len();
+        let patch_verts_count = slab_verts.len();
+        if !slab_verts.is_empty() {
+            let mut patch_min = [f32::INFINITY; 3];
+            let mut patch_max = [f32::NEG_INFINITY; 3];
+            for v in &slab_verts {
+                for k in 0..3 {
+                    if v.local_pos[k] < patch_min[k] {
+                        patch_min[k] = v.local_pos[k];
+                    }
+                    if v.local_pos[k] > patch_max[k] {
+                        patch_max[k] = v.local_pos[k];
+                    }
+                }
+            }
+
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return };
+            let vertex_offset = entry.mesh_vertices.len() as u32;
+            let append_start_bytes = (vertex_offset as usize
+                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
+                as u32;
+            entry.mesh_vertices.extend_from_slice(&slab_verts);
+            let append_len_bytes = (slab_verts.len()
+                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
+                as u32;
+            if append_len_bytes > 0 {
+                entry
+                    .mesh_vertices_dirty
+                    .mark(append_start_bytes, append_len_bytes);
+            }
+
+            let patch_index_count = slab_indices.len() as u32;
+            let new_index_offset = if patch_index_count > 0 {
+                let offset = entry.alloc_index_range(patch_index_count);
+                let rebased: Vec<u32> = slab_indices
+                    .iter()
+                    .map(|&i| i + vertex_offset)
+                    .collect();
+                entry.mesh_indices_write_at(offset, &rebased);
+                offset
+            } else {
+                0
+            };
+
+            let patch_cluster = MeshletCluster {
+                aabb_min: patch_min,
+                _pad0: 0.0,
+                aabb_max: patch_max,
+                index_offset: new_index_offset,
+                index_count: patch_index_count,
+                lod_level: 0,
+                // Born dirty — the patch is outside the bake-time DAG
+                // so the LOD selector's Karis admit has nothing to
+                // project against. Force unconditional admit.
+                flags: CLUSTER_FLAG_LOD_DIRTY,
+                cluster_error: 0.0,
+                parent_group_error: PARENT_GROUP_ERROR_ROOT,
+                // Standalone — no DAG chain. CC walks from
+                // brush-touched LOD-0 clusters don't traverse through
+                // it, which is correct.
+                group_above_idx: DAG_GROUP_NONE,
+                group_below_idx: DAG_GROUP_NONE,
+                _pad3: 0,
+            };
+            let patch_cluster_id = entry.meshlet_clusters.len() as u32;
+            entry.meshlet_clusters.push(patch_cluster);
+            entry.cluster_spatial_index.insert(
+                patch_cluster_id,
+                &patch_cluster,
+                grid_origin,
+                base_vs,
+            );
+        }
+
+        // Phase 6: CC-walk LOD_DIRTY marking over slab AABB. Forces
+        // the LOD selector to drop dirty ancestors and admit dirty
+        // LOD-0 leaves in the chains the slab touches; without it,
+        // coarse LOD>0 clusters at the boundary would render with
+        // stale (pre-refresh) vertex positions.
+        let _walk_visited = if !dirty.is_empty() {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return };
+            super::sculpt::mark_lod_dirty_chains(
+                entry,
+                &dirty,
+                slab_aabb_min_obj,
+                slab_aabb_max_obj,
+            )
+        } else {
+            0
+        };
+
+        // Phase 7: bookkeeping flags. `bump_geometry_epoch` happens
+        // at the `apply_halo_refresh` call site, mirroring the
+        // sculpt path.
+        if let Some(entry) = self.asset_cache.get_mut(handle) {
+            entry.mesh_dirty = true;
+            entry.clusters_dirty = true;
+        }
+
+        if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
+            eprintln!(
+                "[halo-refresh] band re-extract handle={:?} face={} \
+                 dirty_clusters={} cells={} kept_tris={} dropped_tris={} \
+                 slab_verts={} slab_indices={} ({:.2}ms)",
+                handle,
+                target_face,
+                dirty.len(),
+                cells_count,
+                total_kept_tris,
+                total_dropped_tris,
+                patch_verts_count,
+                patch_indices_count,
+                t0.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+    }
+
     /// Full-asset re-extract using the asset's `halo_cells` for the
     /// haloed mesh-extract path. Mirrors `rebuild_asset_mesh` but
     /// uses `extract_surface_mesh_haloed` with halo width 2.
@@ -447,6 +802,75 @@ impl ArvxSceneManager {
                 t0.elapsed().as_secs_f64() * 1000.0,
             );
         }
+    }
+}
+
+/// Compute the slab corners for a face-band re-extract.
+///
+/// Returns `(extract_lo, extract_hi, filter_lo, filter_hi)`:
+///
+/// - `extract_lo, extract_hi` — half-open cell-coord region for
+///   [`extract_mesh_region_from_cells_pooled_haloed`]'s `region_min /
+///   region_max` args. Two cells deep along the face-axis (e.g.
+///   `cell.x ∈ [S-1, S+1)` for `PX`), full `[0, S)` perpendicular.
+///   The extractor's automatic +1 pad expands to 4 cells deep, but
+///   only the interior cells (`{S-2, S-1}` for PX, `{0, 1}` for NX)
+///   actually contribute since halo cells aren't in the cell map
+///   that `collect_cell_map_in_region` produces.
+///
+/// - `filter_lo, filter_hi` — cube-coord AABB for the per-vertex
+///   filter test. Wider than the extract region by one cube on each
+///   side along the face-axis: it covers (a) every cube the slab
+///   extract may emit and (b) the halo cubes that the initial bake
+///   emitted from halo-cell iteration but the slab re-extract won't
+///   re-emit. For PX, this is `cube.x ∈ [S-3, S+1)`; for NX,
+///   `cube.x ∈ [-2, 2)`. Perpendicular axes span `[-1, S+1)` to catch
+///   Y/Z cubes at the boundary.
+fn slab_grid_for_face(face: u8, s: i32) -> (IVec3, IVec3, IVec3, IVec3) {
+    // Perpendicular-axis range — same regardless of which face. SN
+    // cubes at the perpendicular boundaries have one corner at the
+    // tile interior and one in the inner halo ring, so the filter
+    // extends one cube beyond `[0, S)` on each side.
+    let perp_lo = -1;
+    let perp_hi = s + 1;
+    match face {
+        FACE_PX => (
+            IVec3::new(s - 1, 0, 0),
+            IVec3::new(s + 1, s, s),
+            IVec3::new(s - 3, perp_lo, perp_lo),
+            IVec3::new(s + 1, perp_hi, perp_hi),
+        ),
+        FACE_NX => (
+            IVec3::new(-1, 0, 0),
+            IVec3::new(1, s, s),
+            IVec3::new(-2, perp_lo, perp_lo),
+            IVec3::new(2, perp_hi, perp_hi),
+        ),
+        FACE_PY => (
+            IVec3::new(0, s - 1, 0),
+            IVec3::new(s, s + 1, s),
+            IVec3::new(perp_lo, s - 3, perp_lo),
+            IVec3::new(perp_hi, s + 1, perp_hi),
+        ),
+        FACE_NY => (
+            IVec3::new(0, -1, 0),
+            IVec3::new(s, 1, s),
+            IVec3::new(perp_lo, -2, perp_lo),
+            IVec3::new(perp_hi, 2, perp_hi),
+        ),
+        FACE_PZ => (
+            IVec3::new(0, 0, s - 1),
+            IVec3::new(s, s, s + 1),
+            IVec3::new(perp_lo, perp_lo, s - 3),
+            IVec3::new(perp_hi, perp_hi, s + 1),
+        ),
+        FACE_NZ => (
+            IVec3::new(0, 0, -1),
+            IVec3::new(s, s, 1),
+            IVec3::new(perp_lo, perp_lo, -2),
+            IVec3::new(perp_hi, perp_hi, 2),
+        ),
+        _ => (IVec3::ZERO, IVec3::ZERO, IVec3::ZERO, IVec3::ZERO),
     }
 }
 
@@ -564,4 +988,215 @@ fn octant_for_coord(coord: IVec3, level: u8, depth: u8) -> u32 {
 #[allow(dead_code)]
 fn _suppress_uvec3_unused() {
     let _ = UVec3::ZERO;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// For a tile of side `s = 16`, each face's slab corners must
+    /// match the spec in the rustdoc on [`slab_grid_for_face`].
+    #[test]
+    fn slab_grid_for_face_each_axis() {
+        let s: i32 = 16;
+        let perp_lo = -1;
+        let perp_hi = s + 1;
+
+        // PX
+        let (ex_lo, ex_hi, fl_lo, fl_hi) = slab_grid_for_face(FACE_PX, s);
+        assert_eq!(ex_lo, IVec3::new(s - 1, 0, 0));
+        assert_eq!(ex_hi, IVec3::new(s + 1, s, s));
+        assert_eq!(fl_lo, IVec3::new(s - 3, perp_lo, perp_lo));
+        assert_eq!(fl_hi, IVec3::new(s + 1, perp_hi, perp_hi));
+
+        // NX
+        let (ex_lo, ex_hi, fl_lo, fl_hi) = slab_grid_for_face(FACE_NX, s);
+        assert_eq!(ex_lo, IVec3::new(-1, 0, 0));
+        assert_eq!(ex_hi, IVec3::new(1, s, s));
+        assert_eq!(fl_lo, IVec3::new(-2, perp_lo, perp_lo));
+        assert_eq!(fl_hi, IVec3::new(2, perp_hi, perp_hi));
+
+        // PY
+        let (ex_lo, ex_hi, fl_lo, fl_hi) = slab_grid_for_face(FACE_PY, s);
+        assert_eq!(ex_lo, IVec3::new(0, s - 1, 0));
+        assert_eq!(ex_hi, IVec3::new(s, s + 1, s));
+        assert_eq!(fl_lo, IVec3::new(perp_lo, s - 3, perp_lo));
+        assert_eq!(fl_hi, IVec3::new(perp_hi, s + 1, perp_hi));
+
+        // NY
+        let (ex_lo, ex_hi, fl_lo, fl_hi) = slab_grid_for_face(FACE_NY, s);
+        assert_eq!(ex_lo, IVec3::new(0, -1, 0));
+        assert_eq!(ex_hi, IVec3::new(s, 1, s));
+        assert_eq!(fl_lo, IVec3::new(perp_lo, -2, perp_lo));
+        assert_eq!(fl_hi, IVec3::new(perp_hi, 2, perp_hi));
+
+        // PZ
+        let (ex_lo, ex_hi, fl_lo, fl_hi) = slab_grid_for_face(FACE_PZ, s);
+        assert_eq!(ex_lo, IVec3::new(0, 0, s - 1));
+        assert_eq!(ex_hi, IVec3::new(s, s, s + 1));
+        assert_eq!(fl_lo, IVec3::new(perp_lo, perp_lo, s - 3));
+        assert_eq!(fl_hi, IVec3::new(perp_hi, perp_hi, s + 1));
+
+        // NZ
+        let (ex_lo, ex_hi, fl_lo, fl_hi) = slab_grid_for_face(FACE_NZ, s);
+        assert_eq!(ex_lo, IVec3::new(0, 0, -1));
+        assert_eq!(ex_hi, IVec3::new(s, s, 1));
+        assert_eq!(fl_lo, IVec3::new(perp_lo, perp_lo, -2));
+        assert_eq!(fl_hi, IVec3::new(perp_hi, perp_hi, 2));
+    }
+
+    /// Filter slab strictly contains the extract region along the
+    /// face axis on both sides, and is exactly 4 cubes wide along
+    /// that axis — covering every cube position the slab extract may
+    /// emit (3 cubes wide, from the pad-expanded solid cells) plus
+    /// one initial-bake halo cube that the slab won't re-emit.
+    #[test]
+    fn slab_filter_strictly_contains_extract_on_face_axis() {
+        let s: i32 = 16;
+        for face in [
+            FACE_PX, FACE_NX, FACE_PY, FACE_NY, FACE_PZ, FACE_NZ,
+        ] {
+            let (ex_lo, ex_hi, fl_lo, fl_hi) = slab_grid_for_face(face, s);
+            let axis = match face {
+                FACE_PX | FACE_NX => 0usize,
+                FACE_PY | FACE_NY => 1,
+                _ => 2,
+            };
+            assert!(
+                fl_lo[axis] <= ex_lo[axis],
+                "filter lo must extend at-or-below extract lo on face axis (face {face})"
+            );
+            assert!(
+                fl_hi[axis] >= ex_hi[axis],
+                "filter hi must extend at-or-above extract hi on face axis (face {face})"
+            );
+            // Filter is strictly wider on the face axis (at least one
+            // direction must extend further than extract).
+            let lo_extend = ex_lo[axis] - fl_lo[axis];
+            let hi_extend = fl_hi[axis] - ex_hi[axis];
+            assert!(
+                lo_extend > 0 || hi_extend > 0,
+                "filter must extend beyond extract on at least one side (face {face})"
+            );
+            // Exactly 4 cubes wide.
+            assert_eq!(
+                fl_hi[axis] - fl_lo[axis],
+                4,
+                "filter slab must be 4 cubes wide on the face axis (face {face})"
+            );
+        }
+    }
+
+    /// A vertex from SN cube at `cube.x = C` has obj-local position in
+    /// `[(C * vs + grid_origin.x), ((C + 1) * vs + grid_origin.x)]`.
+    /// The filter slab AABB built from `(filter_lo, filter_hi)` in
+    /// cube coords (translated to obj-local floats via
+    /// `* vs + grid_origin`) must contain every vertex whose source
+    /// cube falls in `[filter_lo, filter_hi)` and exclude every
+    /// vertex outside that range.
+    #[test]
+    fn filter_slab_aabb_covers_intended_cubes() {
+        let s: i32 = 16;
+        let vs: f32 = 1.0;
+        let grid_origin = Vec3::ZERO;
+
+        let (_ex_lo, _ex_hi, fl_lo, fl_hi) = slab_grid_for_face(FACE_PX, s);
+        let slab_min = grid_origin + fl_lo.as_vec3() * vs;
+        let slab_max = grid_origin + fl_hi.as_vec3() * vs;
+
+        // A vertex from cube.x = S-3 with position at the cube's lower
+        // edge (= cube.x * vs) is inside the filter slab.
+        let v = Vec3::new((s - 3) as f32 * vs, 0.0, 0.0);
+        assert!(
+            v.x >= slab_min.x && v.x <= slab_max.x,
+            "vertex from cube.x = S-3 must be inside filter slab"
+        );
+
+        // A vertex from cube.x = S-4 (outside the filter range) sits
+        // at vertex.x ∈ [(S-4) * vs, (S-3) * vs]. The upper end is the
+        // boundary; the lower end is strictly outside.
+        let v = Vec3::new((s - 4) as f32 * vs, 0.0, 0.0);
+        assert!(
+            v.x < slab_min.x,
+            "vertex from cube.x = S-4 at cube lo must be strictly outside filter slab"
+        );
+
+        // A vertex from cube.x = S has position in [S * vs, (S+1) * vs].
+        // Both ends are inside the filter slab.
+        let v = Vec3::new(s as f32 * vs, 0.0, 0.0);
+        assert!(v.x >= slab_min.x && v.x <= slab_max.x);
+        let v = Vec3::new((s + 1) as f32 * vs, 0.0, 0.0);
+        assert!(
+            v.x <= slab_max.x,
+            "vertex from cube.x = S at cube hi must be at the filter slab's upper boundary"
+        );
+
+        // A vertex from cube.x = S+1 (halo cube outside iteration range)
+        // is strictly outside the filter slab.
+        let v = Vec3::new((s + 2) as f32 * vs, 0.0, 0.0);
+        assert!(v.x > slab_max.x);
+    }
+
+    /// Bail-out paths must not panic on empty asset state.
+    #[test]
+    fn rebuild_face_band_clusters_bails_on_empty_clusters() {
+        use crate::arvx_scene_manager::manager::ArvxSceneManager;
+        use crate::arvx_scene_manager::types::AssetEntry;
+        use arvx_core::sparse_octree::SparseOctree;
+        use arvx_core::{Aabb, OctreeHandle};
+
+        let mut sm = ArvxSceneManager::new(16);
+        let depth: u8 = 4;
+        let base_vs: f32 = 1.0;
+        let extent = (1u32 << depth) as f32 * base_vs;
+        let entry = AssetEntry {
+            path: std::path::PathBuf::from("test:empty-tile"),
+            refcount: 1,
+            spatial_handle: OctreeHandle {
+                root_offset: 0,
+                len: 0,
+                depth,
+                base_voxel_size: base_vs,
+            },
+            voxel_size: base_vs,
+            aabb: Aabb {
+                min: Vec3::ZERO,
+                max: Vec3::splat(extent),
+            },
+            voxel_count: 0,
+            leaf_attr_slot_start: 0,
+            leaf_attr_slot_count: 0,
+            brick_start: 0,
+            brick_count: 0,
+            skinning: None,
+            mesh_vertices: Vec::new(),
+            mesh_indices: Vec::new(),
+            mesh_indices_free_list: Vec::new(),
+            mesh_indices_next_free: 0,
+            mesh_indices_dirty: arvx_core::DirtyRanges::new(),
+            mesh_vertices_dirty: arvx_core::DirtyRanges::new(),
+            mesh_lod0_index_count: 0,
+            bake_time_cluster_count: 0,
+            meshlet_clusters: Vec::new(),
+            dag_groups: Vec::new(),
+            dag_consumed: Vec::new(),
+            dag_produced: Vec::new(),
+            cpu_octree: SparseOctree::new(depth, base_vs),
+            sculpt_extra_slots: std::collections::HashSet::new(),
+            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
+            halo_extra_slots: std::collections::HashSet::new(),
+            halo_cells: Vec::new(),
+            mesh_dirty: false,
+            clusters_dirty: false,
+            cluster_spatial_index:
+                crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
+        };
+        let handle = sm.asset_cache.insert(entry);
+
+        // Should be a no-op: no clusters to filter, no panic.
+        sm.rebuild_face_band_clusters(handle, FACE_PX);
+        let entry = sm.asset_cache.get(handle).expect("entry should still exist");
+        assert!(entry.meshlet_clusters.is_empty());
+        assert!(!entry.mesh_dirty, "no-op refresh should leave mesh_dirty unset");
+    }
 }

@@ -120,7 +120,7 @@ fn local_aabb_intersects(
 /// topology (`dag_groups.is_empty()`), preserving v5-load behavior.
 ///
 /// Returns the number of clusters newly flagged dirty.
-fn mark_lod_dirty_chains(
+pub(super) fn mark_lod_dirty_chains(
     entry: &mut super::types::AssetEntry,
     seeds: &[u32],
     brush_aabb_min: Vec3,
