@@ -81,12 +81,26 @@ const TILE_HALO_VOXELS: u32 = 2;
 /// (Mountain → rock above the slope threshold) and should defer to
 /// the broader biome wash. Authors who want a stamp to punch through
 /// a biome do so by stacking a higher-priority biome on the stamp.
+/// Convenience: same as [`bake_tile_with_skirts`] with skirts
+/// disabled (`skirt_depth_m = 0.0`). Kept for tests + persist
+/// roundtrip code that don't care about skirts.
 pub fn bake_tile(
     key: TileKey,
     voxel_size_m: f32,
     terrain_fn: &dyn TerrainFn,
     stamps: &[Stamp],
     regions: &TerrainRegionSnapshot,
+) -> Option<BakedTile> {
+    bake_tile_with_skirts(key, voxel_size_m, terrain_fn, stamps, regions, 0.0)
+}
+
+pub fn bake_tile_with_skirts(
+    key: TileKey,
+    voxel_size_m: f32,
+    terrain_fn: &dyn TerrainFn,
+    stamps: &[Stamp],
+    regions: &TerrainRegionSnapshot,
+    skirt_depth_m: f32,
 ) -> Option<BakedTile> {
     let t0 = std::time::Instant::now();
 
@@ -162,7 +176,7 @@ pub fn bake_tile(
     // it as `brick_id * BRICK_CELLS + flat`.
     let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
 
-    let mesh = build_mesh_sections_blob_haloed(
+    let mut mesh = build_mesh_sections_blob_haloed(
         artifact.octree.as_slice(),
         artifact.octree.depth(),
         voxel_size_m,
@@ -174,6 +188,17 @@ pub fn bake_tile(
         TILE_HALO_VOXELS,
     );
 
+    // V2 LOD pyramid: append lateral skirts so LOD-band cracks aren't
+    // see-through. Per-vertex vertical strips; adjacent strips overlap
+    // visually into a curtain when viewed horizontally. `0.0` disables.
+    append_lateral_skirts(
+        &mut mesh,
+        tile_origin_world,
+        extent,
+        voxel_size_m,
+        skirt_depth_m,
+    );
+
     Some(BakedTile {
         key,
         voxel_size_m,
@@ -181,6 +206,175 @@ pub fn bake_tile(
         mesh,
         bake_time_ms: t0.elapsed().as_secs_f32() * 1000.0,
     })
+}
+
+/// Append lateral-tile-boundary skirts to `mesh`.
+///
+/// V2 LOD pyramid follow-up: at LOD-band boundaries adjacent tiles
+/// use different voxel sizes, producing surface vertices at slightly
+/// different heights at the shared edge. Cameras see through the gap
+/// as a thin sky-coloured slit. Skirts mask the slit by emitting a
+/// thin vertical strip dropping `skirt_depth_m` below each
+/// boundary-surface vertex. Adjacent strips overlap into a visually
+/// continuous curtain when viewed from horizontal angles.
+///
+/// Per-vertex strips (not edge-stitched) are a deliberate V1
+/// simplification: cheaper to implement, robust to non-manifold
+/// surface meshes, and adjacent strips are ≈ voxel_size apart so the
+/// overlap closes the visual gap. Trade-off: from directly above the
+/// boundary, the strips contribute no horizontal extent (they're
+/// vertical). Acceptable for a Y-up world where players rarely look
+/// straight down at a tile seam.
+///
+/// `skirt_depth_m <= 0` or an empty mesh is a no-op.
+fn append_lateral_skirts(
+    mesh: &mut arvx_core::asset_file::MeshSectionsBlob,
+    tile_origin_world: Vec3,
+    tile_extent_m: f32,
+    voxel_size_m: f32,
+    skirt_depth_m: f32,
+) {
+    use arvx_core::mesh_cluster::{
+        MeshletCluster, CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE, PARENT_GROUP_ERROR_ROOT,
+    };
+    use arvx_core::mesh_extract::MeshVertex;
+
+    if skirt_depth_m <= 0.0 || mesh.vertices.is_empty() {
+        return;
+    }
+
+    let verts: &[MeshVertex] = bytemuck::cast_slice(&mesh.vertices);
+    if verts.is_empty() {
+        return;
+    }
+
+    // Boundary plane positions (object-local = world for terrain).
+    let x_min = tile_origin_world.x;
+    let x_max = tile_origin_world.x + tile_extent_m;
+    let z_min = tile_origin_world.z;
+    let z_max = tile_origin_world.z + tile_extent_m;
+
+    // A vertex is "on the boundary" if it's within half a voxel of the
+    // plane — the SN cube vertex centres land on cell-edge midpoints
+    // which can be slightly inside the tile.
+    let eps = voxel_size_m * 0.5;
+    // Each per-vertex strip is voxel_size wide so adjacent strips meet.
+    let half_w = voxel_size_m * 0.5;
+
+    let pre_vertex_count = verts.len() as u32;
+    let pre_index_count = (mesh.indices.len() / std::mem::size_of::<u32>()) as u32;
+
+    let mut new_verts: Vec<MeshVertex> = Vec::new();
+    let mut new_indices: Vec<u32> = Vec::new();
+    let mut patch_min = [f32::INFINITY; 3];
+    let mut patch_max = [f32::NEG_INFINITY; 3];
+
+    let update_aabb = |min: &mut [f32; 3], max: &mut [f32; 3], p: [f32; 3]| {
+        for k in 0..3 {
+            if p[k] < min[k] {
+                min[k] = p[k];
+            }
+            if p[k] > max[k] {
+                max[k] = p[k];
+            }
+        }
+    };
+
+    // Per-face skirt: emit a 4-vertex / 2-triangle strip facing
+    // outward. CCW winding from the outward POV: TL, BL, BR / TL, BR, TR.
+    let mut emit_strip =
+        |pos: [f32; 3], normal_oct: u32, leaf_attr_id: u32, tangent: [f32; 3]| {
+            let p = pos;
+            let tl = [p[0] - tangent[0] * half_w, p[1], p[2] - tangent[2] * half_w];
+            let tr = [p[0] + tangent[0] * half_w, p[1], p[2] + tangent[2] * half_w];
+            let bl = [tl[0], tl[1] - skirt_depth_m, tl[2]];
+            let br = [tr[0], tr[1] - skirt_depth_m, tr[2]];
+
+            let base = pre_vertex_count + new_verts.len() as u32;
+
+            // All 4 skirt verts inherit the source vertex's attrs so
+            // the resolve pass picks the same material / normal at
+            // shading time. The strip's geometric normal is horizontal
+            // outward, but normal_oct stays equal to the source for
+            // visual continuity with the surface above.
+            for p in [tl, tr, bl, br] {
+                new_verts.push(MeshVertex {
+                    local_pos: p,
+                    normal_oct,
+                    leaf_attr_id,
+                    bone_indices: 0,
+                    bone_weights: 0,
+                    _pad: 0,
+                });
+                update_aabb(&mut patch_min, &mut patch_max, p);
+            }
+            // tl=0, tr=1, bl=2, br=3. CCW from outward POV: TL→BL→BR, TL→BR→TR.
+            new_indices.extend_from_slice(&[
+                base, base + 2, base + 3,
+                base, base + 3, base + 1,
+            ]);
+        };
+
+    for v in verts {
+        let p = v.local_pos;
+        let on_x_min = (p[0] - x_min).abs() < eps;
+        let on_x_max = (p[0] - x_max).abs() < eps;
+        let on_z_min = (p[2] - z_min).abs() < eps;
+        let on_z_max = (p[2] - z_max).abs() < eps;
+
+        // A corner vertex may be on TWO boundaries — emit one strip per
+        // side. Adjacent overlap is intentional (covers the gap).
+        if on_x_max {
+            // Outward +X, tangent +Z (cross(+X, +Y)).
+            emit_strip(p, v.normal_oct, v.leaf_attr_id, [0.0, 0.0, 1.0]);
+        }
+        if on_x_min {
+            // Outward -X, tangent -Z.
+            emit_strip(p, v.normal_oct, v.leaf_attr_id, [0.0, 0.0, -1.0]);
+        }
+        if on_z_max {
+            // Outward +Z, tangent -X (cross(+Z, +Y) = -X).
+            emit_strip(p, v.normal_oct, v.leaf_attr_id, [-1.0, 0.0, 0.0]);
+        }
+        if on_z_min {
+            // Outward -Z, tangent +X.
+            emit_strip(p, v.normal_oct, v.leaf_attr_id, [1.0, 0.0, 0.0]);
+        }
+    }
+
+    if new_verts.is_empty() {
+        return;
+    }
+
+    // Append vertex + index bytes.
+    mesh.vertices
+        .extend_from_slice(bytemuck::cast_slice(&new_verts));
+    mesh.indices
+        .extend_from_slice(bytemuck::cast_slice(&new_indices));
+
+    // Append a single new LOD-0 patch cluster covering the skirts.
+    // CLUSTER_FLAG_LOD_DIRTY + DAG_GROUP_NONE matches the sculpt V2
+    // patch + halo-refresh slab patterns: the LOD selector admits
+    // dirty LOD-0 leaves unconditionally, so the skirt always renders.
+    let skirt_cluster = MeshletCluster {
+        aabb_min: patch_min,
+        _pad0: 0.0,
+        aabb_max: patch_max,
+        index_offset: pre_index_count,
+        index_count: new_indices.len() as u32,
+        lod_level: 0,
+        flags: CLUSTER_FLAG_LOD_DIRTY,
+        cluster_error: 0.0,
+        parent_group_error: PARENT_GROUP_ERROR_ROOT,
+        group_above_idx: DAG_GROUP_NONE,
+        group_below_idx: DAG_GROUP_NONE,
+        _pad3: 0,
+    };
+    mesh.clusters
+        .extend_from_slice(bytemuck::cast_slice(std::slice::from_ref(&skirt_cluster)));
+
+    // Skirt indices belong to the LOD-0 prefix.
+    mesh.lod0_index_count += new_indices.len() as u32;
 }
 
 #[cfg(test)]
@@ -909,5 +1103,107 @@ mod tests {
             mats.contains(&1),
             "empty BiomeRegion should leave base material intact; got {mats:?}"
         );
+    }
+
+    // ── V2 LOD pyramid: lateral skirts ─────────────────────────────────
+
+    /// `skirt_depth_m = 0` is a no-op — mesh.vertices length unchanged.
+    #[test]
+    fn skirts_disabled_when_depth_zero() {
+        let vs = 0.5;
+        let baked_no_skirts =
+            bake_tile_with_skirts(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions(), 0.0)
+                .expect("bake");
+        let baked_baseline =
+            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions())
+                .expect("bake");
+        assert_eq!(
+            baked_no_skirts.mesh.vertices.len(),
+            baked_baseline.mesh.vertices.len(),
+            "skirt_depth=0 must produce the same vertex byte count as bake_tile"
+        );
+        assert_eq!(
+            baked_no_skirts.mesh.indices.len(),
+            baked_baseline.mesh.indices.len(),
+        );
+    }
+
+    /// `skirt_depth_m > 0` appends geometry — vertex / index / cluster
+    /// counts strictly grow vs the baseline.
+    #[test]
+    fn skirts_append_geometry_when_enabled() {
+        let vs = 0.5;
+        let baked_with =
+            bake_tile_with_skirts(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions(), 4.0)
+                .expect("bake");
+        let baked_without =
+            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions())
+                .expect("bake");
+        assert!(
+            baked_with.mesh.vertices.len() > baked_without.mesh.vertices.len(),
+            "skirts must add vertex bytes"
+        );
+        assert!(
+            baked_with.mesh.indices.len() > baked_without.mesh.indices.len(),
+            "skirts must add index bytes"
+        );
+        assert!(
+            baked_with.mesh.clusters.len() > baked_without.mesh.clusters.len(),
+            "skirts must add a cluster"
+        );
+        assert!(
+            baked_with.mesh.lod0_index_count > baked_without.mesh.lod0_index_count,
+            "skirt indices count as LOD-0"
+        );
+    }
+
+    /// Every skirt vertex must sit at-or-below its source surface
+    /// vertex Y (either at the top of the strip, or `skirt_depth_m`
+    /// below). No skirt vertex floats above the surface mesh.
+    #[test]
+    fn skirt_vertices_sit_at_or_below_surface() {
+        use arvx_core::mesh_extract::MeshVertex;
+
+        let vs = 0.5;
+        let depth = 6.0;
+        let baked_with =
+            bake_tile_with_skirts(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions(), depth)
+                .expect("bake");
+        let baked_without =
+            bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions())
+                .expect("bake");
+        // Find the maximum surface Y the baseline emitted.
+        let baseline_verts: &[MeshVertex] =
+            bytemuck::cast_slice(&baked_without.mesh.vertices);
+        let max_surface_y = baseline_verts
+            .iter()
+            .map(|v| v.local_pos[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        // Iterate the skirt verts (everything past the baseline's end).
+        let with_verts: &[MeshVertex] = bytemuck::cast_slice(&baked_with.mesh.vertices);
+        let baseline_count = baseline_verts.len();
+        assert!(
+            with_verts.len() > baseline_count,
+            "test setup: skirts must add verts"
+        );
+        let skirt_verts = &with_verts[baseline_count..];
+        for sv in skirt_verts {
+            // Skirt verts are at the boundary plane's Y or at
+            // (boundary_y - depth). Boundary Ys are <= max_surface_y.
+            assert!(
+                sv.local_pos[1] <= max_surface_y + 1e-3,
+                "skirt vertex Y {} must be ≤ max surface Y {max_surface_y}",
+                sv.local_pos[1],
+            );
+            // And ≥ max_surface_y - depth (no skirt goes deeper than
+            // configured).
+            assert!(
+                sv.local_pos[1] >= max_surface_y - depth - 1e-3,
+                "skirt vertex Y {} must be ≥ max_surface_y - depth ({})",
+                sv.local_pos[1],
+                max_surface_y - depth,
+            );
+        }
     }
 }

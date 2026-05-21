@@ -38,6 +38,10 @@ use std::thread::JoinHandle;
 
 use crossbeam::channel::{unbounded, Receiver, Sender};
 
+// `bake_tile_with_skirts` is the V2 LOD-pyramid path; the legacy
+// `bake_tile` wrapper (no skirts) still lives in `crate::bake` for
+// tests / persist roundtrip.
+#[allow(unused_imports)]
 use crate::bake::bake_tile;
 use crate::baked_tile::BakedTile;
 use crate::persist::read_baked_tile;
@@ -83,6 +87,9 @@ pub struct BakeJob {
     /// the region set changes. Always present, even for scenes
     /// without regions (then it's the empty default).
     pub regions: Arc<TerrainRegionSnapshot>,
+    /// V2 LOD pyramid: lateral skirt depth (m). `0.0` disables.
+    /// Threaded from `Terrain::skirt_depth_m`.
+    pub skirt_depth_m: f32,
 }
 
 /// Outcome of one worker job. `baked = None` means the bake failed —
@@ -218,6 +225,7 @@ fn worker_loop(
             disk_path,
             stamps,
             regions,
+            skirt_depth_m,
         } = job;
 
         // Phase 4.4: if a `.arvxtile` is on disk for this key, load
@@ -254,12 +262,13 @@ fn worker_loop(
                     }
                 }
             }
-            bake_tile(
+            crate::bake::bake_tile_with_skirts(
                 key,
                 voxel_size_m,
                 &*terrain_fn,
                 stamps.as_slice(),
                 regions.as_ref(),
+                skirt_depth_m,
             )
         }));
         drop(terrain_fn);

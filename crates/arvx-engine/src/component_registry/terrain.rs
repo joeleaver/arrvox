@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use super::{ComponentEntry, FieldMeta};
 use crate::inspector::{FieldType, FieldValue};
 
-static TERRAIN_FIELDS: [FieldMeta; 13] = [
+static TERRAIN_FIELDS: [FieldMeta; 14] = [
     FieldMeta {
         name: "bounded",
         field_type: FieldType::Bool,
@@ -91,6 +91,16 @@ static TERRAIN_FIELDS: [FieldMeta; 13] = [
         asset_filter: None,
         enum_options: None,
         scrub: false,
+    },
+    FieldMeta {
+        name: "skirt_depth_m",
+        field_type: FieldType::Float,
+        range: Some((0.0, 64.0)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: true,
     },
     FieldMeta {
         name: "fbm_seed",
@@ -175,11 +185,18 @@ struct TerrainSerde {
     /// Defaults to `1` if absent in older scene files (V1 behavior).
     #[serde(default = "default_lod_levels")]
     lod_levels: u8,
+    /// Defaults to `4.0` if absent in older scene files.
+    #[serde(default = "default_skirt_depth_m")]
+    skirt_depth_m: f32,
     spec: TerrainFnSpec,
 }
 
 fn default_lod_levels() -> u8 {
     1
+}
+
+fn default_skirt_depth_m() -> f32 {
+    4.0
 }
 
 impl From<&Terrain> for TerrainSerde {
@@ -189,6 +206,7 @@ impl From<&Terrain> for TerrainSerde {
             base_tier: t.base_tier,
             render_radius_m: t.render_radius_m,
             lod_levels: t.lod_levels,
+            skirt_depth_m: t.skirt_depth_m,
             spec: t.spec.clone(),
         }
     }
@@ -255,6 +273,7 @@ pub fn terrain_entry() -> ComponentEntry {
                 "extent_z" => Ok(FieldValue::Int(extent(&t).map(|e| e.z as i64).unwrap_or(0))),
                 "render_radius_m" => Ok(FieldValue::Float(t.render_radius_m as f64)),
                 "lod_levels" => Ok(FieldValue::Int(t.lod_levels as i64)),
+                "skirt_depth_m" => Ok(FieldValue::Float(t.skirt_depth_m as f64)),
                 "fbm_seed" => Ok(FieldValue::Int(
                     fbm(&t).map(|f| f.seed as i64).unwrap_or(0),
                 )),
@@ -341,6 +360,14 @@ pub fn terrain_entry() -> ComponentEntry {
                         Err("type mismatch".into())
                     }
                 }
+                "skirt_depth_m" => {
+                    if let FieldValue::Float(v) = value {
+                        t.skirt_depth_m = (v as f32).clamp(0.0, 64.0);
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
                 "fbm_seed" => {
                     if let FieldValue::Int(v) = value {
                         set_fbm(&mut t, |f| f.seed = v.max(0) as u32)
@@ -417,6 +444,7 @@ pub fn terrain_entry() -> ComponentEntry {
             t.base_tier = s.base_tier;
             t.render_radius_m = s.render_radius_m;
             t.lod_levels = s.lod_levels.clamp(1, 8);
+            t.skirt_depth_m = s.skirt_depth_m.clamp(0.0, 64.0);
             t.set_spec(s.spec);
             world.insert_one(entity, t).map_err(|e| format!("{e}"))
         },

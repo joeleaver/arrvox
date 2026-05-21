@@ -73,6 +73,15 @@ pub struct Terrain {
     /// saturate at Tier 0 (1 m voxels) via `voxel_size_for_level`'s
     /// floor.
     pub lod_levels: u8,
+    /// V2 LOD pyramid: lateral skirt depth in metres. Each boundary
+    /// surface vertex emits a thin vertical strip dropping by this
+    /// many metres, masking the height-mismatch cracks between
+    /// LOD-band neighbours. `0.0` disables skirts entirely.
+    ///
+    /// Default 4.0 m. Clamped to `[0.0, 64.0]` by the Inspector. The
+    /// upper bound is one tile's worth — past that the skirt sticks
+    /// out below the world, visible only to debug cameras.
+    pub skirt_depth_m: f32,
 }
 
 impl std::fmt::Debug for Terrain {
@@ -82,6 +91,7 @@ impl std::fmt::Debug for Terrain {
             .field("base_tier", &self.base_tier)
             .field("render_radius_m", &self.render_radius_m)
             .field("lod_levels", &self.lod_levels)
+            .field("skirt_depth_m", &self.skirt_depth_m)
             .field("stamps_count", &self.stamps.len())
             .field("regions_count", &self.regions.len())
             .field("terrain_fn", &"<Arc<dyn TerrainFn>>")
@@ -102,6 +112,7 @@ impl Default for Terrain {
             regions: Arc::new(TerrainRegionSnapshot::new()),
             render_radius_m: 192.0,
             lod_levels: 1,
+            skirt_depth_m: 4.0,
         }
     }
 }

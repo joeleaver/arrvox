@@ -677,6 +677,7 @@ impl TileStreamer {
                 disk_path,
                 stamps,
                 regions: Arc::clone(&terrain.regions),
+                skirt_depth_m: terrain.skirt_depth_m,
             };
             if self.worker.submit(job) {
                 slot.state = TileState::Submitted;
@@ -717,6 +718,7 @@ mod tests {
             regions: Arc::new(crate::TerrainRegionSnapshot::new()),
             render_radius_m: 200.0,
             lod_levels: 1,
+            skirt_depth_m: 0.0,
         }
     }
 
@@ -764,6 +766,7 @@ mod tests {
             regions: Arc::new(crate::TerrainRegionSnapshot::new()),
             render_radius_m: 80.0, // ~1 tile radius
             lod_levels: 1,
+            skirt_depth_m: 0.0,
         };
 
         // First residency pass — populate slots near origin.
@@ -982,6 +985,7 @@ mod tests {
             regions: Arc::new(crate::TerrainRegionSnapshot::new()),
             render_radius_m: 80.0,
             lod_levels: 1,
+            skirt_depth_m: 0.0,
         };
 
         let cam_a = WorldPosition::new(IVec3::ZERO, Vec3::ZERO);
