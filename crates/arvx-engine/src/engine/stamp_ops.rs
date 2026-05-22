@@ -311,3 +311,45 @@ fn position_seed(p: Vec3, salt: u32) -> u32 {
     salt.wrapping_add(x.wrapping_mul(0x9e37_79b9))
         .wrapping_add(z.wrapping_mul(0x85eb_ca77))
 }
+
+#[cfg(test)]
+mod build_default_stamp_tests {
+    use super::*;
+
+    /// SpawnStamp(Plateau) must produce a stamp with the V2 default
+    /// `edge_falloff_m` value (not zero). Regression test for the
+    /// "edge falloff seems stuck at 0" report.
+    #[test]
+    fn plateau_default_has_nonzero_edge_falloff() {
+        let s = build_default_stamp(StampKindSpec::Plateau, Vec3::ZERO);
+        match s.kind {
+            StampKind::Plateau { edge_falloff_m, corner_radius_m, .. } => {
+                assert!(
+                    edge_falloff_m > 0.0,
+                    "Plateau default edge_falloff_m should be > 0; got {edge_falloff_m}",
+                );
+                assert!(
+                    corner_radius_m > 0.0,
+                    "Plateau default corner_radius_m should be > 0; got {corner_radius_m}",
+                );
+            }
+            _ => panic!("expected Plateau"),
+        }
+    }
+
+    /// Flatten ships with a smaller edge_falloff than Plateau (the
+    /// "crisp ground survey" feel) but it must still be non-zero.
+    #[test]
+    fn flatten_default_has_nonzero_edge_falloff() {
+        let s = build_default_stamp(StampKindSpec::Flatten, Vec3::ZERO);
+        match s.kind {
+            StampKind::Flatten { edge_falloff_m, .. } => {
+                assert!(
+                    edge_falloff_m > 0.0,
+                    "Flatten default edge_falloff_m should be > 0; got {edge_falloff_m}",
+                );
+            }
+            _ => panic!("expected Flatten"),
+        }
+    }
+}

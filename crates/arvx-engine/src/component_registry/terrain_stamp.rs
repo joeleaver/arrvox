@@ -593,6 +593,79 @@ mod tests {
     }
 
     #[test]
+    fn entry_set_edge_falloff_writes_through_on_plateau() {
+        let mut w = World::new();
+        let p = Stamp::new(
+            StampKind::Plateau {
+                half_extents: glam::Vec2::new(10.0, 10.0),
+                corner_radius_m: 0.0,
+                edge_falloff_m: 0.0,
+                tilt: glam::Vec2::ZERO,
+            },
+            Vec3::ZERO,
+        );
+        let e = w.spawn((p,));
+        let entry = stamp_entry();
+
+        // Read: starts at 0.
+        match (entry.get_field)(&w, e, "edge_falloff_m").unwrap() {
+            FieldValue::Float(v) => assert!((v - 0.0).abs() < 1e-6, "initial got {v}"),
+            other => panic!("expected Float, got {other:?}"),
+        }
+
+        // Write a non-zero.
+        (entry.set_field)(&mut w, e, "edge_falloff_m", FieldValue::Float(5.5))
+            .expect("set");
+
+        // Read back: should be 5.5.
+        match (entry.get_field)(&w, e, "edge_falloff_m").unwrap() {
+            FieldValue::Float(v) => assert!(
+                (v - 5.5).abs() < 1e-4,
+                "after set, read got {v} — Inspector dispatch broken",
+            ),
+            other => panic!("expected Float, got {other:?}"),
+        }
+
+        // And the actual component field should be updated.
+        let s = w.get::<&Stamp>(e).unwrap();
+        match s.kind {
+            StampKind::Plateau { edge_falloff_m, .. } => {
+                assert!((edge_falloff_m - 5.5).abs() < 1e-4);
+            }
+            _ => panic!("variant shifted"),
+        }
+    }
+
+    #[test]
+    fn entry_set_edge_falloff_is_noop_on_mountain() {
+        // Mountain doesn't carry edge_falloff_m. Writing the field
+        // should be a silent no-op (not an error) so the flat-field
+        // Inspector stays uniform.
+        let mut w = World::new();
+        let m = Stamp::new(
+            StampKind::Mountain {
+                h_max: 50.0,
+                radius: 30.0,
+                falloff: arvx_terrain::FalloffCurve::Smoothstep,
+                aspect: 1.0,
+                ridge_strength: 0.0,
+                ridge_count: 3,
+            },
+            Vec3::ZERO,
+        );
+        let e = w.spawn((m,));
+        let entry = stamp_entry();
+        // Set should succeed.
+        (entry.set_field)(&mut w, e, "edge_falloff_m", FieldValue::Float(5.5))
+            .expect("set");
+        // Read should still return 0 (irrelevant for Mountain).
+        match (entry.get_field)(&w, e, "edge_falloff_m").unwrap() {
+            FieldValue::Float(v) => assert!((v - 0.0).abs() < 1e-6, "Mountain edge_falloff should stay 0; got {v}"),
+            other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn entry_serialise_roundtrip_preserves_kind_variant() {
         let mut w = World::new();
         let original = Stamp::new(
