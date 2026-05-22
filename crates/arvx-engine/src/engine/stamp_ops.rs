@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arvx_core::Aabb;
 use arvx_terrain::{
-    FalloffCurve, Stamp, StampIndex, StampKind, Terrain,
+    FalloffCurve, ShapeNoise, Stamp, StampIndex, StampKind, Terrain,
 };
 use glam::{Vec2, Vec3};
 
@@ -189,28 +189,111 @@ impl super::state::EngineState {
 }
 
 fn build_default_stamp(spec: StampKindSpec, position: Vec3) -> Stamp {
-    let kind = match spec {
-        StampKindSpec::Mountain => StampKind::Mountain {
-            h_max: 50.0,
-            radius: 30.0,
-            falloff: FalloffCurve::Smoothstep,
-        },
-        StampKindSpec::Hill => StampKind::Hill {
-            h_max: 10.0,
-            radius: 15.0,
-            falloff: FalloffCurve::Smoothstep,
-        },
-        StampKindSpec::Lake => StampKind::Lake {
-            depth: 8.0,
-            radius: 20.0,
-            falloff: FalloffCurve::Smoothstep,
-        },
-        StampKindSpec::Plateau => StampKind::Plateau {
-            half_extents: Vec2::new(15.0, 15.0),
-        },
-        StampKindSpec::Flatten => StampKind::Flatten {
-            half_extents: Vec2::new(10.0, 10.0),
-        },
+    // V2 defaults: each kind ships with non-zero values for the new
+    // shape knobs so a freshly-spawned stamp looks organic rather
+    // than geometric. Authors who want the V1 look set the knobs
+    // back to zero in the Inspector.
+    let (kind, shape_noise) = match spec {
+        StampKindSpec::Mountain => {
+            let radius = 30.0;
+            (
+                StampKind::Mountain {
+                    h_max: 50.0,
+                    radius,
+                    falloff: FalloffCurve::Quadratic, // pointier than Smoothstep
+                    aspect: 1.0,
+                    ridge_strength: 0.30,
+                    ridge_count: 3,
+                },
+                // Shape noise: ~10% of the radius, mid-frequency.
+                ShapeNoise {
+                    amp_m: radius * 0.10,
+                    scale_m: radius * 0.6,
+                    seed: position_seed(position, 0x6e_4e_5d_31),
+                    octaves: 3,
+                },
+            )
+        }
+        StampKindSpec::Hill => {
+            let radius = 15.0;
+            (
+                StampKind::Hill {
+                    h_max: 10.0,
+                    radius,
+                    falloff: FalloffCurve::Smoothstep,
+                    aspect: 1.0,
+                    ridge_strength: 0.10, // gentler than Mountain
+                    ridge_count: 2,
+                },
+                ShapeNoise {
+                    amp_m: radius * 0.08,
+                    scale_m: radius * 0.7,
+                    seed: position_seed(position, 0x48_1a_3f_91),
+                    octaves: 2,
+                },
+            )
+        }
+        StampKindSpec::Lake => {
+            let radius = 20.0;
+            (
+                StampKind::Lake {
+                    depth: 8.0,
+                    radius,
+                    falloff: FalloffCurve::Smoothstep,
+                    aspect: 1.0,
+                    floor_flat_frac: 0.45, // wide flat floor, sloped shore
+                },
+                ShapeNoise {
+                    amp_m: radius * 0.12, // noisy shoreline
+                    scale_m: radius * 0.5,
+                    seed: position_seed(position, 0xa1_de_0c_27),
+                    octaves: 3,
+                },
+            )
+        }
+        StampKindSpec::Plateau => {
+            let half = Vec2::new(15.0, 15.0);
+            (
+                StampKind::Plateau {
+                    half_extents: half,
+                    corner_radius_m: half.min_element() * 0.20,
+                    edge_falloff_m: half.min_element() * 0.25,
+                    tilt: Vec2::ZERO,
+                },
+                ShapeNoise {
+                    amp_m: half.min_element() * 0.05,
+                    scale_m: half.min_element() * 0.5,
+                    seed: position_seed(position, 0x37_28_b2_45),
+                    octaves: 2,
+                },
+            )
+        }
+        StampKindSpec::Flatten => {
+            let half = Vec2::new(10.0, 10.0);
+            (
+                StampKind::Flatten {
+                    half_extents: half,
+                    corner_radius_m: half.min_element() * 0.15,
+                    edge_falloff_m: half.min_element() * 0.10, // crisper than Plateau
+                    tilt: Vec2::ZERO,
+                },
+                // Flatten is for surveyed-flat-ground use cases —
+                // keep the rim straight by default.
+                ShapeNoise::default(),
+            )
+        }
     };
-    Stamp::new(kind, position)
+    let mut stamp = Stamp::new(kind, position);
+    stamp.shape_noise = shape_noise;
+    stamp
+}
+
+/// Hash a world position into a noise seed so two stamps placed at
+/// different XZ get different shape noise patterns by default.
+/// Authors can edit `shape_noise.seed` in the Inspector to taste.
+fn position_seed(p: Vec3, salt: u32) -> u32 {
+    let x = (p.x * 17.31).round() as i32 as u32;
+    let z = (p.z * 23.97).round() as i32 as u32;
+    salt.wrapping_add(x.wrapping_mul(0x9e37_79b9))
+        .wrapping_add(z.wrapping_mul(0x85eb_ca77))
 }
