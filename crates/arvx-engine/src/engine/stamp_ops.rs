@@ -252,6 +252,15 @@ fn build_default_stamp(spec: StampKindSpec, position: Vec3) -> Stamp {
                     // for the 6 m drop — about 22° average slope
                     // instead of V2.0's ~36°.
                     floor_flat_frac: 0.25,
+                    // V2.2: 25% of radius (5 m at default) gives
+                    // the lake a soft outer rim. Without this,
+                    // lakes placed on hilly terrain showed a
+                    // vertical cliff at the rim — SmoothMin clamped
+                    // the surrounding (higher) terrain down to
+                    // position.y in one voxel layer. The weight
+                    // ramp lets the base show through near the rim
+                    // so the cliff smooths into the hillside.
+                    edge_falloff_m: radius * 0.25,
                 },
                 ShapeNoise {
                     // Smaller than V2.0 (was 0.12). 6% of radius is

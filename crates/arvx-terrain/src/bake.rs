@@ -936,6 +936,7 @@ mod tests {
                 falloff: FalloffCurve::Smoothstep,
                 aspect: 1.0,
                 floor_flat_frac: 0.0,
+                edge_falloff_m: 0.0,
             },
             // FlatHalf surface is at world y = 32. Place the lake surface there
             // so the basin floor lands at y = 22.
@@ -1008,6 +1009,7 @@ mod tests {
                 falloff: FalloffCurve::Smoothstep,
                 aspect: 1.0,
                 floor_flat_frac: 0.0,
+                edge_falloff_m: 0.0,
             },
             Vec3::new(16.0, 32.0, 32.0),
         );
@@ -1108,6 +1110,7 @@ mod tests {
                 falloff: FalloffCurve::Smoothstep,
                 aspect: 1.0,
                 floor_flat_frac: 0.0,
+                edge_falloff_m: 0.0,
             },
             Vec3::new(32.0, 32.0, 32.0),
         );
@@ -1163,6 +1166,7 @@ mod tests {
                 falloff: FalloffCurve::Smoothstep,
                 aspect: 1.0,
                 floor_flat_frac: 0.0,
+                edge_falloff_m: 0.0,
             },
             Vec3::new(32.0, 32.0, 32.0),
         );

@@ -254,6 +254,16 @@ pub enum StampKind {
         /// floor with sloped walls covering the outer 40 %.
         #[serde(default)]
         floor_flat_frac: f32,
+        /// Outer-rim weight falloff band, in metres. Inside this
+        /// band the lake's effect ramps from `0` at `t = 1` (rim)
+        /// to `1` at the band's inner edge. Lakes on terrain that
+        /// sits *above* `position.y` need this — without it,
+        /// SmoothMin clamps the surface down to `position.y` right
+        /// at the rim, producing a vertical cliff where the lake
+        /// meets the surrounding hillside. `0.0` (default for
+        /// pre-V2.2 scenes) gives the original sharp rim.
+        #[serde(default)]
+        edge_falloff_m: f32,
     },
     /// Rectangular plateau. Target height is `position.y` (plus
     /// optional tilt) inside the rotated rectangle. Default op:
@@ -415,7 +425,17 @@ impl Stamp {
                 falloff,
                 aspect,
                 floor_flat_frac,
-            } => self.sample_lake(wx, wz, depth, radius, falloff, aspect, floor_flat_frac),
+                edge_falloff_m,
+            } => self.sample_lake(
+                wx,
+                wz,
+                depth,
+                radius,
+                falloff,
+                aspect,
+                floor_flat_frac,
+                edge_falloff_m,
+            ),
             StampKind::Plateau {
                 half_extents,
                 corner_radius_m,
@@ -508,6 +528,7 @@ impl Stamp {
         falloff: FalloffCurve,
         aspect: f32,
         floor_flat_frac: f32,
+        edge_falloff_m: f32,
     ) -> Option<StampSample> {
         if radius <= 0.0 {
             return None;
@@ -537,7 +558,25 @@ impl Stamp {
         };
 
         let h_at = self.position.y - depth * falloff.apply(t_walls);
-        Some(StampSample { target_h: h_at, weight: 1.0 })
+
+        // Outer-rim weight falloff. Without this, SmoothMin clamps
+        // the surface to position.y at t = 1 — fine when the base
+        // terrain is also at position.y, vertical cliff when it
+        // isn't. Ramping weight to 0 at the rim lets the base show
+        // through at the very edge so the cliff softens.
+        let weight = if edge_falloff_m > 0.0 && radius > 0.0 {
+            let t_falloff = (edge_falloff_m / radius).clamp(0.0, 1.0);
+            // (1 - t) is the distance inward from the rim, in
+            // normalised radial units. Divide by the falloff width
+            // (also normalised) and clamp.
+            let ramp = ((1.0 - t) / t_falloff).clamp(0.0, 1.0);
+            // Smoothstep for nicer visuals than a linear ramp.
+            ramp * ramp * (3.0 - 2.0 * ramp)
+        } else {
+            1.0
+        };
+
+        Some(StampSample { target_h: h_at, weight })
     }
 
     fn sample_rect_like(
@@ -631,6 +670,10 @@ impl Stamp {
                 }
             }
             StampKind::Lake { depth, radius, aspect, .. } => {
+                // edge_falloff_m doesn't extend the footprint
+                // (the ramp lives INSIDE the rim at t in [1 -
+                // t_falloff, 1]) — only noise_margin grows the
+                // outer extent. Keeping the AABB tight here.
                 let rx = radius + noise_margin;
                 let rz = radius * aspect.max(1e-3) + noise_margin;
                 let r = rx.max(rz);
@@ -792,6 +835,7 @@ mod tests {
             falloff: FalloffCurve::Smoothstep,
             aspect: 1.0,
             floor_flat_frac: 0.0,
+            edge_falloff_m: 0.0,
         }
     }
 
@@ -955,6 +999,63 @@ mod tests {
 
     // ── flat-bottom Lake ───────────────────────────────────────────────
 
+    /// Lake's outer-rim `edge_falloff_m` ramps `weight` from 0 at the
+    /// rim to 1 deeper inside. Lets the base terrain show through at
+    /// the rim so SmoothMin doesn't clamp a hillside down to
+    /// position.y as a vertical cliff.
+    #[test]
+    fn lake_edge_falloff_ramps_weight_at_rim() {
+        let kind = StampKind::Lake {
+            depth: 10.0,
+            radius: 20.0,
+            falloff: FalloffCurve::Smoothstep,
+            aspect: 1.0,
+            floor_flat_frac: 0.0,
+            edge_falloff_m: 5.0, // 25% of radius
+        };
+        let l = Stamp::new(kind, Vec3::new(0.0, 10.0, 0.0));
+        // Centre: full weight.
+        let c = l.sample_height(0.0, 0.0).unwrap();
+        assert!((c.weight - 1.0).abs() < 1e-4, "centre weight {}", c.weight);
+        // Just inside the rim (r = 19.5): weight should be small —
+        // (1 - 0.975) / 0.25 = 0.1; smoothstep(0.1) ≈ 0.028.
+        let near_rim = l.sample_height(19.5, 0.0).unwrap();
+        assert!(
+            near_rim.weight < 0.1,
+            "near-rim weight should taper to ~0; got {}",
+            near_rim.weight,
+        );
+        // Inside the falloff band entrance (r ≈ 15, t = 0.75, just
+        // beyond the band's inner edge at t = 1 - 0.25 = 0.75): full
+        // weight.
+        let inner = l.sample_height(14.0, 0.0).unwrap();
+        assert!(
+            (inner.weight - 1.0).abs() < 1e-4,
+            "weight inside band entrance should be 1; got {}",
+            inner.weight,
+        );
+    }
+
+    /// Setting `edge_falloff_m = 0` reproduces V2.1 behaviour: weight
+    /// is 1 throughout the footprint. Sanity check that the new
+    /// default-disabled value is the back-compat path.
+    #[test]
+    fn lake_zero_edge_falloff_keeps_weight_one() {
+        let kind = StampKind::Lake {
+            depth: 5.0,
+            radius: 10.0,
+            falloff: FalloffCurve::Smoothstep,
+            aspect: 1.0,
+            floor_flat_frac: 0.0,
+            edge_falloff_m: 0.0,
+        };
+        let l = Stamp::new(kind, Vec3::ZERO);
+        for r in [0.0_f32, 3.0, 6.0, 9.5] {
+            let s = l.sample_height(r, 0.0).unwrap();
+            assert!((s.weight - 1.0).abs() < 1e-6, "weight at r={r} = {}", s.weight);
+        }
+    }
+
     #[test]
     fn flat_bottom_lake_holds_max_depth_across_floor() {
         let kind = StampKind::Lake {
@@ -963,6 +1064,7 @@ mod tests {
             falloff: FalloffCurve::Smoothstep,
             aspect: 1.0,
             floor_flat_frac: 0.5,
+            edge_falloff_m: 0.0,
         };
         let l = Stamp::new(kind, Vec3::new(0.0, 10.0, 0.0));
         // Centre — full depth.

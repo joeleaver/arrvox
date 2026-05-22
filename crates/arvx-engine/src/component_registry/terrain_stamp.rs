@@ -260,9 +260,9 @@ fn set_corner_radius(s: &mut Stamp, v: f32) {
 
 fn edge_falloff_of(s: &Stamp) -> f32 {
     match s.kind {
-        StampKind::Plateau { edge_falloff_m, .. } | StampKind::Flatten { edge_falloff_m, .. } => {
-            edge_falloff_m
-        }
+        StampKind::Plateau { edge_falloff_m, .. }
+        | StampKind::Flatten { edge_falloff_m, .. }
+        | StampKind::Lake { edge_falloff_m, .. } => edge_falloff_m,
         _ => 0.0,
     }
 }
@@ -270,7 +270,8 @@ fn edge_falloff_of(s: &Stamp) -> f32 {
 fn set_edge_falloff(s: &mut Stamp, v: f32) {
     match &mut s.kind {
         StampKind::Plateau { edge_falloff_m, .. }
-        | StampKind::Flatten { edge_falloff_m, .. } => *edge_falloff_m = v.max(0.0),
+        | StampKind::Flatten { edge_falloff_m, .. }
+        | StampKind::Lake { edge_falloff_m, .. } => *edge_falloff_m = v.max(0.0),
         _ => {}
     }
 }
@@ -513,8 +514,11 @@ fn stamp_field_visible(world: &hecs::World, entity: hecs::Entity, field: &str) -
         "ridge_strength" | "ridge_count" => is_mountain_or_hill,
         // Lake only (flat-bottom basin).
         "floor_flat_frac" => is_lake,
-        // Plateau / Flatten only (rounded corners + soft rim + tilt).
-        "corner_radius_m" | "edge_falloff_m" => is_rect,
+        // Plateau / Flatten only (rounded corners).
+        "corner_radius_m" => is_rect,
+        // Plateau / Flatten / Lake — soft outer rim weight ramp.
+        // Lake added in V2.2 to fix vertical-cliff rim on hilly terrain.
+        "edge_falloff_m" => is_rect || is_lake,
         // Unknown field — surface it so the bug is obvious.
         _ => true,
     }
@@ -584,6 +588,7 @@ mod tests {
                     falloff: FalloffCurve::Smoothstep,
                     aspect: 1.0,
                     floor_flat_frac: 0.0,
+                    edge_falloff_m: 0.0,
                 },
                 "Lake",
             ),
@@ -763,6 +768,7 @@ mod tests {
                 falloff: FalloffCurve::Linear,
                 aspect: 1.0,
                 floor_flat_frac: 0.0,
+                edge_falloff_m: 0.0,
             },
             Vec3::new(5.0, 10.0, 15.0),
         );
