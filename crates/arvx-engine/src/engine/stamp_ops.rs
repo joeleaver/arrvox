@@ -237,14 +237,28 @@ fn build_default_stamp(spec: StampKindSpec, position: Vec3) -> Stamp {
             let radius = 20.0;
             (
                 StampKind::Lake {
-                    depth: 8.0,
+                    // Shallower than V2.0 (was 8 m). Default basins
+                    // should read as ponds, not as quarries; the
+                    // world-envelope clamp also catches anything
+                    // that dips below the floor, but a gentle
+                    // default avoids the clamp triggering on
+                    // default-placed lakes.
+                    depth: 6.0,
                     radius,
                     falloff: FalloffCurve::Smoothstep,
                     aspect: 1.0,
-                    floor_flat_frac: 0.45, // wide flat floor, sloped shore
+                    // Smaller than V2.0 (was 0.45). Walls now span
+                    // 75% of the radius (15 m at the 20 m default)
+                    // for the 6 m drop — about 22° average slope
+                    // instead of V2.0's ~36°.
+                    floor_flat_frac: 0.25,
                 },
                 ShapeNoise {
-                    amp_m: radius * 0.12, // noisy shoreline
+                    // Smaller than V2.0 (was 0.12). 6% of radius is
+                    // enough to read as natural without producing
+                    // locally-cliff-y shorelines that compound the
+                    // wall slope visually.
+                    amp_m: radius * 0.06,
                     scale_m: radius * 0.5,
                     seed: position_seed(position, 0xa1_de_0c_27),
                     octaves: 3,
