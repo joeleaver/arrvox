@@ -60,14 +60,22 @@ const GBUFFER_PICK_FORMAT: wgpu::TextureFormat = GBUFFER_LEAF_SLOT_FORMAT;
 ///   offset 32..44  paint_min          vec3<f32>
 ///   offset 44..48  object_id          u32
 ///   offset 48..60  paint_max          vec3<f32>
-///   offset 60..64  surface_y          f32       (blade base y = paint_max.y in world)
+///   offset 60..64  surface_y          f32       (blade base y in world)
 ///   offset 64..76  surface_normal     vec3<f32> (world unit normal, +Y fallback)
 ///   offset 76..80  seed               u32
+///   offset 80..84  paint_mask         u32       (4×4 XZ bitmap; see below)
+///   offset 84..96  _pad               u32 × 3   (std430 stride round-up)
 ///
-/// 80 B total — aligns to 16 (WGSL std430). Field offsets asserted
-/// at compile time. `surface_normal` sits at offset 64 to satisfy
-/// vec3's 16-byte alignment; per `feedback_wgsl_std430_vec3_no_padding`
-/// the following u32 packs immediately at offset 76 with no pad.
+/// 96 B total — array stride = 96 (vec3 forces 16-aligned stride).
+/// Field offsets asserted at compile time.
+///
+/// `paint_mask` is a 16-bit (low) bitmap encoding which 4×4 XZ
+/// sub-cells of the tile cube contain at least one leaf carrying
+/// this anchor's material. Sub-cell `(cx, cz)` maps to bit
+/// `cz * 4 + cx`. `spawn_alive` reads this to cull blades that land
+/// on sub-cells without the host material — replaces the per-spawn
+/// `paint_probe` octree descent that was 16 M ops/frame at the V1
+/// anchor cap. Bits 16..32 reserved.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct AnchorRecord {
@@ -81,9 +89,11 @@ pub struct AnchorRecord {
     pub surface_y: f32,
     pub surface_normal: [f32; 3],
     pub seed: u32,
+    pub paint_mask: u32,
+    pub _pad: [u32; 3],
 }
 
-const _: () = assert!(std::mem::size_of::<AnchorRecord>() == 80);
+const _: () = assert!(std::mem::size_of::<AnchorRecord>() == 96);
 const _: () = {
     use std::mem::offset_of;
     assert!(offset_of!(AnchorRecord, tile_min) == 0);
@@ -96,7 +106,12 @@ const _: () = {
     assert!(offset_of!(AnchorRecord, surface_y) == 60);
     assert!(offset_of!(AnchorRecord, surface_normal) == 64);
     assert!(offset_of!(AnchorRecord, seed) == 76);
+    assert!(offset_of!(AnchorRecord, paint_mask) == 80);
 };
+
+/// Edge resolution of the per-anchor paint mask. 4×4 = 16 bits, fits
+/// in the low half of `AnchorRecord.paint_mask`.
+pub const PAINT_MASK_DIM: u32 = 4;
 
 /// Per-frame engine uniforms uploaded once per render. Layout matches
 /// `FrameContext` in both `user_shader_mesh.wesl` and
@@ -191,24 +206,31 @@ pub fn anchor_seed(world_pos: [f32; 3]) -> u32 {
 }
 
 /// V1 ceiling on anchors per user-shader material — matches the
-/// 3-pass Blelloch scan in `user_shader_mesh_compute.wesl`
-/// (`PREFIX_SUM_WG_SIZE × PREFIX_SUM_MAX_WG_COUNT = 256 × 32 = 8192`).
-/// At `@tile_size 0.5` this covers ~2000 m² of painted surface.
-/// For larger paint, add a 4th tier (one extra workgroup of
-/// inter-batch-sum scans) — the per-pass code already handles up
-/// to 256³ ≈ 16M anchors structurally.
+/// 4-level Blelloch scan in `user_shader_mesh_compute.wesl`
+/// (`PREFIX_SUM_WG_SIZE × PREFIX_SUM_MAX_WG_COUNT = 256 × 1024 = 262 144`).
+/// At `@tile_size 0.5` this covers ~65 000 m² of painted surface
+/// — enough for a sizable open-world chunk before frustum/distance
+/// culling cuts it further. Adding a 5th tier scales to 256³ ≈ 16 M
+/// anchors structurally.
 ///
 /// Memory cost at this cap, per material:
-///   anchors  = 8192 × 64 B                   = 512 KB
-///   records  = 8192 × MAX_SPAWNS × 8 B       = 4 MB (with MAX_SPAWNS=64)
-///   counts/offsets                            = 64 KB
-///   wg_sums                                   = 128 B
-///   Total                                     = ~4.5 MB
-pub const MAX_ANCHORS_PER_SHADER_V1: u32 = 8192;
+///   anchors  = 262 144 ×  96 B                ≈  25 MB
+///   counts                                     ≈   1 MB
+///   offsets                                    ≈   1 MB
+///   records  = 262 144 × MAX_SPAWNS ×  8 B    ≈ 128 MB (with MAX_SPAWNS=64)
+///   wg_sums                                    ≈   4 KB
+///   wg_sums2                                   ≈  16 B
+///   Total                                      ≈ 155 MB
+pub const MAX_ANCHORS_PER_SHADER_V1: u32 = 262_144;
 
-/// Per-workgroup-sum slots used by the Blelloch scan. Must match
-/// `PREFIX_SUM_MAX_WG_COUNT` in `user_shader_mesh_compute.wesl`.
-pub const PREFIX_SUM_MAX_WG_COUNT: u32 = 32;
+/// Per-workgroup-sum slots used by the tier-1 Blelloch scan. Must
+/// match `PREFIX_SUM_MAX_WG_COUNT` in `user_shader_mesh_compute.wesl`.
+pub const PREFIX_SUM_MAX_WG_COUNT: u32 = 1024;
+
+/// Per-tier-2-block-sum slots. Each tier-2 WG (256 threads) scans 256
+/// entries of `wg_sums`, so `PREFIX_SUM_MAX_WG_COUNT / 256 = 4` slots
+/// are needed. Must match `PREFIX_SUM_MAX_WG_COUNT_2` in the WESL.
+pub const PREFIX_SUM_MAX_WG_COUNT_2: u32 = 4;
 
 // ─── Pipeline objects ──────────────────────────────────────────────
 
@@ -234,7 +256,9 @@ pub struct UserShaderMeshPass {
     pub stub_shadow: wgpu::RenderPipeline,
     pub stub_spawn_count: wgpu::ComputePipeline,
     pub stub_prefix_local: wgpu::ComputePipeline,
+    pub stub_prefix_local2: wgpu::ComputePipeline,
     pub stub_prefix_scan_sums: wgpu::ComputePipeline,
+    pub stub_prefix_add_back2: wgpu::ComputePipeline,
     pub stub_prefix_add_back: wgpu::ComputePipeline,
     pub stub_fill: wgpu::ComputePipeline,
 }
@@ -250,7 +274,9 @@ pub struct UserShaderMeshPipelines {
     pub shadow: wgpu::RenderPipeline,
     pub spawn_count: wgpu::ComputePipeline,
     pub prefix_local: wgpu::ComputePipeline,
+    pub prefix_local2: wgpu::ComputePipeline,
     pub prefix_scan_sums: wgpu::ComputePipeline,
+    pub prefix_add_back2: wgpu::ComputePipeline,
     pub prefix_add_back: wgpu::ComputePipeline,
     pub fill: wgpu::ComputePipeline,
 }
@@ -367,9 +393,12 @@ impl UserShaderMeshPass {
                     uniform_entry(6, wgpu::ShaderStages::COMPUTE),
                     // 7: dispatch (uniform)
                     uniform_entry(7, wgpu::ShaderStages::COMPUTE),
-                    // 8: wg_sums (storage, RW) — Blelloch scan
-                    //    per-workgroup-sum scratch.
+                    // 8: wg_sums (storage, RW) — tier-1 per-WG sum
+                    //    scratch (1024 slots).
                     storage_entry(8, false, wgpu::ShaderStages::COMPUTE),
+                    // 9: wg_sums2 (storage, RW) — tier-2 per-block
+                    //    sum scratch (4 slots).
+                    storage_entry(9, false, wgpu::ShaderStages::COMPUTE),
                 ],
             },
         );
@@ -463,7 +492,9 @@ impl UserShaderMeshPass {
             stub_shadow,
             stub_spawn_count: stub.spawn_count,
             stub_prefix_local: stub.prefix_local,
+            stub_prefix_local2: stub.prefix_local2,
             stub_prefix_scan_sums: stub.prefix_scan_sums,
+            stub_prefix_add_back2: stub.prefix_add_back2,
             stub_prefix_add_back: stub.prefix_add_back,
             stub_fill: stub.fill,
         }
@@ -527,7 +558,9 @@ impl UserShaderMeshPass {
             shadow,
             spawn_count: computes.spawn_count,
             prefix_local: computes.prefix_local,
+            prefix_local2: computes.prefix_local2,
             prefix_scan_sums: computes.prefix_scan_sums,
+            prefix_add_back2: computes.prefix_add_back2,
             prefix_add_back: computes.prefix_add_back,
             fill: computes.fill,
         }
@@ -665,7 +698,9 @@ fn uniform_entry(
 struct ComputePipelineSet {
     spawn_count: wgpu::ComputePipeline,
     prefix_local: wgpu::ComputePipeline,
+    prefix_local2: wgpu::ComputePipeline,
     prefix_scan_sums: wgpu::ComputePipeline,
+    prefix_add_back2: wgpu::ComputePipeline,
     prefix_add_back: wgpu::ComputePipeline,
     fill: wgpu::ComputePipeline,
 }
@@ -687,11 +722,13 @@ fn build_compute_pipelines(
         })
     };
     ComputePipelineSet {
-        spawn_count:      build("entry_spawn_count",     "spawn_count"),
-        prefix_local:     build("entry_prefix_local",    "prefix_local"),
-        prefix_scan_sums: build("entry_prefix_scan_sums","prefix_scan_sums"),
-        prefix_add_back:  build("entry_prefix_add_back", "prefix_add_back"),
-        fill:             build("entry_fill",            "fill"),
+        spawn_count:      build("entry_spawn_count",       "spawn_count"),
+        prefix_local:     build("entry_prefix_local",      "prefix_local"),
+        prefix_local2:    build("entry_prefix_local2",     "prefix_local2"),
+        prefix_scan_sums: build("entry_prefix_scan_sums",  "prefix_scan_sums"),
+        prefix_add_back2: build("entry_prefix_add_back2",  "prefix_add_back2"),
+        prefix_add_back:  build("entry_prefix_add_back",   "prefix_add_back"),
+        fill:             build("entry_fill",              "fill"),
     }
 }
 
@@ -833,7 +870,7 @@ mod tests {
 
     #[test]
     fn anchor_record_layout() {
-        assert_eq!(std::mem::size_of::<AnchorRecord>(), 80);
+        assert_eq!(std::mem::size_of::<AnchorRecord>(), 96);
         assert_eq!(std::mem::align_of::<AnchorRecord>(), 4);
     }
 

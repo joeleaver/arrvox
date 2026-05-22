@@ -532,11 +532,47 @@ impl EngineState {
                             te.aabb.max,
                             entity_world,
                         );
-                        let surface_y = paint_world_max.y;
-                        let local_normal = te
-                            .normal_sum
-                            .try_normalize()
-                            .unwrap_or(glam::Vec3::Y);
+                        // Surface anchor (Y + normal) policy:
+                        //
+                        //   · With a per-tile sample (best_xz_dist_sq
+                        //     finite ⇒ tile_size was known + a leaf
+                        //     landed near the tile-center XZ): take
+                        //     that leaf's top-Y and its prefiltered
+                        //     LeafAttr.normal. Same world-locked tile
+                        //     across LODs picks the same world location
+                        //     for the sample, so the resulting
+                        //     surface_y / surface_normal stay stable
+                        //     when a tile entity swaps voxel sizes.
+                        //   · Without a per-tile sample (NO_TILE_COORD
+                        //     fall-back, or no leaf near tile center):
+                        //     use the legacy aggregate — paint_max.y +
+                        //     `normal_sum` averaging. Blades shimmer on
+                        //     LOD swap in this branch but it's the
+                        //     historical behavior; only the @tile_size
+                        //     path gets the world-locked guarantee.
+                        let (surface_y, local_normal) = if te.best_xz_dist_sq.is_finite() {
+                            // Per-tile sample (object-local). XYZ
+                            // because non-identity entity transforms
+                            // need the leaf's XZ to land at the right
+                            // world-Y after rotation.
+                            let world_pos = entity_world
+                                .map(|m| m.transform_point3(te.surface_sample_pos))
+                                .unwrap_or(te.surface_sample_pos);
+                            let n = te
+                                .surface_sample_normal
+                                .try_normalize()
+                                .unwrap_or(glam::Vec3::Y);
+                            (world_pos.y, n)
+                        } else {
+                            // NO_TILE_COORD fall-back (paint_max.y +
+                            // averaged normal). Pre-tile-sample
+                            // behavior, drift-prone on LOD swap.
+                            let n = te
+                                .normal_sum
+                                .try_normalize()
+                                .unwrap_or(glam::Vec3::Y);
+                            (paint_world_max.y, n)
+                        };
                         let world_normal = entity_world
                             .map(|m| m.transform_vector3(local_normal))
                             .unwrap_or(local_normal)
@@ -559,6 +595,8 @@ impl EngineState {
                                 surface_y,
                                 surface_normal: world_normal.to_array(),
                                 seed,
+                                paint_mask: te.paint_mask,
+                                _pad: [0; 3],
                             },
                         );
                     }

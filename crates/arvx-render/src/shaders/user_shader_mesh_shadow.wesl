@@ -60,6 +60,10 @@ struct AnchorContext {
     surface_y:       f32,
     surface_normal:  vec3<f32>,
     seed:            u32,
+    paint_mask:      u32,
+    _pad0:           u32,
+    _pad1:           u32,
+    _pad2:           u32,
 }
 
 struct FrameContext {

@@ -466,6 +466,7 @@ fn references_frame_context(text: &str) -> bool {
 /// // @animated
 /// // @geometry procedural { vertex_count: N }   // V1 mesh-path
 /// // @tile_size <f32>
+/// // @max_distance <f32>      // world units, anchors past this are not uploaded
 /// // @spawn_count_cache static | per_frame
 /// ```
 ///
@@ -523,6 +524,10 @@ fn parse_metadata(
             }
             "tile_size" => {
                 md.tile_size = Some(parse_f32(path, line_no, "tile_size", args)?);
+            }
+            "max_distance" => {
+                md.max_distance =
+                    Some(parse_f32(path, line_no, "max_distance", args)?);
             }
             "animated" => {
                 if !args.is_empty() {

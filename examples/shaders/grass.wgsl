@@ -25,6 +25,7 @@
 // ── Manifest ──────────────────────────────────────────────────────
 // @geometry procedural { vertex_count: 6 }
 // @tile_size 0.5
+// @max_distance 150.0
 // @animated
 
 // ── Per-material params ───────────────────────────────────────────
@@ -65,24 +66,30 @@ fn grass_tangent_frame(n: vec3<f32>) -> mat2x3<f32> {
 
 // Per-spawn blade base position in world space.
 //
-// XZ is randomized inside the anchor's PAINT bounds (te.aabb world-
-// transformed) so blades land on the actual painted region.
+// XZ is randomized inside the anchor's TILE cube (tile_coord ×
+// tile_size, world-transformed) — that's LOD-stable: the same world
+// tile_coord maps to the same world XZ rectangle no matter which
+// terrain LOD entity covers it. Earlier versions used `paint_min/max`
+// (the painted-leaf AABB) which grew with voxel size and made blade
+// XZ shimmer on LOD swap.
 //
 // Y is projected onto the per-tile surface plane through
-// (paint_center_xz, surface_y) with normal `surface_normal`. On a
-// flat tile this returns `surface_y` unchanged; on a slope it tracks
-// the surface so blades aren't floating. Falls back to `surface_y`
-// when the normal is too tipped (|N.y| < eps) — flat horizontal
-// plane semantics for vertical surfaces.
+// (tile_center_xz, surface_y) with normal `surface_normal`. Both come
+// from the leaf nearest to the tile-center XZ (CPU pre-sample), so
+// they're LOD-stable too. On a flat tile this returns `surface_y`
+// unchanged; on a slope it tracks the surface so blades aren't
+// floating. Falls back to `surface_y` when the normal is too tipped
+// (|N.y| < eps) — flat horizontal plane semantics for vertical
+// surfaces.
 fn grass_blade_base(anchor: AnchorContext, spawn_idx: u32) -> vec3<f32> {
     let s0 = anchor.seed ^ (spawn_idx * 0x9E3779B9u);
     let r_px = grass_hash_u01(s0 ^ 0xBF58476Du);
     let r_pz = grass_hash_u01(s0 ^ 0x94D049BBu);
-    let pos_x = mix(anchor.paint_min.x, anchor.paint_max.x, r_px);
-    let pos_z = mix(anchor.paint_min.z, anchor.paint_max.z, r_pz);
+    let pos_x = mix(anchor.tile_min.x, anchor.tile_max.x, r_px);
+    let pos_z = mix(anchor.tile_min.z, anchor.tile_max.z, r_pz);
 
-    let cx = 0.5 * (anchor.paint_min.x + anchor.paint_max.x);
-    let cz = 0.5 * (anchor.paint_min.z + anchor.paint_max.z);
+    let cx = 0.5 * (anchor.tile_min.x + anchor.tile_max.x);
+    let cz = 0.5 * (anchor.tile_min.z + anchor.tile_max.z);
     let n  = anchor.surface_normal;
     var pos_y = anchor.surface_y;
     if (abs(n.y) > 1e-3) {
@@ -101,8 +108,13 @@ fn grass_blade_base(anchor: AnchorContext, spawn_idx: u32) -> vec3<f32> {
 // matching `MAX_SPAWNS_PER_ANCHOR_V1`).
 fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
     let density = ctx_param(2);
-    let extent_x = max(anchor.paint_max.x - anchor.paint_min.x, 0.0);
-    let extent_z = max(anchor.paint_max.z - anchor.paint_min.z, 0.0);
+    // Use the LOD-stable tile cube area, not the painted-leaf BB —
+    // see grass_blade_base. For a fully-painted tile this is identical
+    // (cube == leaf BB); for partly-painted tiles the cube may
+    // over-count, but `spawn_alive`'s paint_probe cuts the unpainted
+    // spawns, so the visible blade count tracks paint regardless.
+    let extent_x = max(anchor.tile_max.x - anchor.tile_min.x, 0.0);
+    let extent_z = max(anchor.tile_max.z - anchor.tile_min.z, 0.0);
     let xz_area = extent_x * extent_z;
     let raw = density * xz_area;
 
@@ -116,9 +128,31 @@ fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
 
 // ── spawn_alive ───────────────────────────────────────────────────
 fn spawn_alive(anchor: AnchorContext, spawn_idx: u32, frame: FrameContext) -> bool {
-    // Spawn region is the painted-leaf BB on the anchor — every
-    // blade is already inside the painted area, no probe needed.
-    return true;
+    // Tile-cube placement (LOD-stable) puts blades anywhere inside
+    // the tile, including sub-cells that hold a different material
+    // (FBM terrain mixes grass with sand/rock/snow inside any one
+    // shader tile). `anchor.paint_mask` is a 4×4 bitmap, set CPU-
+    // side from the leaves that actually carry this material; we
+    // map the blade's XZ to its sub-cell and keep only the spawns
+    // whose bit is set. This is the cheap CPU-pre-computed
+    // alternative to the per-spawn paint_probe octree descent.
+    let base = grass_blade_base(anchor, spawn_idx);
+    let extent_x = max(anchor.tile_max.x - anchor.tile_min.x, 1e-6);
+    let extent_z = max(anchor.tile_max.z - anchor.tile_min.z, 1e-6);
+    let u = clamp(
+        (base.x - anchor.tile_min.x) / extent_x,
+        0.0,
+        0.999999,
+    );
+    let v = clamp(
+        (base.z - anchor.tile_min.z) / extent_z,
+        0.0,
+        0.999999,
+    );
+    let cx = u32(u * 4.0);
+    let cz = u32(v * 4.0);
+    let bit = cz * 4u + cx;
+    return (anchor.paint_mask & (1u << bit)) != 0u;
 }
 
 // ── vs ────────────────────────────────────────────────────────────

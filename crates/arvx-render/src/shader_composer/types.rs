@@ -105,6 +105,12 @@ pub struct ShaderMetadata {
     /// (one region per (object, material) covering the painted-leaf
     /// AABB; cell size grows with paint extent).
     pub tile_size: Option<f32>,
+    /// Max world distance (camera → tile center) for which mesh-path
+    /// anchors are uploaded. Anchors beyond this radius are dropped
+    /// at upload time, before they consume any GPU spawn budget. The
+    /// engine also frustum-culls anchors regardless of this value.
+    /// None disables the distance check.
+    pub max_distance: Option<f32>,
     /// V1 mesh-path geometry declaration. `None` means the file
     /// didn't opt into the mesh path (it may still expose the older
     /// `shade` / `generate` hooks).
@@ -254,6 +260,7 @@ impl UserShaderRegistry {
                 cell_size: e.metadata.cell_size,
                 max_depth: e.metadata.max_depth,
                 tile_size: e.metadata.tile_size,
+                max_distance: e.metadata.max_distance,
                 has_shade: e.shade_text.is_some(),
                 has_generate: e.generate_text.is_some(),
                 has_vs: e.is_mesh_path(),
@@ -290,6 +297,7 @@ pub struct UserShaderInfo {
     pub cell_size: Option<f32>,
     pub max_depth: Option<u32>,
     pub tile_size: Option<f32>,
+    pub max_distance: Option<f32>,
     pub has_shade: bool,
     pub has_generate: bool,
     /// V1 mesh-path — true if the shader provides a `vs` hook AND

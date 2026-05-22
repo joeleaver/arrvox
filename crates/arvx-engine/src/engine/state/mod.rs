@@ -25,11 +25,37 @@ mod constructor;
 /// host surface. Sum (not running mean) lets the tile-spanning leaf
 /// path contribute the same normal once per overlapped tile without
 /// extra state.
+///
+/// `surface_sample_*` track the best (nearest-to-tile-center-XZ) leaf
+/// for *world-locked* surface anchoring of user-shader anchors. When a
+/// shader declares `@tile_size`, the anchor's `surface_y` /
+/// `surface_normal` come from this single leaf rather than the
+/// `normal_sum` / `paint_max.y` aggregate, so they stay LOD-stable as
+/// the terrain swaps tile entities at different voxel sizes (an
+/// entity-local AABB grows with leaf size, but the leaf nearest to a
+/// world-locked tile-center XZ stays the same one).
+///
+/// `best_xz_dist_sq = +inf` means no sample yet — fall back to the
+/// aggregate. This happens for shaders without `@tile_size`.
 #[derive(Debug, Clone)]
 pub(crate) struct PaintedTileEntry {
     pub aabb: arvx_core::Aabb,
     pub leaf_count: u32,
     pub normal_sum: glam::Vec3,
+    /// Object-local top-of-leaf XYZ for the leaf whose XZ center sits
+    /// closest to the tile-center XZ. Used as the surface anchor for
+    /// `AnchorRecord.surface_y` after world-space transform. Sentinel
+    /// when no sample: `best_xz_dist_sq == +inf`.
+    pub surface_sample_pos: glam::Vec3,
+    pub surface_sample_normal: glam::Vec3,
+    pub best_xz_dist_sq: f32,
+    /// 4×4 XZ bitmap of which sub-cells of the tile contain at least
+    /// one leaf carrying this entry's material. Bit `cz * 4 + cx` is
+    /// set if the leaf at sub-cell `(cx, cz)` is painted. Surfaced
+    /// onto `AnchorRecord.paint_mask` so `spawn_alive` can cull
+    /// blades that land on unpainted sub-cells (e.g. FBM-mixed
+    /// terrain where one tile spans grass + rock + sand).
+    pub paint_mask: u32,
 }
 
 impl PaintedTileEntry {
@@ -41,6 +67,10 @@ impl PaintedTileEntry {
             },
             leaf_count: 0,
             normal_sum: glam::Vec3::ZERO,
+            surface_sample_pos: glam::Vec3::ZERO,
+            surface_sample_normal: glam::Vec3::ZERO,
+            best_xz_dist_sq: f32::INFINITY,
+            paint_mask: 0,
         }
     }
 }

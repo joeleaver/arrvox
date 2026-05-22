@@ -276,6 +276,15 @@ pub(super) struct RenderState {
         >,
     >,
 
+    /// MAIN viewport's `view_proj` matrix from the previous frame.
+    /// Used to detect static cameras: when this matches the current
+    /// frame's matrix AND `last_uploaded_painted_anchors` matches the
+    /// current `painted_anchors` Arc, the frustum/distance-filtered
+    /// anchor list is byte-identical to last frame's, so the mesh-
+    /// path user-shader tick can skip the per-material refilter +
+    /// upload + 7 compute dispatches. `None` until the first frame.
+    pub(super) last_main_camera_vp: Option<[[f32; 4]; 4]>,
+
     /// Phase 7 — TLAS over instance AABBs. Session 2 ships the host
     /// CPU builder + GPU upload (called per frame from
     /// `compose_render_one_frame`); Session 3 adds user-shader
@@ -403,6 +412,7 @@ impl RenderState {
             mesh_user_shader_cache: std::collections::HashMap::new(),
             user_shader_mesh_draws: Vec::new(),
             last_uploaded_painted_anchors: None,
+            last_main_camera_vp: None,
             tlas_pass,
             tlas_build_pass,
             pick_readback_buffer,

@@ -743,23 +743,80 @@ pub(crate) fn expand_aabb(
 ) {
     let mat_map = out.entry(mat).or_default();
 
+    // `tile_size` controls the surface-sample policy:
+    //   · None → `NO_TILE_COORD` aggregate: surface_sample_* stays NaN
+    //     and the lifecycle build falls back to paint_max.y +
+    //     `normal_sum` averaging (unchanged from before tile sampling).
+    //   · Some(s) → per-tile sample: the leaf whose XZ center sits
+    //     closest to the *tile-center XZ* wins. World-locked tiles
+    //     mean this leaf is the same regardless of which LOD entity
+    //     covers the tile, so blade base Y + normal don't shimmer on
+    //     LOD swap.
     fn merge(
         mat_map: &mut HashMap<[i32; 3], PaintedTileEntry>,
         key: [i32; 3],
         mn: Vec3,
         mx: Vec3,
         normal: Vec3,
+        tile_size: Option<f32>,
     ) {
         let entry = mat_map.entry(key).or_insert_with(PaintedTileEntry::empty);
         entry.aabb.min = entry.aabb.min.min(mn);
         entry.aabb.max = entry.aabb.max.max(mx);
         entry.leaf_count = entry.leaf_count.saturating_add(1);
         entry.normal_sum += normal;
+
+        if let Some(s) = tile_size {
+            if s > 0.0 && key != NO_TILE_COORD {
+                let tile_origin_x = key[0] as f32 * s;
+                let tile_origin_z = key[2] as f32 * s;
+                let tile_center_x = tile_origin_x + 0.5 * s;
+                let tile_center_z = tile_origin_z + 0.5 * s;
+                let leaf_cx = 0.5 * (mn.x + mx.x);
+                let leaf_cz = 0.5 * (mn.z + mx.z);
+                let dx = leaf_cx - tile_center_x;
+                let dz = leaf_cz - tile_center_z;
+                let d_sq = dx * dx + dz * dz;
+                if d_sq < entry.best_xz_dist_sq {
+                    entry.best_xz_dist_sq = d_sq;
+                    entry.surface_sample_pos =
+                        Vec3::new(leaf_cx, mx.y, leaf_cz);
+                    entry.surface_sample_normal = normal;
+                }
+
+                // Paint mask — mark each PAINT_MASK_DIM × PAINT_MASK_DIM
+                // sub-cell of the tile that this leaf's XZ AABB
+                // touches. Sub-cell width = tile_size / DIM (= 0.125 m
+                // at default grass `@tile_size 0.5`). Clamped to
+                // [0, DIM) so off-tile portions of a leaf that
+                // straddles multiple tiles don't bleed into this
+                // entry. Bit layout: cz * DIM + cx, low DIM*DIM bits
+                // of `paint_mask`.
+                const DIM: i32 =
+                    arvx_render::user_shader_mesh_pass::PAINT_MASK_DIM as i32;
+                let inv_cell = DIM as f32 / s;
+                let cx_lo = ((mn.x - tile_origin_x) * inv_cell).floor() as i32;
+                let cx_hi =
+                    (((mx.x - 1e-6) - tile_origin_x) * inv_cell).floor() as i32;
+                let cz_lo = ((mn.z - tile_origin_z) * inv_cell).floor() as i32;
+                let cz_hi =
+                    (((mx.z - 1e-6) - tile_origin_z) * inv_cell).floor() as i32;
+                let cx_lo = cx_lo.clamp(0, DIM - 1);
+                let cx_hi = cx_hi.clamp(0, DIM - 1);
+                let cz_lo = cz_lo.clamp(0, DIM - 1);
+                let cz_hi = cz_hi.clamp(0, DIM - 1);
+                for cz in cz_lo..=cz_hi {
+                    for cx in cx_lo..=cx_hi {
+                        entry.paint_mask |= 1u32 << (cz * DIM + cx);
+                    }
+                }
+            }
+        }
     }
 
     match tile_size {
         None => {
-            merge(mat_map, NO_TILE_COORD, mn, mx, normal);
+            merge(mat_map, NO_TILE_COORD, mn, mx, normal, None);
         }
         Some(s) if s > 0.0 => {
             let inv = 1.0 / s;
@@ -777,12 +834,146 @@ pub(crate) fn expand_aabb(
                                 continue;
                             }
                         }
-                        merge(mat_map, [ix, iy, iz], mn, mx, normal);
+                        merge(mat_map, [ix, iy, iz], mn, mx, normal, Some(s));
                     }
                 }
             }
         }
-        Some(_) => merge(mat_map, NO_TILE_COORD, mn, mx, normal),
+        Some(_) => merge(mat_map, NO_TILE_COORD, mn, mx, normal, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LOD-stability invariant — the world-locked anchor fix.
+    ///
+    /// Two scenarios cover the same world tile (16.0..16.5) painted with
+    /// the same material:
+    ///   · LOD-0: four 0.25 m leaves quantize the surface.
+    ///   · LOD-1: one  0.5  m leaf  quantizes the surface.
+    /// In both cases the entity transform is identity (terrain tiles),
+    /// so leaf object-local positions equal world positions. The grass
+    /// shader uses tile_min/max + surface_sample_pos/normal — none of
+    /// which should depend on which LOD covered the tile.
+    #[test]
+    fn surface_sample_stable_across_lod() {
+        let tile_size = 0.5f32;
+        let up = Vec3::Y;
+
+        // LOD-0: 4 leaves at y=0 with top at y=0.25, centered around tile center.
+        let mut lod0 = HashMap::<u16, HashMap<[i32; 3], PaintedTileEntry>>::new();
+        for (lx, lz) in [(16.0f32, 16.0), (16.25, 16.0), (16.0, 16.25), (16.25, 16.25)] {
+            expand_aabb(
+                &mut lod0,
+                7,
+                Vec3::new(lx, 0.0, lz),
+                Vec3::new(lx + 0.25, 0.25, lz + 0.25),
+                up,
+                Some(tile_size),
+                None,
+            );
+        }
+
+        // LOD-1: 1 leaf with top at y=0.5, covers same world rectangle.
+        let mut lod1 = HashMap::<u16, HashMap<[i32; 3], PaintedTileEntry>>::new();
+        expand_aabb(
+            &mut lod1,
+            7,
+            Vec3::new(16.0, 0.0, 16.0),
+            Vec3::new(16.5, 0.5, 16.5),
+            up,
+            Some(tile_size),
+            None,
+        );
+
+        // Same tile_coord at both LODs.
+        let key = [32, 0, 32];
+        let e0 = &lod0[&7][&key];
+        let e1 = &lod1[&7][&key];
+
+        // Surface sample XZ is at the tile center in both — that's the
+        // load-bearing invariant for the lifecycle anchor build.
+        let tc_x = (key[0] as f32 + 0.5) * tile_size; // 16.25
+        let tc_z = (key[2] as f32 + 0.5) * tile_size;
+        assert!(e0.best_xz_dist_sq.is_finite());
+        assert!(e1.best_xz_dist_sq.is_finite());
+        // XZ component of the chosen sample is within half-a-leaf of
+        // the tile center (LOD-0 leaves are 0.25 m wide, their centers
+        // can sit 0.125 m off the tile center).
+        assert!((e0.surface_sample_pos.x - tc_x).abs() < 0.2);
+        assert!((e0.surface_sample_pos.z - tc_z).abs() < 0.2);
+        assert!((e1.surface_sample_pos.x - tc_x).abs() < 0.2);
+        assert!((e1.surface_sample_pos.z - tc_z).abs() < 0.2);
+
+        // Normals are identical (both world-up).
+        assert_eq!(e0.surface_sample_normal, e1.surface_sample_normal);
+    }
+
+    /// Paint mask is a 4×4 bitmap of sub-cells. A leaf occupying the
+    /// bottom-left quadrant of a tile (sub-cells (0,0), (1,0), (0,1),
+    /// (1,1)) must set exactly those 4 bits.
+    #[test]
+    fn paint_mask_marks_leaf_subcells() {
+        let tile_size = 0.5f32;
+        // Tile (0,0,0) covers world XZ rect (0..0.5)×(0..0.5).
+        // Sub-cell width = 0.125 m. A 0.25 m leaf at (0,0)-(0.25, ?, 0.25)
+        // sits in the bottom-left 2×2 quadrant of sub-cells.
+        let mut out = HashMap::<u16, HashMap<[i32; 3], PaintedTileEntry>>::new();
+        expand_aabb(
+            &mut out,
+            7,
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.25, 0.25, 0.25),
+            Vec3::Y,
+            Some(tile_size),
+            None,
+        );
+        let key = [0, 0, 0];
+        let mask = out[&7][&key].paint_mask;
+        // Bits for (cx, cz) in (0,0),(1,0),(0,1),(1,1) — bit = cz*4 + cx
+        let expected =
+            (1u32 << 0) | (1u32 << 1) | (1u32 << 4) | (1u32 << 5);
+        assert_eq!(mask, expected, "expected bottom-left 2×2 sub-cells set");
+    }
+
+    /// A leaf that fully covers the tile must light up every sub-cell.
+    #[test]
+    fn paint_mask_full_coverage() {
+        let tile_size = 0.5f32;
+        let mut out = HashMap::<u16, HashMap<[i32; 3], PaintedTileEntry>>::new();
+        expand_aabb(
+            &mut out,
+            7,
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.5, 0.5, 0.5),
+            Vec3::Y,
+            Some(tile_size),
+            None,
+        );
+        let mask = out[&7][&[0, 0, 0]].paint_mask;
+        assert_eq!(mask, 0xFFFF, "all 16 sub-cells should be set");
+    }
+
+    /// When no `tile_size` is declared (legacy shader), the entry stays
+    /// in the NO_TILE_COORD aggregate and `surface_sample_*` stays
+    /// unsampled — the lifecycle build then falls back to paint_max.y.
+    #[test]
+    fn no_tile_size_keeps_aggregate_fallback() {
+        let mut out = HashMap::<u16, HashMap<[i32; 3], PaintedTileEntry>>::new();
+        expand_aabb(
+            &mut out,
+            3,
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::Y,
+            None,
+            None,
+        );
+        let entry = &out[&3][&NO_TILE_COORD];
+        assert!(!entry.best_xz_dist_sq.is_finite()); // never sampled
+        assert_eq!(entry.leaf_count, 1);
     }
 }
 

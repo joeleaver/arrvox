@@ -7,24 +7,35 @@
 // stub bodies make the file valid WGSL standalone.
 //
 // Pipeline contract:
-//   · Five dispatches per active user-shader material per frame:
+//   · Seven dispatches per active user-shader material per frame:
 //       1. entry_spawn_count
 //       2. entry_prefix_local
-//       3. entry_prefix_scan_sums
-//       4. entry_prefix_add_back
-//       5. entry_fill
-//     (Future work gates 1–4 by paint_epoch + geometry_epoch +
+//       3. entry_prefix_local2
+//       4. entry_prefix_scan_sums
+//       5. entry_prefix_add_back2
+//       6. entry_prefix_add_back
+//       7. entry_fill
+//     (Future work gates 1–6 by paint_epoch + geometry_epoch +
 //     param_epoch for static-cache shaders.)
 //   · `entry_spawn_count`: 1 thread per anchor; reads `anchors[i]`,
 //     calls `spawn_count(anchor, frame)`, writes `out_counts[i]`.
-//   · `entry_prefix_local` + `entry_prefix_scan_sums` +
-//     `entry_prefix_add_back`: 3-pass Blelloch-style scan. Each
-//     workgroup scans 256 elements locally and emits its total to
-//     `wg_sums[wg_id]`; one scanning workgroup turns wg_sums into
-//     cumulative offsets; final pass adds the workgroup-offset back
-//     into every per-thread offset. V1 ceiling: 256 × 32 = 8192
-//     anchors per material (= `MAX_ANCHORS_PER_SHADER_V1`). The
-//     scan-of-sums pass also writes the indirect-draw args at slot 0.
+//   · entry_prefix_local + _local2 + _scan_sums + _add_back2 +
+//     _add_back form a 4-level Blelloch-style exclusive scan:
+//       - tier 1 (_local): 256-wide WGs scan anchor counts in place;
+//         each WG emits its inclusive total to `wg_sums[wgid]`.
+//       - tier 2 (_local2): 256-wide WGs scan wg_sums in 256-element
+//         chunks; each emits its inclusive total to `wg_sums2[wgid2]`
+//         and overwrites its chunk of wg_sums with exclusive offsets.
+//       - tier 3 (_scan_sums): single 256-wide WG scans wg_sums2 in
+//         place (≤ 4 entries used at the V1 max), writes the
+//         indirect-draw args.
+//       - tier 4 (_add_back2): 256-wide WGs add wg_sums2[wgid2] back
+//         into each entry of wg_sums.
+//       - tier 5 (_add_back): 256-wide WGs add wg_sums[wgid] back
+//         into each per-anchor offset.
+//     V1 ceiling: 256 × 1024 = 262 144 anchors per material
+//     (= `MAX_ANCHORS_PER_SHADER_V1`). Adding a 5th tier scales to
+//     256³ ≈ 16 M structurally.
 //   · `entry_fill`: 1 thread per anchor; reads `offsets[i]` +
 //     `counts[i]`, runs `spawn_alive` per spawn (defaults true),
 //     materializes `instance_records[offset+k] = (anchor_idx, k)` or
@@ -40,6 +51,7 @@
 //   @group(0) @binding(6)  params               (uniform)
 //   @group(0) @binding(7)  dispatch             (uniform)
 //   @group(0) @binding(8)  wg_sums              (storage, read_write)
+//   @group(0) @binding(9)  wg_sums2             (storage, read_write)
 //
 // Group 1 = scene (ArvxScene::bind_group_layout). Lets `paint_probe`
 // from `spawn_alive` descend the host octree at the spawn position
@@ -66,7 +78,16 @@ import package::lib::leaf_attr::fetch_leaf_attr_for;
 
 const ANCHOR_IDX_DEAD: u32 = 0xFFFFFFFFu;
 const PREFIX_SUM_WG_SIZE: u32 = 256u;
-const PREFIX_SUM_MAX_WG_COUNT: u32 = 32u;
+// Tier-1 wg count: at WG_SIZE = 256, 1024 WGs cover the V1 ceiling
+// of 262 144 anchors. Each WG emits its inclusive total to
+// `wg_sums[wgid]`.
+const PREFIX_SUM_MAX_WG_COUNT: u32 = 1024u;
+// Tier-2 wg count: each tier-2 WG (256 threads) scans 256 entries
+// of `wg_sums`, so 1024 / 256 = 4 tier-2 WGs cover the full
+// `wg_sums` array. Each emits its inclusive total to
+// `wg_sums2[wgid2]`. The tier-3 scan reads only the first
+// `PREFIX_SUM_MAX_WG_COUNT_2` entries of `wg_sums2`.
+const PREFIX_SUM_MAX_WG_COUNT_2: u32 = 4u;
 
 // Layout mirrors `arvx_render::user_shader_mesh_pass::AnchorRecord`.
 // 80 B std430. `surface_normal` (vec3) sits at offset 64 with `seed`
@@ -83,6 +104,10 @@ struct AnchorContext {
     surface_y:       f32,
     surface_normal:  vec3<f32>,
     seed:            u32,
+    paint_mask:      u32,
+    _pad0:           u32,
+    _pad1:           u32,
+    _pad2:           u32,
 }
 
 struct FrameContext {
@@ -131,6 +156,7 @@ struct DispatchInfo {
 @group(0) @binding(6) var<uniform>             params:         UserParams;
 @group(0) @binding(7) var<uniform>             dispatch:       DispatchInfo;
 @group(0) @binding(8) var<storage, read_write> wg_sums:        array<u32>;
+@group(0) @binding(9) var<storage, read_write> wg_sums2:       array<u32>;
 
 // Scene group — same layout ArvxScene::create_layout exposes.
 // Names locked to what `lib::octree` / `lib::leaf_attr` reference as
@@ -286,23 +312,29 @@ fn entry_spawn_count(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ── Multi-pass Blelloch prefix sum ────────────────────────────────
 //
-// Three-pass exclusive scan covers up to `PREFIX_SUM_WG_SIZE *
-// PREFIX_SUM_MAX_WG_COUNT = 256 * 32 = 8192` anchors per material
-// (= `MAX_ANCHORS_PER_SHADER_V1`).
+// Four-level exclusive scan covering up to
+// `PREFIX_SUM_WG_SIZE * PREFIX_SUM_MAX_WG_COUNT = 256 * 1024 = 262 144`
+// anchors per material (= `MAX_ANCHORS_PER_SHADER_V1`).
 //
-//   1. `entry_prefix_local` — each workgroup of 256 threads does a
+//   1. `entry_prefix_local` — each tier-1 WG of 256 threads does a
 //      Hillis-Steele scan over its slice; last thread stashes the
 //      workgroup total into `wg_sums[wgid]`. Per-thread offsets are
 //      written into `out_offsets` *without* the per-workgroup base
-//      added yet.
-//   2. `entry_prefix_scan_sums` — single workgroup of 256 threads
-//      scans `wg_sums[0..MAX_WG_COUNT]` in place, converting per-
-//      workgroup totals into per-workgroup exclusive offsets. Thread
-//      0 also writes the indirect-draw args (vertex_count + total
-//      instance_count). Reads stale `wg_sums[MAX_WG_COUNT..]` are
-//      harmless because we only consume `wg_sums[wgid]` for active
-//      workgroups in pass 3.
-//   3. `entry_prefix_add_back` — adds each per-workgroup base
+//      added yet. Up to 1024 tier-1 WGs.
+//   2. `entry_prefix_local2` — each tier-2 WG of 256 threads scans
+//      a 256-entry chunk of `wg_sums` in place. The local exclusive
+//      offsets are written back to `wg_sums`; the chunk total goes
+//      to `wg_sums2[wgid2]`. Up to 4 tier-2 WGs.
+//   3. `entry_prefix_scan_sums` — single workgroup of 256 threads
+//      scans `wg_sums2[0..MAX_WG_COUNT_2]` in place, converting per-
+//      tier-2-block totals into exclusive offsets. Thread 0 also
+//      writes the indirect-draw args (vertex_count + total
+//      instance_count).
+//   4. `entry_prefix_add_back2` — adds each tier-2 base
+//      (`wg_sums2[wgid2]`) onto every entry of its 256-entry block
+//      in `wg_sums`. After this `wg_sums` holds global exclusive
+//      offsets per tier-1 WG.
+//   5. `entry_prefix_add_back` — adds each tier-1 base
 //      (`wg_sums[wgid]`) onto every `out_offsets[idx]` so the final
 //      per-thread offset is the global exclusive scan.
 
@@ -342,11 +374,22 @@ fn entry_prefix_local(
 }
 
 @compute @workgroup_size(PREFIX_SUM_WG_SIZE)
-fn entry_prefix_scan_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn entry_prefix_local2(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wgid: vec3<u32>,
+) {
     let tid = lid.x;
+    let idx = gid.x;
 
+    // Each tier-2 WG scans 256 entries of wg_sums. Only the entries
+    // for live tier-1 WGs were written this frame — past that index
+    // wg_sums holds stale values from a previous frame's run, so
+    // clamp reads to the live range and feed 0 into the scan.
+    let live_tier1_wgs =
+        (dispatch.num_anchors + PREFIX_SUM_WG_SIZE - 1u) / PREFIX_SUM_WG_SIZE;
     var val: u32 = 0u;
-    if (tid < PREFIX_SUM_MAX_WG_COUNT) { val = wg_sums[tid]; }
+    if (idx < live_tier1_wgs) { val = wg_sums[idx]; }
     scan_data[tid] = val;
     workgroupBarrier();
 
@@ -360,22 +403,54 @@ fn entry_prefix_scan_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
         stride = stride << 1u;
     }
 
-    // Convert inclusive → exclusive scan and write back to wg_sums
-    // so pass 3 reads per-workgroup base offsets.
-    if (tid < PREFIX_SUM_MAX_WG_COUNT) {
-        wg_sums[tid] = scan_data[tid] - val;
+    // Exclusive offsets back to wg_sums; chunk total to wg_sums2.
+    if (idx < PREFIX_SUM_MAX_WG_COUNT) {
+        wg_sums[idx] = scan_data[tid] - val;
+    }
+    if (tid == PREFIX_SUM_WG_SIZE - 1u) {
+        wg_sums2[wgid.x] = scan_data[tid];
+    }
+}
+
+@compute @workgroup_size(PREFIX_SUM_WG_SIZE)
+fn entry_prefix_scan_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+
+    // wg_sums2[i] is stale past the live tier-2 range (the host
+    // dispatches only as many tier-2 WGs as needed). Same clamp
+    // pattern as entry_prefix_local2.
+    let live_tier1_wgs =
+        (dispatch.num_anchors + PREFIX_SUM_WG_SIZE - 1u) / PREFIX_SUM_WG_SIZE;
+    let live_tier2_wgs =
+        (live_tier1_wgs + PREFIX_SUM_WG_SIZE - 1u) / PREFIX_SUM_WG_SIZE;
+    var val: u32 = 0u;
+    if (tid < live_tier2_wgs) { val = wg_sums2[tid]; }
+    scan_data[tid] = val;
+    workgroupBarrier();
+
+    var stride: u32 = 1u;
+    while (stride < PREFIX_SUM_WG_SIZE) {
+        var t: u32 = 0u;
+        if (tid >= stride) { t = scan_data[tid - stride]; }
+        workgroupBarrier();
+        if (tid >= stride) { scan_data[tid] = scan_data[tid] + t; }
+        workgroupBarrier();
+        stride = stride << 1u;
+    }
+
+    if (tid < PREFIX_SUM_MAX_WG_COUNT_2) {
+        wg_sums2[tid] = scan_data[tid] - val;
     }
 
     if (tid == 0u) {
         let n = dispatch.num_anchors;
         var total: u32 = 0u;
         if (n > 0u) {
-            let last_wg = (n + PREFIX_SUM_WG_SIZE - 1u) / PREFIX_SUM_WG_SIZE;
-            if (last_wg > 0u && last_wg <= PREFIX_SUM_MAX_WG_COUNT) {
-                // `scan_data[last_wg - 1]` is the inclusive total
-                // up to the last used workgroup — i.e., the grand
-                // total of all anchor counts.
-                total = scan_data[last_wg - 1u];
+            // anchors-per-tier-2-block = WG_SIZE * WG_SIZE = 65536.
+            let per_block = PREFIX_SUM_WG_SIZE * PREFIX_SUM_WG_SIZE;
+            let last_wg2 = (n + per_block - 1u) / per_block;
+            if (last_wg2 > 0u && last_wg2 <= PREFIX_SUM_MAX_WG_COUNT_2) {
+                total = scan_data[last_wg2 - 1u];
             }
         }
         out_indirect.vertex_count   = dispatch.verts_per_spawn;
@@ -383,6 +458,16 @@ fn entry_prefix_scan_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
         out_indirect.first_vertex   = 0u;
         out_indirect.first_instance = 0u;
     }
+}
+
+@compute @workgroup_size(PREFIX_SUM_WG_SIZE)
+fn entry_prefix_add_back2(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(workgroup_id) wgid: vec3<u32>,
+) {
+    let idx = gid.x;
+    if (idx >= PREFIX_SUM_MAX_WG_COUNT) { return; }
+    wg_sums[idx] = wg_sums[idx] + wg_sums2[wgid.x];
 }
 
 @compute @workgroup_size(PREFIX_SUM_WG_SIZE)
