@@ -34,7 +34,12 @@ static STAMP_KIND_OPTIONS: &[(&str, &str)] = &[
     ("Flatten", "Flatten"),
 ];
 
-static STAMP_FIELDS: [FieldMeta; 4] = [
+/// Flat-field Inspector surface. A full dedicated stamp editor /
+/// stamp library UI is a separate next-session investment; this
+/// keeps things scrubbable in the meantime. Fields that don't apply
+/// to the current variant get treated as no-ops by the get/set
+/// dispatch (read returns 0, write is silently dropped).
+static STAMP_FIELDS: [FieldMeta; 13] = [
     FieldMeta {
         name: "kind_name",
         field_type: FieldType::String,
@@ -75,7 +80,200 @@ static STAMP_FIELDS: [FieldMeta; 4] = [
         enum_options: None,
         scrub: false,
     },
+    // ── V2 shape knobs ──────────────────────────────────────
+    FieldMeta {
+        name: "aspect",
+        field_type: FieldType::Float,
+        range: Some((0.1, 10.0)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: true,
+    },
+    FieldMeta {
+        name: "ridge_strength",
+        field_type: FieldType::Float,
+        range: Some((0.0, 1.0)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: true,
+    },
+    FieldMeta {
+        name: "ridge_count",
+        field_type: FieldType::Int,
+        range: Some((0.0, 12.0)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: false,
+    },
+    FieldMeta {
+        name: "floor_flat_frac",
+        field_type: FieldType::Float,
+        range: Some((0.0, 0.99)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: true,
+    },
+    FieldMeta {
+        name: "corner_radius_m",
+        field_type: FieldType::Float,
+        range: Some((0.0, 100.0)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: true,
+    },
+    FieldMeta {
+        name: "edge_falloff_m",
+        field_type: FieldType::Float,
+        range: Some((0.0, 100.0)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: true,
+    },
+    // ── ShapeNoise (cross-cutting) ─────────────────────────
+    FieldMeta {
+        name: "noise_amp_m",
+        field_type: FieldType::Float,
+        range: Some((0.0, 100.0)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: true,
+    },
+    FieldMeta {
+        name: "noise_scale_m",
+        field_type: FieldType::Float,
+        range: Some((0.5, 200.0)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: true,
+    },
+    FieldMeta {
+        name: "noise_seed",
+        field_type: FieldType::Int,
+        range: Some((0.0, u32::MAX as f64)),
+        transient: false,
+        struct_fields: None,
+        asset_filter: None,
+        enum_options: None,
+        scrub: false,
+    },
 ];
+
+// ── per-knob helpers ──────────────────────────────────────────────
+
+fn aspect_of(s: &Stamp) -> f32 {
+    match s.kind {
+        StampKind::Mountain { aspect, .. }
+        | StampKind::Hill { aspect, .. }
+        | StampKind::Lake { aspect, .. } => aspect,
+        _ => 1.0,
+    }
+}
+
+fn set_aspect(s: &mut Stamp, v: f32) {
+    match &mut s.kind {
+        StampKind::Mountain { aspect, .. }
+        | StampKind::Hill { aspect, .. }
+        | StampKind::Lake { aspect, .. } => *aspect = v.max(0.01),
+        _ => {} // rect kinds use full-rectangle yaw; aspect is N/A
+    }
+}
+
+fn ridge_strength_of(s: &Stamp) -> f32 {
+    match s.kind {
+        StampKind::Mountain { ridge_strength, .. }
+        | StampKind::Hill { ridge_strength, .. } => ridge_strength,
+        _ => 0.0,
+    }
+}
+
+fn set_ridge_strength(s: &mut Stamp, v: f32) {
+    match &mut s.kind {
+        StampKind::Mountain { ridge_strength, .. }
+        | StampKind::Hill { ridge_strength, .. } => *ridge_strength = v.clamp(0.0, 1.0),
+        _ => {}
+    }
+}
+
+fn ridge_count_of(s: &Stamp) -> u8 {
+    match s.kind {
+        StampKind::Mountain { ridge_count, .. } | StampKind::Hill { ridge_count, .. } => {
+            ridge_count
+        }
+        _ => 0,
+    }
+}
+
+fn set_ridge_count(s: &mut Stamp, v: u8) {
+    match &mut s.kind {
+        StampKind::Mountain { ridge_count, .. } | StampKind::Hill { ridge_count, .. } => {
+            *ridge_count = v
+        }
+        _ => {}
+    }
+}
+
+fn floor_flat_frac_of(s: &Stamp) -> f32 {
+    match s.kind {
+        StampKind::Lake { floor_flat_frac, .. } => floor_flat_frac,
+        _ => 0.0,
+    }
+}
+
+fn set_floor_flat_frac(s: &mut Stamp, v: f32) {
+    if let StampKind::Lake { floor_flat_frac, .. } = &mut s.kind {
+        *floor_flat_frac = v.clamp(0.0, 0.99);
+    }
+}
+
+fn corner_radius_of(s: &Stamp) -> f32 {
+    match s.kind {
+        StampKind::Plateau { corner_radius_m, .. } | StampKind::Flatten { corner_radius_m, .. } => {
+            corner_radius_m
+        }
+        _ => 0.0,
+    }
+}
+
+fn set_corner_radius(s: &mut Stamp, v: f32) {
+    match &mut s.kind {
+        StampKind::Plateau { corner_radius_m, .. }
+        | StampKind::Flatten { corner_radius_m, .. } => *corner_radius_m = v.max(0.0),
+        _ => {}
+    }
+}
+
+fn edge_falloff_of(s: &Stamp) -> f32 {
+    match s.kind {
+        StampKind::Plateau { edge_falloff_m, .. } | StampKind::Flatten { edge_falloff_m, .. } => {
+            edge_falloff_m
+        }
+        _ => 0.0,
+    }
+}
+
+fn set_edge_falloff(s: &mut Stamp, v: f32) {
+    match &mut s.kind {
+        StampKind::Plateau { edge_falloff_m, .. }
+        | StampKind::Flatten { edge_falloff_m, .. } => *edge_falloff_m = v.max(0.0),
+        _ => {}
+    }
+}
 
 fn kind_name(s: &Stamp) -> &'static str {
     match s.kind {
@@ -111,7 +309,7 @@ fn kind_radius(s: &Stamp) -> f32 {
         StampKind::Mountain { radius, .. }
         | StampKind::Hill { radius, .. }
         | StampKind::Lake { radius, .. } => radius,
-        StampKind::Plateau { half_extents } | StampKind::Flatten { half_extents } => {
+        StampKind::Plateau { half_extents, .. } | StampKind::Flatten { half_extents, .. } => {
             half_extents.x.max(half_extents.y)
         }
     }
@@ -122,7 +320,7 @@ fn set_kind_radius(s: &mut Stamp, v: f32) {
         StampKind::Mountain { radius, .. }
         | StampKind::Hill { radius, .. }
         | StampKind::Lake { radius, .. } => *radius = v,
-        StampKind::Plateau { half_extents } | StampKind::Flatten { half_extents } => {
+        StampKind::Plateau { half_extents, .. } | StampKind::Flatten { half_extents, .. } => {
             // Maintain aspect ratio by scaling both axes to the new value.
             *half_extents = glam::Vec2::new(v, v);
         }
@@ -143,6 +341,15 @@ pub fn stamp_entry() -> ComponentEntry {
                 "amplitude" => Ok(FieldValue::Float(kind_amplitude(&c) as f64)),
                 "radius" => Ok(FieldValue::Float(kind_radius(&c) as f64)),
                 "priority" => Ok(FieldValue::Int(c.priority as i64)),
+                "aspect" => Ok(FieldValue::Float(aspect_of(&c) as f64)),
+                "ridge_strength" => Ok(FieldValue::Float(ridge_strength_of(&c) as f64)),
+                "ridge_count" => Ok(FieldValue::Int(ridge_count_of(&c) as i64)),
+                "floor_flat_frac" => Ok(FieldValue::Float(floor_flat_frac_of(&c) as f64)),
+                "corner_radius_m" => Ok(FieldValue::Float(corner_radius_of(&c) as f64)),
+                "edge_falloff_m" => Ok(FieldValue::Float(edge_falloff_of(&c) as f64)),
+                "noise_amp_m" => Ok(FieldValue::Float(c.shape_noise.amp_m as f64)),
+                "noise_scale_m" => Ok(FieldValue::Float(c.shape_noise.scale_m as f64)),
+                "noise_seed" => Ok(FieldValue::Int(c.shape_noise.seed as i64)),
                 _ => Err(format!("unknown field '{field}'")),
             }
         },
@@ -173,6 +380,78 @@ pub fn stamp_entry() -> ComponentEntry {
                 "priority" => {
                     if let FieldValue::Int(v) = value {
                         c.priority = v as i32;
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "aspect" => {
+                    if let FieldValue::Float(v) = value {
+                        set_aspect(&mut c, v as f32);
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "ridge_strength" => {
+                    if let FieldValue::Float(v) = value {
+                        set_ridge_strength(&mut c, v as f32);
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "ridge_count" => {
+                    if let FieldValue::Int(v) = value {
+                        set_ridge_count(&mut c, v.clamp(0, 12) as u8);
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "floor_flat_frac" => {
+                    if let FieldValue::Float(v) = value {
+                        set_floor_flat_frac(&mut c, v as f32);
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "corner_radius_m" => {
+                    if let FieldValue::Float(v) = value {
+                        set_corner_radius(&mut c, v as f32);
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "edge_falloff_m" => {
+                    if let FieldValue::Float(v) = value {
+                        set_edge_falloff(&mut c, v as f32);
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "noise_amp_m" => {
+                    if let FieldValue::Float(v) = value {
+                        c.shape_noise.amp_m = (v as f32).max(0.0);
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "noise_scale_m" => {
+                    if let FieldValue::Float(v) = value {
+                        c.shape_noise.scale_m = (v as f32).max(0.1);
+                        Ok(())
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "noise_seed" => {
+                    if let FieldValue::Int(v) = value {
+                        c.shape_noise.seed = v.max(0) as u32;
                         Ok(())
                     } else {
                         Err("type mismatch".into())
@@ -218,6 +497,9 @@ mod tests {
                 h_max: 50.0,
                 radius: 30.0,
                 falloff: FalloffCurve::Smoothstep,
+                aspect: 1.0,
+                ridge_strength: 0.0,
+                ridge_count: 3,
             },
             Vec3::new(10.0, 0.0, 20.0),
         )
@@ -242,6 +524,9 @@ mod tests {
                     h_max: 1.0,
                     radius: 1.0,
                     falloff: FalloffCurve::Smoothstep,
+                    aspect: 1.0,
+                    ridge_strength: 0.0,
+                    ridge_count: 3,
                 },
                 "Mountain",
             ),
@@ -250,6 +535,9 @@ mod tests {
                     h_max: 1.0,
                     radius: 1.0,
                     falloff: FalloffCurve::Smoothstep,
+                    aspect: 1.0,
+                    ridge_strength: 0.0,
+                    ridge_count: 3,
                 },
                 "Hill",
             ),
@@ -258,18 +546,26 @@ mod tests {
                     depth: 1.0,
                     radius: 1.0,
                     falloff: FalloffCurve::Smoothstep,
+                    aspect: 1.0,
+                    floor_flat_frac: 0.0,
                 },
                 "Lake",
             ),
             (
                 StampKind::Plateau {
                     half_extents: glam::Vec2::new(5.0, 5.0),
+                    corner_radius_m: 0.0,
+                    edge_falloff_m: 0.0,
+                    tilt: glam::Vec2::ZERO,
                 },
                 "Plateau",
             ),
             (
                 StampKind::Flatten {
                     half_extents: glam::Vec2::new(5.0, 5.0),
+                    corner_radius_m: 0.0,
+                    edge_falloff_m: 0.0,
+                    tilt: glam::Vec2::ZERO,
                 },
                 "Flatten",
             ),
@@ -304,6 +600,8 @@ mod tests {
                 depth: 12.0,
                 radius: 25.0,
                 falloff: FalloffCurve::Linear,
+                aspect: 1.0,
+                floor_flat_frac: 0.0,
             },
             Vec3::new(5.0, 10.0, 15.0),
         );
