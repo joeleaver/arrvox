@@ -371,6 +371,17 @@ impl MaterialLibrary {
         self.path_to_slot.get(path).copied().unwrap_or(0)
     }
 
+    /// Project root the library was scanned against, derived as the
+    /// `materials_dir`'s grandparent (`materials_dir` is conventionally
+    /// `<root>/assets/materials/`). `None` until `scan` has been
+    /// called or if the layout doesn't conform.
+    pub fn project_root(&self) -> Option<&Path> {
+        self.materials_dir
+            .as_ref()
+            .and_then(|d| d.parent()) // assets/
+            .and_then(|d| d.parent()) // project root
+    }
+
     /// Look up the file path for a given slot ID.
     pub fn path_for_id(&self, id: u16) -> Option<&Path> {
         match self.slots.get(id as usize) {
@@ -588,6 +599,28 @@ impl MaterialLibrary {
     }
 }
 
+// ── MaterialLibraryLookup impl ───────────────────────────────────────────
+
+/// Make the live library queryable via the trait `arvx-terrain` (and
+/// any other procedural source crate) uses to resolve
+/// `MaterialRef::Path` → slot id. Paths in the lookup are
+/// **project-root-relative** (`"assets/materials/rock.arvxmat"`); we
+/// join against `project_root()` to match the canonical absolute
+/// paths in `path_to_slot`.
+impl arvx_core::MaterialLibraryLookup for MaterialLibrary {
+    fn resolve_path(&self, path: &Path) -> Option<u16> {
+        // Already absolute? Hit the map directly.
+        if path.is_absolute() {
+            return self.path_to_slot.get(path).copied();
+        }
+        // Project-root-relative form — the common case for paths
+        // authored in FBM defaults / scene JSON.
+        let root = self.project_root()?;
+        let abs = root.join(path);
+        self.path_to_slot.get(&abs).copied()
+    }
+}
+
 // ── Starter materials ────────────────────────────────────────────────────
 
 /// Starter material definitions written to new projects.
@@ -652,6 +685,49 @@ fn starter_materials() -> Vec<(&'static str, MaterialDef)> {
                 roughness: 0.05,
                 metallic: 0.0,
                 opacity: 0.3,
+                ..Default::default()
+            },
+        ),
+        // Terrain-FBM material defaults — pair with
+        // `FbmTerrainFn::default()` material paths so a fresh project's
+        // procedural terrain renders correctly without any user setup.
+        (
+            "grass.arvxmat",
+            MaterialDef {
+                name: "Grass".into(),
+                albedo: [0.32, 0.48, 0.18],
+                roughness: 0.85,
+                metallic: 0.0,
+                ..Default::default()
+            },
+        ),
+        (
+            "rock.arvxmat",
+            MaterialDef {
+                name: "Rock".into(),
+                albedo: [0.42, 0.40, 0.38],
+                roughness: 0.92,
+                metallic: 0.0,
+                ..Default::default()
+            },
+        ),
+        (
+            "sand.arvxmat",
+            MaterialDef {
+                name: "Sand".into(),
+                albedo: [0.76, 0.69, 0.50],
+                roughness: 0.88,
+                metallic: 0.0,
+                ..Default::default()
+            },
+        ),
+        (
+            "snow.arvxmat",
+            MaterialDef {
+                name: "Snow".into(),
+                albedo: [0.93, 0.94, 0.96],
+                roughness: 0.55,
+                metallic: 0.0,
                 ..Default::default()
             },
         ),

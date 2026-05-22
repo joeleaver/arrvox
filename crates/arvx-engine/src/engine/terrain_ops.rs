@@ -158,6 +158,12 @@ impl super::state::EngineState {
     /// already (`SpawnTerrain`'s explicit check; scene-load's
     /// "only on first match" loop).
     pub(crate) fn init_terrain_runtime(&mut self, terrain_entity: hecs::Entity) {
+        // Bring the Terrain entity's runtime `terrain_fn` in line with
+        // the live `MaterialLibrary`. Scene-load and SpawnTerrain both
+        // construct the Terrain through the component registry, which
+        // can't see the material library — its `terrain_fn` resolves
+        // every `MaterialRef::Path` to slot 0 until refreshed here.
+        self.rebuild_terrain_fn_from_material_lib();
         let mut runtime = Box::new(
             crate::terrain_state::TerrainRuntime::new(terrain_entity),
         );
@@ -598,6 +604,49 @@ impl super::state::EngineState {
         runtime
             .streamer
             .invalidate_all_excluding(&runtime.dirty_tiles);
+    }
+
+    /// Rebuild every Terrain's runtime `terrain_fn` from its stored
+    /// spec using the current [`MaterialLibrary`]. Does NOT invalidate
+    /// tiles — call after construction (`init_terrain_runtime`,
+    /// scene-load) where there's nothing live to invalidate yet, or
+    /// from inside `refresh_terrain_fn_from_material_lib` which
+    /// handles invalidation separately.
+    ///
+    /// Editor-singleton invariant: at most one entity carries
+    /// `Terrain`; we iterate defensively in case that changes.
+    pub(crate) fn rebuild_terrain_fn_from_material_lib(&mut self) {
+        // Collect entity ids first so we can borrow `material_lib`
+        // immutably while taking a `&mut Terrain` from the world.
+        let entities: Vec<hecs::Entity> = self
+            .world
+            .query::<&arvx_terrain::Terrain>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for entity in entities {
+            if let Ok(mut t) = self.world.get::<&mut arvx_terrain::Terrain>(entity) {
+                t.refresh_terrain_fn(&self.material_lib);
+            }
+        }
+    }
+
+    /// Same as [`Self::rebuild_terrain_fn_from_material_lib`] but
+    /// also invalidates every live tile so they re-bake under the
+    /// new material resolution.
+    ///
+    /// Called when the material library's slot mapping changes — a new
+    /// material is created, an existing material is deleted, or a
+    /// fresh scan loads a different set of files. Without this, a
+    /// `MaterialRef::Path` that resolved to slot 0 (default opaque)
+    /// the first time around would silently stay at slot 0 even after
+    /// the user adds the missing `.arvxmat` file.
+    pub(crate) fn refresh_terrain_fn_from_material_lib(&mut self) {
+        self.rebuild_terrain_fn_from_material_lib();
+        // Every live tile may now resolve to different slot ids,
+        // so re-bake the lot. Dirty (sculpt-edited) tiles are
+        // preserved by `invalidate_all_terrain_tiles`.
+        self.invalidate_all_terrain_tiles();
     }
 
     /// Phase 9b: revert sculpt edits inside `aabb`. Two steps:

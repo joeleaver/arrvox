@@ -108,6 +108,12 @@ impl EngineState {
                 FileEvent::MaterialChanged(path) => {
                     eprintln!("[ArvxEngine] material changed: {}", path.display());
                     self.material_lib.reload(&path);
+                    // Reload may have added a previously-missing slot
+                    // (file appeared) or updated material defs that
+                    // affect Terrain bake output. Refresh defensively
+                    // — `refresh_terrain_fn_from_material_lib` is a
+                    // cheap no-op when there's no Terrain in the scene.
+                    self.refresh_terrain_fn_from_material_lib();
                 }
                 FileEvent::MeshSourceChanged(path) => {
                     eprintln!("[ArvxEngine] mesh source changed: {}", path.display());

@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use super::{ComponentEntry, FieldMeta};
 use crate::inspector::{FieldType, FieldValue};
 
-static TERRAIN_FIELDS: [FieldMeta; 14] = [
+static TERRAIN_FIELDS: [FieldMeta; 18] = [
     FieldMeta {
         name: "bounded",
         field_type: FieldType::Bool,
@@ -172,7 +172,79 @@ static TERRAIN_FIELDS: [FieldMeta; 14] = [
         enum_options: None,
         scrub: true,
     },
+    // Path-based material refs. Stored as project-root-relative
+    // strings (e.g. "assets/materials/rock.arvxmat") and resolved
+    // to slot ids at bake-time via `MaterialLibraryLookup`. Empty
+    // string → MaterialRef::Slot(0) (default opaque).
+    FieldMeta {
+        name: "fbm_grass_material",
+        field_type: FieldType::String,
+        range: None,
+        transient: false,
+        struct_fields: None,
+        asset_filter: Some("arvxmat"),
+        enum_options: None,
+        scrub: false,
+    },
+    FieldMeta {
+        name: "fbm_rock_material",
+        field_type: FieldType::String,
+        range: None,
+        transient: false,
+        struct_fields: None,
+        asset_filter: Some("arvxmat"),
+        enum_options: None,
+        scrub: false,
+    },
+    FieldMeta {
+        name: "fbm_snow_material",
+        field_type: FieldType::String,
+        range: None,
+        transient: false,
+        struct_fields: None,
+        asset_filter: Some("arvxmat"),
+        enum_options: None,
+        scrub: false,
+    },
+    FieldMeta {
+        name: "fbm_sand_material",
+        field_type: FieldType::String,
+        range: None,
+        transient: false,
+        struct_fields: None,
+        asset_filter: Some("arvxmat"),
+        enum_options: None,
+        scrub: false,
+    },
 ];
+
+/// Stringify a `MaterialRef` for the Inspector display. Path variants
+/// emit the path verbatim; Slot variants emit a non-editable `@slot:N`
+/// marker so the user sees what's bound. Empty string means "slot 0
+/// (default opaque)".
+fn material_ref_to_string(r: &arvx_core::MaterialRef) -> String {
+    match r {
+        arvx_core::MaterialRef::Path(p) => p.to_string_lossy().into_owned(),
+        arvx_core::MaterialRef::Slot(0) => String::new(),
+        arvx_core::MaterialRef::Slot(n) => format!("@slot:{n}"),
+    }
+}
+
+/// Parse the Inspector's string back into a `MaterialRef`. Recognises
+/// the `@slot:N` syntax (so a Slot-typed scene can still be edited
+/// without coercing it to a Path); everything else becomes a `Path`.
+/// Empty string → `Slot(0)`.
+fn string_to_material_ref(s: String) -> arvx_core::MaterialRef {
+    if s.is_empty() {
+        return arvx_core::MaterialRef::Slot(0);
+    }
+    if let Some(rest) = s.strip_prefix("@slot:") {
+        if let Ok(n) = rest.parse::<u16>() {
+            return arvx_core::MaterialRef::Slot(n);
+        }
+    }
+    arvx_core::MaterialRef::Path(s.into())
+}
 
 /// JSON shape for scene save/load. Captures only the
 /// authoritative fields; the runtime cache (`terrain_fn` trait
@@ -212,9 +284,9 @@ impl From<&Terrain> for TerrainSerde {
     }
 }
 
-fn fbm(t: &Terrain) -> Option<FbmTerrainFn> {
+fn fbm(t: &Terrain) -> Option<&FbmTerrainFn> {
     match &t.spec {
-        TerrainFnSpec::Fbm(f) => Some(*f),
+        TerrainFnSpec::Fbm(f) => Some(f),
     }
 }
 
@@ -224,7 +296,13 @@ where
 {
     let TerrainFnSpec::Fbm(mut fbm) = t.spec.clone();
     f(&mut fbm);
-    t.set_spec(TerrainFnSpec::Fbm(fbm));
+    // The component-registry set_field callback can't see the
+    // engine's `MaterialLibrary`, so we build the trait object
+    // with a null lookup here. The engine's post-edit hook in
+    // `cmd_runtime` calls `refresh_terrain_fn(&material_library)`
+    // on every Terrain edit, immediately rebuilding the runtime
+    // form with real slot resolution before any bake job runs.
+    t.set_spec(TerrainFnSpec::Fbm(fbm), &arvx_core::NullMaterialLookup);
     Ok(())
 }
 
@@ -294,6 +372,18 @@ pub fn terrain_entry() -> ComponentEntry {
                 )),
                 "fbm_slope_rock_threshold_deg" => Ok(FieldValue::Float(
                     fbm(&t).map(|f| f.slope_rock_threshold_deg as f64).unwrap_or(0.0),
+                )),
+                "fbm_grass_material" => Ok(FieldValue::String(
+                    fbm(&t).map(|f| material_ref_to_string(&f.grass_material)).unwrap_or_default(),
+                )),
+                "fbm_rock_material" => Ok(FieldValue::String(
+                    fbm(&t).map(|f| material_ref_to_string(&f.rock_material)).unwrap_or_default(),
+                )),
+                "fbm_snow_material" => Ok(FieldValue::String(
+                    fbm(&t).map(|f| material_ref_to_string(&f.snow_material)).unwrap_or_default(),
+                )),
+                "fbm_sand_material" => Ok(FieldValue::String(
+                    fbm(&t).map(|f| material_ref_to_string(&f.sand_material)).unwrap_or_default(),
                 )),
                 _ => Err(format!("unknown field '{field}'")),
             }
@@ -419,6 +509,34 @@ pub fn terrain_entry() -> ComponentEntry {
                         Err("type mismatch".into())
                     }
                 }
+                "fbm_grass_material" => {
+                    if let FieldValue::String(v) = value {
+                        set_fbm(&mut t, |f| f.grass_material = string_to_material_ref(v))
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "fbm_rock_material" => {
+                    if let FieldValue::String(v) = value {
+                        set_fbm(&mut t, |f| f.rock_material = string_to_material_ref(v))
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "fbm_snow_material" => {
+                    if let FieldValue::String(v) = value {
+                        set_fbm(&mut t, |f| f.snow_material = string_to_material_ref(v))
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
+                "fbm_sand_material" => {
+                    if let FieldValue::String(v) = value {
+                        set_fbm(&mut t, |f| f.sand_material = string_to_material_ref(v))
+                    } else {
+                        Err("type mismatch".into())
+                    }
+                }
                 _ => Err(format!("unknown field '{field}'")),
             }
         },
@@ -445,7 +563,11 @@ pub fn terrain_entry() -> ComponentEntry {
             t.render_radius_m = s.render_radius_m;
             t.lod_levels = s.lod_levels.clamp(1, 8);
             t.skirt_depth_m = s.skirt_depth_m.clamp(0.0, 64.0);
-            t.set_spec(s.spec);
+            // Same as `set_fbm`: deserialize_insert can't see the
+            // engine's material library. The engine's scene-load
+            // path refreshes the runtime form via `refresh_terrain_fn`
+            // (see `scene_io_ops.rs` post-load hook).
+            t.set_spec(s.spec, &arvx_core::NullMaterialLookup);
             world.insert_one(entity, t).map_err(|e| format!("{e}"))
         },
         on_add: None,
@@ -492,7 +614,7 @@ mod tests {
         let entry = terrain_entry();
         (entry.set_field)(&mut w, e, "fbm_seed", FieldValue::Int(12345)).unwrap();
         let t = w.get::<&Terrain>(e).unwrap();
-        match t.spec {
+        match &t.spec {
             TerrainFnSpec::Fbm(f) => assert_eq!(f.seed, 12345),
         }
         // Runtime trait object should produce the new seed's noise.
@@ -534,21 +656,24 @@ mod tests {
         let mut w = World::new();
         let mut t = Terrain::default();
         t.render_radius_m = 333.0;
-        t.set_spec(TerrainFnSpec::Fbm(FbmTerrainFn {
-            seed: 99,
-            octaves: 7,
-            scale_m: 200.0,
-            amplitude_m: 50.0,
-            base_height_m: -5.0,
-            sea_level_y: 0.0,
-            snow_level_y: 40.0,
-            slope_rock_threshold_deg: 30.0,
-            slope_probe_m: 0.5,
-            grass_material: 1,
-            rock_material: 3,
-            snow_material: 4,
-            sand_material: 2,
-        }));
+        t.set_spec(
+            TerrainFnSpec::Fbm(FbmTerrainFn {
+                seed: 99,
+                octaves: 7,
+                scale_m: 200.0,
+                amplitude_m: 50.0,
+                base_height_m: -5.0,
+                sea_level_y: 0.0,
+                snow_level_y: 40.0,
+                slope_rock_threshold_deg: 30.0,
+                slope_probe_m: 0.5,
+                grass_material: arvx_core::MaterialRef::Slot(1),
+                rock_material: arvx_core::MaterialRef::Slot(3),
+                snow_material: arvx_core::MaterialRef::Slot(4),
+                sand_material: arvx_core::MaterialRef::Slot(2),
+            }),
+            &arvx_core::NullMaterialLookup,
+        );
         let e = w.spawn((t,));
         let entry = terrain_entry();
         let json = (entry.serialize)(&w, e).expect("serialise");
@@ -557,7 +682,7 @@ mod tests {
 
         let back = w.get::<&Terrain>(e).unwrap();
         assert!((back.render_radius_m - 333.0).abs() < 1e-4);
-        match back.spec {
+        match &back.spec {
             TerrainFnSpec::Fbm(f) => {
                 assert_eq!(f.seed, 99);
                 assert_eq!(f.octaves, 7);

@@ -198,6 +198,15 @@ impl EngineState {
                                 // repopulate on the next residency
                                 // tick.
                                 if component_name == "Terrain" {
+                                    // The set_field path uses
+                                    // NullMaterialLookup (it can't see
+                                    // `self.material_lib`); refresh
+                                    // here so the runtime trait object
+                                    // gets correct slot ids before any
+                                    // bake runs. `rebuild_…` (no
+                                    // invalidate) — the explicit
+                                    // invalidate below picks that up.
+                                    self.rebuild_terrain_fn_from_material_lib();
                                     self.invalidate_all_terrain_tiles();
                                 }
                             }
@@ -288,6 +297,11 @@ impl EngineState {
                     Ok(id) => {
                         eprintln!("[ArvxEngine] created material '{name}' as id {id}");
                         self.selected_material = Some(id);
+                        // A new path → slot mapping exists. Any
+                        // Terrain `MaterialRef::Path` that previously
+                        // resolved to slot 0 (missing) may now bind
+                        // to this new slot — rebuild + re-bake.
+                        self.refresh_terrain_fn_from_material_lib();
                     }
                     Err(e) => eprintln!("[ArvxEngine] create material failed: {e}"),
                 }
@@ -372,6 +386,11 @@ impl EngineState {
                     if self.selected_material == Some(material_id) {
                         self.selected_material = None;
                     }
+                    // A path → slot mapping is gone. Any Terrain
+                    // `MaterialRef::Path` referring to it now resolves
+                    // to slot 0 — rebuild + re-bake so tiles don't
+                    // keep painting the deleted material's slot.
+                    self.refresh_terrain_fn_from_material_lib();
                 }
             }
 
