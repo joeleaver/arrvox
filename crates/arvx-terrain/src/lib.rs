@@ -31,6 +31,7 @@ pub mod terrain_fn_spec;
 pub mod tile_collider_mesh;
 pub mod tile_key;
 pub mod tile_tag;
+pub mod value_noise;
 pub mod worker;
 
 pub use bake::bake_tile;
@@ -50,7 +51,7 @@ pub use sculpt_diff_persist::{
     load_all_sculpt_diffs, load_sculpt_diff, save_sculpt_diff, sculpt_path,
     SCULPT_SUBDIR,
 };
-pub use stamp::{combine_heights, CombineOp, FalloffCurve, Stamp, StampKind};
+pub use stamp::{combine_heights, CombineOp, FalloffCurve, ShapeNoise, Stamp, StampKind, StampSample};
 pub use stamp_index::{StampIndex, StampIndexHandle};
 pub use streamer::{StreamerStats, TileSlot, TileState, TileStreamer};
 pub use terrain::Terrain;

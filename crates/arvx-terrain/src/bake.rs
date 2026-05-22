@@ -124,21 +124,30 @@ pub fn bake_tile_with_skirts(
                 let local = world_pos - tile_origin_world;
                 let mut s = terrain_fn.sample(key, local, voxel_size_m);
 
-                // Layer 2 — heightmap-style stamps.
+                // Layer 2 — heightmap-style stamps. The V2 stamp
+                // API returns `(target_h, weight)`; we blend the
+                // combine_op'd target back toward the running `h`
+                // by `(1 - weight)`. That makes soft-rim stamps
+                // (rounded plateau, noisy lake shore) ramp their
+                // effect down to zero at the rim without changing
+                // the combine_op contract.
                 if !stamps.is_empty() {
                     let wy = world_pos.y;
                     let mut h = wy - s.sd;
                     let mut mat_override: Option<u16> = None;
                     for stamp in stamps {
-                        if let Some(target_h) =
+                        if let Some(sample) =
                             stamp.sample_height(world_pos.x, world_pos.z)
                         {
-                            h = combine_heights(
+                            let combined = combine_heights(
                                 h,
-                                target_h,
+                                sample.target_h,
                                 stamp.combine_op,
                                 stamp.position.y,
                             );
+                            // Lerp(h, combined, weight). weight = 1
+                            // reproduces V1 behaviour exactly.
+                            h = h + (combined - h) * sample.weight;
                             if let Some(m) = stamp.material_override {
                                 mat_override = Some(m);
                             }
@@ -863,6 +872,9 @@ mod tests {
                 h_max: 15.0,
                 radius: 16.0,
                 falloff: FalloffCurve::Smoothstep,
+                aspect: 1.0,
+                ridge_strength: 0.0,
+                ridge_count: 3,
             },
             Vec3::new(32.0, 32.0, 32.0),
         );
@@ -898,6 +910,8 @@ mod tests {
                 depth: 10.0,
                 radius: 16.0,
                 falloff: FalloffCurve::Smoothstep,
+                aspect: 1.0,
+                floor_flat_frac: 0.0,
             },
             // FlatHalf surface is at world y = 32. Place the lake surface there
             // so the basin floor lands at y = 22.
@@ -934,6 +948,9 @@ mod tests {
         let stamp = crate::stamp::Stamp::new(
             StampKind::Flatten {
                 half_extents: glam::Vec2::new(40.0, 40.0),
+                corner_radius_m: 0.0,
+                edge_falloff_m: 0.0,
+                tilt: glam::Vec2::ZERO,
             },
             Vec3::new(32.0, target_y, 32.0),
         );
@@ -965,6 +982,8 @@ mod tests {
                 depth: 8.0,
                 radius: 14.0,
                 falloff: FalloffCurve::Smoothstep,
+                aspect: 1.0,
+                floor_flat_frac: 0.0,
             },
             Vec3::new(16.0, 32.0, 32.0),
         );
@@ -975,6 +994,9 @@ mod tests {
                 h_max: 12.0,
                 radius: 14.0,
                 falloff: FalloffCurve::Smoothstep,
+                aspect: 1.0,
+                ridge_strength: 0.0,
+                ridge_count: 3,
             },
             Vec3::new(48.0, 32.0, 32.0),
         );

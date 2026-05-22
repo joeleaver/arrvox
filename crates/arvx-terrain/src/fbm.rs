@@ -381,70 +381,12 @@ impl TerrainFn for FbmTerrainFnResolved {
     }
 }
 
-// ── value-noise FBM ────────────────────────────────────────────────────────
-
-/// Hash a 2D integer lattice point to a float in `[-1, 1]`.
-fn hash2(x: i32, z: i32, seed: u32) -> f32 {
-    let mut n = seed
-        .wrapping_add((x as u32).wrapping_mul(73_856_093))
-        .wrapping_add((z as u32).wrapping_mul(19_349_663));
-    n ^= n >> 13;
-    n = n.wrapping_mul(0x5bd1_e995);
-    n ^= n >> 15;
-    // Map u32 → [-1, 1].
-    (n as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-/// Bilinear-interpolated 2D value noise with smoothstep weights.
-fn value_noise_2d(x: f32, z: f32, seed: u32) -> f32 {
-    let xi = x.floor() as i32;
-    let zi = z.floor() as i32;
-    let xf = x - xi as f32;
-    let zf = z - zi as f32;
-
-    let v00 = hash2(xi, zi, seed);
-    let v10 = hash2(xi + 1, zi, seed);
-    let v01 = hash2(xi, zi + 1, seed);
-    let v11 = hash2(xi + 1, zi + 1, seed);
-
-    let smx = xf * xf * (3.0 - 2.0 * xf);
-    let smz = zf * zf * (3.0 - 2.0 * zf);
-
-    let a = v00 * (1.0 - smx) + v10 * smx;
-    let b = v01 * (1.0 - smx) + v11 * smx;
-    a * (1.0 - smz) + b * smz
-}
-
-/// Octave-summed FBM. Output is approximately in `[-1, 1]`.
-///
-/// Normalises by the GEOMETRIC-SERIES LIMIT `2.0` rather than the
-/// per-call partial sum. This is load-bearing for the V2 LOD-pyramid
-/// pre-filter: dropping high-frequency octaves (to avoid Nyquist
-/// aliasing at coarse voxel sizes) leaves the same low-frequency
-/// amplitude as the fine bake. The partial-sum normalisation would
-/// instead AMPLIFY the surviving low-freq octaves by the missing
-/// amplitude — turning the pre-filter into a brightness shift
-/// (coarse terrain ends up taller than fine).
-///
-/// Cost: outputs are at most ~3% smaller in absolute amplitude than
-/// the pre-fix normalisation (5 octaves: partial sum = 1.9375, vs
-/// limit 2.0 → 0.97× factor). Visually identical for V1 / V2 defaults.
-fn fbm_2d(x: f32, z: f32, octaves: u8, seed: u32) -> f32 {
-    let mut sum = 0.0;
-    let mut amplitude = 1.0;
-    let mut frequency = 1.0;
-    for o in 0..octaves {
-        let s = seed.wrapping_add((o as u32).wrapping_mul(0x9E37_79B9));
-        sum += amplitude * value_noise_2d(x * frequency, z * frequency, s);
-        amplitude *= 0.5;
-        frequency *= 2.0;
-    }
-    // Infinite-series limit of 1 + 0.5 + 0.25 + ... = 2.0. Dividing by
-    // the limit makes low-freq amplitude invariant under octave-count
-    // changes (the LOD pre-filter is then a pure low-pass, not a
-    // re-amplifier).
-    sum / 2.0
-}
+// FBM primitives (hash2 / value_noise_2d / fbm_2d) live in
+// `crate::value_noise` so both this module and `crate::stamp` can
+// use the same noise. The pre-filter normalisation (divide by the
+// geometric-series limit 2.0 instead of the partial sum) is
+// documented there; it's load-bearing for the V2 LOD pyramid.
+use crate::value_noise::fbm_2d;
 
 #[cfg(test)]
 mod tests {

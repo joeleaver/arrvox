@@ -150,6 +150,9 @@ mod tests {
                 h_max,
                 radius,
                 falloff: FalloffCurve::Smoothstep,
+                aspect: 1.0,
+                ridge_strength: 0.0,
+                ridge_count: 3,
             },
             p,
         );
