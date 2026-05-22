@@ -89,6 +89,13 @@ const PREFIX_SUM_MAX_WG_COUNT: u32 = 1024u;
 // `PREFIX_SUM_MAX_WG_COUNT_2` entries of `wg_sums2`.
 const PREFIX_SUM_MAX_WG_COUNT_2: u32 = 4u;
 
+// Hard cap on per-anchor spawn count, mirroring
+// `MAX_SPAWNS_PER_ANCHOR_V1` in the engine. `entry_spawn_count` clamps
+// the user shader's `spawn_count` return to this value so the records
+// buffer (sized `MAX_ANCHORS × MAX_SPAWNS_PER_ANCHOR_V1`) cannot
+// overflow if a user pushes a density slider past the buffer cap.
+const MAX_SPAWNS_PER_ANCHOR_V1: u32 = 32u;
+
 // Layout mirrors `arvx_render::user_shader_mesh_pass::AnchorRecord`.
 // 80 B std430. `surface_normal` (vec3) sits at offset 64 with `seed`
 // packing into the trailing 4 B at offset 76 — see
@@ -307,7 +314,11 @@ const USER_BODY_END: u32 = 0u;
 fn entry_spawn_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= dispatch.num_anchors) { return; }
-    out_counts[i] = spawn_count(anchors[i], frame);
+    // Hard-clamp the user shader's return to the records-buffer cap.
+    // A runaway density slider can't overflow `out_records` because
+    // every anchor contributes at most `MAX_SPAWNS_PER_ANCHOR_V1` to
+    // the global total `instance_count` produced by the scan.
+    out_counts[i] = min(spawn_count(anchors[i], frame), MAX_SPAWNS_PER_ANCHOR_V1);
 }
 
 // ── Multi-pass Blelloch prefix sum ────────────────────────────────

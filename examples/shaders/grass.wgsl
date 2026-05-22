@@ -31,11 +31,11 @@
 // ── Per-material params ───────────────────────────────────────────
 // `density` is blades-per-m² of painted surface. Probabilistic
 // rounding spreads sub-integer expected counts across spawns.
-// At the V1 cap of 64 blades per anchor with tile_size = 0.5 m
-// (area 0.25 m²), saturation hits at density = 256 blades/m².
+// At the V1 cap of 32 blades per anchor with tile_size = 0.5 m
+// (area 0.25 m²), saturation hits at density = 128 blades/m².
 // @param blade_height: f32 = 0.35,  range = [0.05, 1.5]
 // @param blade_width:  f32 = 0.04,  range = [0.01, 0.2]
-// @param density:      f32 = 100.0, range = [1.0, 256.0]
+// @param density:      f32 = 100.0, range = [1.0, 128.0]
 // @param wind_amp:     f32 = 0.08,  range = [0.0, 0.3]
 // @param wind_freq:    f32 = 1.5,   range = [0.0, 6.0]
 
@@ -104,8 +104,10 @@ fn grass_blade_base(anchor: AnchorContext, spawn_idx: u32) -> vec3<f32> {
 // leaf BB, not the tile cube — so density scales on the actual
 // painted m², not on tile area that may be mostly empty).
 // Probabilistic rounding so sub-integer counts don't floor to 0.
-// Capped at the engine's per-anchor spawn ceiling (V1 = 64,
-// matching `MAX_SPAWNS_PER_ANCHOR_V1`).
+// Capped at the engine's per-anchor spawn ceiling (V1 = 32,
+// matching `MAX_SPAWNS_PER_ANCHOR_V1`). The host WESL also clamps
+// `out_counts[i]` to the same value, so returning more here is safe
+// but wasted work.
 fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
     let density = ctx_param(2);
     // Use the LOD-stable tile cube area, not the painted-leaf BB —
@@ -123,7 +125,7 @@ fn spawn_count(anchor: AnchorContext, frame: FrameContext) -> u32 {
     let r = grass_hash_u01(anchor.seed ^ 0xA341316Cu);
     var n = base;
     if (r < frac) { n = n + 1u; }
-    return min(n, 64u);
+    return min(n, 32u);
 }
 
 // ── spawn_alive ───────────────────────────────────────────────────

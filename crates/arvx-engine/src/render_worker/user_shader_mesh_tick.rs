@@ -8,7 +8,7 @@
 //!      then `UserShaderMeshPass::build_pipelines`).
 //!   2. Allocates fixed-capacity GPU buffers (per material) for
 //!      anchors / counts / offsets / records / indirect args /
-//!      uniforms. V1 caps at 1024 anchors × 64 spawns/anchor.
+//!      uniforms. V1 caps at 262 144 anchors × 32 spawns/anchor.
 //!   3. Uploads the per-frame data: anchor records, FrameUniforms,
 //!      UserShaderParams, DispatchInfo.
 //!   4. Dispatches the three compute passes: spawn_count → prefix_sum
@@ -119,11 +119,14 @@ fn filter_anchors(
 }
 
 /// Fixed V1 cap on per-anchor spawn count. With
-/// `MAX_ANCHORS_PER_SHADER_V1 = 262 144` and a 64-spawn/anchor cap, the
-/// records buffer is `262 144 × 64 × 8 B ≈ 128 MB` per material. The
-/// shader spawn_count is also clamped to this value so the records
-/// buffer cannot overflow.
-pub const MAX_SPAWNS_PER_ANCHOR_V1: u32 = 64;
+/// `MAX_ANCHORS_PER_SHADER_V1 = 262 144` and a 32-spawn/anchor cap, the
+/// records buffer is `262 144 × 32 × 8 B ≈ 64 MB` per material — half
+/// the size of the V1 64-cap. The WESL `entry_spawn_count` clamps the
+/// user shader's return to this constant so a runaway density slider
+/// cannot overflow the records buffer; the visible blade cap at
+/// `@tile_size 0.5` becomes `32 / 0.25 m² = 128 blades/m²`, which is
+/// well above any realistic grass density.
+pub const MAX_SPAWNS_PER_ANCHOR_V1: u32 = 32;
 pub const MAX_SPAWNS_PER_SHADER_V1: u32 =
     MAX_ANCHORS_PER_SHADER_V1 * MAX_SPAWNS_PER_ANCHOR_V1;
 
@@ -679,5 +682,22 @@ mod tests {
         let a = anchor_at([0.0; 3], [1.0; 3]);
         let out = filter_anchors(&[a], glam::Vec3::ZERO, None, None);
         assert_eq!(out.len(), 1);
+    }
+
+    /// Pin the V1 per-anchor spawn cap at 32. The records buffer is
+    /// sized `MAX_ANCHORS × MAX_SPAWNS_PER_ANCHOR_V1`, so silently
+    /// raising this without resizing the buffer would walk off the
+    /// end during `entry_fill`. The WESL also hardcodes the matching
+    /// `MAX_SPAWNS_PER_ANCHOR_V1 = 32u`; if you change one, the
+    /// composer's naga-validated test will fail before runtime.
+    #[test]
+    fn max_spawns_per_anchor_v1_is_32() {
+        assert_eq!(MAX_SPAWNS_PER_ANCHOR_V1, 32);
+        // Sanity: records buffer total = MAX_ANCHORS × MAX_SPAWNS,
+        // and the prefix sum's `instance_count` cannot exceed it.
+        assert_eq!(
+            MAX_SPAWNS_PER_SHADER_V1 as u64,
+            MAX_ANCHORS_PER_SHADER_V1 as u64 * 32,
+        );
     }
 }

@@ -217,10 +217,10 @@ pub fn anchor_seed(world_pos: [f32; 3]) -> u32 {
 ///   anchors  = 262 144 ×  96 B                ≈  25 MB
 ///   counts                                     ≈   1 MB
 ///   offsets                                    ≈   1 MB
-///   records  = 262 144 × MAX_SPAWNS ×  8 B    ≈ 128 MB (with MAX_SPAWNS=64)
+///   records  = 262 144 × MAX_SPAWNS ×  8 B    ≈  64 MB (with MAX_SPAWNS=32)
 ///   wg_sums                                    ≈   4 KB
 ///   wg_sums2                                   ≈  16 B
-///   Total                                      ≈ 155 MB
+///   Total                                      ≈  91 MB
 pub const MAX_ANCHORS_PER_SHADER_V1: u32 = 262_144;
 
 /// Per-workgroup-sum slots used by the tier-1 Blelloch scan. Must
