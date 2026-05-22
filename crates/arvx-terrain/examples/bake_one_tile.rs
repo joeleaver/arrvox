@@ -82,7 +82,8 @@ fn main() {
     let fbm = FbmTerrainFn {
         seed: args.seed,
         ..Default::default()
-    };
+    }
+    .resolve(&arvx_core::NullMaterialLookup);
 
     println!(
         "Baking tile ({}, {}, {}) at level 0 — voxel_size = {} m, extent = {} m",

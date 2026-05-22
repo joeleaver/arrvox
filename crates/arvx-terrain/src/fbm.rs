@@ -21,13 +21,21 @@
 
 use crate::terrain_fn::{TerrainFn, TerrainSample};
 use crate::tile_key::TileKey;
+use arvx_core::{MaterialLibraryLookup, MaterialRef};
 use glam::Vec3;
 
 /// FBM heightmap terrain with slope+height material rules.
 ///
 /// Deterministic given the seed. Self-contained — uses an internal
 /// xorshift-style hash for the noise lattice, no `rand`/`noise` crate.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// **Spec form** — this struct is what's authored on disk (in the
+/// Inspector / scene file). It does NOT impl [`TerrainFn`] because
+/// the material fields are [`MaterialRef`]s that need a
+/// [`MaterialLibraryLookup`] to become concrete slot ids. Call
+/// [`FbmTerrainFn::resolve`] to produce the runtime
+/// [`FbmTerrainFnResolved`] that does impl `TerrainFn`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FbmTerrainFn {
     /// Determinism seed.
     pub seed: u32,
@@ -56,15 +64,36 @@ pub struct FbmTerrainFn {
     /// is a sensible default for terrain at the V1 default tier
     /// (0.25 m voxels).
     pub slope_probe_m: f32,
-    /// Material id used on near-flat ground above sea level and
-    /// below the snow line.
-    pub grass_material: u16,
-    /// Material id used on slopes steeper than `slope_rock_threshold_deg`.
-    pub rock_material: u16,
-    /// Material id used above `snow_level_y`.
-    pub snow_material: u16,
-    /// Material id used at or below `sea_level_y`.
-    pub sand_material: u16,
+    /// Material reference used on near-flat ground above sea level and
+    /// below the snow line. Default: `"assets/materials/grass.arvxmat"`.
+    #[serde(default = "default_grass_material")]
+    pub grass_material: MaterialRef,
+    /// Material reference used on slopes steeper than
+    /// `slope_rock_threshold_deg`. Default:
+    /// `"assets/materials/rock.arvxmat"`.
+    #[serde(default = "default_rock_material")]
+    pub rock_material: MaterialRef,
+    /// Material reference used above `snow_level_y`. Default:
+    /// `"assets/materials/snow.arvxmat"`.
+    #[serde(default = "default_snow_material")]
+    pub snow_material: MaterialRef,
+    /// Material reference used at or below `sea_level_y`. Default:
+    /// `"assets/materials/sand.arvxmat"`.
+    #[serde(default = "default_sand_material")]
+    pub sand_material: MaterialRef,
+}
+
+fn default_grass_material() -> MaterialRef {
+    MaterialRef::path("assets/materials/grass.arvxmat")
+}
+fn default_rock_material() -> MaterialRef {
+    MaterialRef::path("assets/materials/rock.arvxmat")
+}
+fn default_snow_material() -> MaterialRef {
+    MaterialRef::path("assets/materials/snow.arvxmat")
+}
+fn default_sand_material() -> MaterialRef {
+    MaterialRef::path("assets/materials/sand.arvxmat")
 }
 
 impl Default for FbmTerrainFn {
@@ -74,6 +103,14 @@ impl Default for FbmTerrainFn {
         // amplitude = 24, the surface oscillates in [-8, 40] m —
         // sea_level at 0 covers troughs, snow_level at 32 covers
         // upper peaks, rock kicks in on steep flanks.
+        //
+        // Materials use PATH refs by default so a fresh project's
+        // starter palette resolves cleanly regardless of palette
+        // sort order. The starter pack ships grass/rock/snow/sand
+        // for exactly this reason — without those files the refs
+        // fall back to slot 0 (default opaque) with a console
+        // warning, which is much better than silently colliding
+        // with whatever happens to land at slots 1..4.
         Self {
             seed: 42,
             octaves: 5,
@@ -84,10 +121,10 @@ impl Default for FbmTerrainFn {
             snow_level_y: 32.0,
             slope_rock_threshold_deg: 35.0,
             slope_probe_m: 0.5,
-            grass_material: 1,
-            rock_material: 3,
-            snow_material: 4,
-            sand_material: 2,
+            grass_material: default_grass_material(),
+            rock_material: default_rock_material(),
+            snow_material: default_snow_material(),
+            sand_material: default_sand_material(),
         }
     }
 }
@@ -177,6 +214,101 @@ impl FbmTerrainFn {
         grad_mag.atan().to_degrees()
     }
 
+    /// Resolve [`MaterialRef`]s against `lookup`, producing a runtime
+    /// [`FbmTerrainFnResolved`] that impls [`TerrainFn`]. Resolved
+    /// once per bake-job submission (cheap — 4 hash-map lookups), not
+    /// once per voxel.
+    pub fn resolve(&self, lookup: &dyn MaterialLibraryLookup) -> FbmTerrainFnResolved {
+        FbmTerrainFnResolved {
+            seed: self.seed,
+            octaves: self.octaves,
+            scale_m: self.scale_m,
+            amplitude_m: self.amplitude_m,
+            base_height_m: self.base_height_m,
+            sea_level_y: self.sea_level_y,
+            snow_level_y: self.snow_level_y,
+            slope_rock_threshold_deg: self.slope_rock_threshold_deg,
+            slope_probe_m: self.slope_probe_m,
+            grass_material: self.grass_material.resolve(lookup),
+            rock_material: self.rock_material.resolve(lookup),
+            snow_material: self.snow_material.resolve(lookup),
+            sand_material: self.sand_material.resolve(lookup),
+        }
+    }
+}
+
+/// Resolved runtime form of [`FbmTerrainFn`]. Material refs have been
+/// collapsed to concrete `u16` slot ids — this struct is what the bake
+/// worker calls `sample` on, once per voxel position. Built by
+/// [`FbmTerrainFn::resolve`] at bake-job submission time so the hot
+/// path stays a single field load per material lookup.
+///
+/// Never serialized: the on-disk authoritative form is `FbmTerrainFn`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FbmTerrainFnResolved {
+    pub seed: u32,
+    pub octaves: u8,
+    pub scale_m: f32,
+    pub amplitude_m: f32,
+    pub base_height_m: f32,
+    pub sea_level_y: f32,
+    pub snow_level_y: f32,
+    pub slope_rock_threshold_deg: f32,
+    pub slope_probe_m: f32,
+    pub grass_material: u16,
+    pub rock_material: u16,
+    pub snow_material: u16,
+    pub sand_material: u16,
+}
+
+impl FbmTerrainFnResolved {
+    /// Nyquist-clamped octave count for a given voxel size. See
+    /// [`FbmTerrainFn::octaves_for_voxel`] for the derivation; this
+    /// mirror exists so the resolved form is self-contained at the
+    /// bake hot path.
+    pub fn octaves_for_voxel(&self, voxel_size_m: f32) -> u8 {
+        if voxel_size_m <= 0.0 || self.scale_m <= 0.0 {
+            return self.octaves;
+        }
+        let max_safe = (self.scale_m / (2.0 * voxel_size_m)).log2().floor() as i32 + 1;
+        max_safe.max(1).min(self.octaves as i32) as u8
+    }
+
+    pub fn height_at_with_octaves(&self, x_m: f32, z_m: f32, octaves: u8) -> f32 {
+        let n = fbm_2d(
+            x_m / self.scale_m,
+            z_m / self.scale_m,
+            octaves,
+            self.seed,
+        );
+        self.base_height_m + n * self.amplitude_m
+    }
+
+    pub fn height_at(&self, x_m: f32, z_m: f32) -> f32 {
+        self.height_at_with_octaves(x_m, z_m, self.octaves)
+    }
+
+    pub fn slope_degrees_at_with_octaves(
+        &self,
+        x_m: f32,
+        z_m: f32,
+        octaves: u8,
+    ) -> f32 {
+        let half = self.slope_probe_m.max(1e-3) * 0.5;
+        let dh_dx = (self.height_at_with_octaves(x_m + half, z_m, octaves)
+            - self.height_at_with_octaves(x_m - half, z_m, octaves))
+            / (2.0 * half);
+        let dh_dz = (self.height_at_with_octaves(x_m, z_m + half, octaves)
+            - self.height_at_with_octaves(x_m, z_m - half, octaves))
+            / (2.0 * half);
+        let grad_mag = (dh_dx * dh_dx + dh_dz * dh_dz).sqrt();
+        grad_mag.atan().to_degrees()
+    }
+
+    pub fn slope_degrees_at(&self, x_m: f32, z_m: f32) -> f32 {
+        self.slope_degrees_at_with_octaves(x_m, z_m, self.octaves)
+    }
+
     /// Pick the material id at a world-space `(x, y, z)` using the
     /// configured slope/height rules. Pure data — no SDF involvement.
     pub fn material_at(&self, x_m: f32, y_m: f32, z_m: f32) -> u16 {
@@ -209,7 +341,7 @@ impl FbmTerrainFn {
     }
 }
 
-impl TerrainFn for FbmTerrainFn {
+impl TerrainFn for FbmTerrainFnResolved {
     fn sample(&self, tile: TileKey, local: Vec3, voxel_size_m: f32) -> TerrainSample {
         // Tile-local → world-space x/z for the noise lookup.
         // `origin_world().to_vec3()` is f32-precision in absolute world
@@ -317,17 +449,28 @@ fn fbm_2d(x: f32, z: f32, octaves: u8, seed: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arvx_core::NullMaterialLookup;
+
+    /// All tests that need to call `TerrainFn::sample` or
+    /// `material_at` operate on the resolved form. We resolve the
+    /// authored defaults via the null lookup (every `Path` → 0) when
+    /// the test doesn't care about which specific material id comes
+    /// back; tests that DO care construct the resolved struct
+    /// directly with explicit slot ids.
+    fn resolved_default() -> FbmTerrainFnResolved {
+        FbmTerrainFn::default().resolve(&NullMaterialLookup)
+    }
 
     #[test]
     fn default_is_finite_at_origin() {
-        let f = FbmTerrainFn::default();
+        let f = resolved_default();
         let h = f.height_at(0.0, 0.0);
         assert!(h.is_finite(), "height at origin = {h}");
     }
 
     #[test]
     fn deterministic_across_calls() {
-        let f = FbmTerrainFn::default();
+        let f = resolved_default();
         let s1 = f.sample(TileKey::level0(0, 0, 0), Vec3::new(1.0, 2.0, 3.0), 0.08);
         let s2 = f.sample(TileKey::level0(0, 0, 0), Vec3::new(1.0, 2.0, 3.0), 0.08);
         assert_eq!(s1, s2);
@@ -335,8 +478,8 @@ mod tests {
 
     #[test]
     fn different_seeds_produce_different_heights() {
-        let mut a = FbmTerrainFn::default();
-        let mut b = FbmTerrainFn::default();
+        let mut a = resolved_default();
+        let mut b = resolved_default();
         a.seed = 1;
         b.seed = 2;
         // 100 samples on a coarse grid; almost certainly at least one differs.
@@ -356,7 +499,7 @@ mod tests {
     /// SDF sign convention: above surface positive, below negative.
     #[test]
     fn sign_convention_above_and_below() {
-        let f = FbmTerrainFn::default();
+        let f = resolved_default();
         let k = TileKey::level0(0, 0, 0);
         // Well above the base height should be positive.
         let high = f.sample(k, Vec3::new(0.0, 1000.0, 0.0), 0.08);
@@ -372,7 +515,7 @@ mod tests {
     /// the value remains well-defined.
     #[test]
     fn far_tile_sample_is_finite() {
-        let f = FbmTerrainFn::default();
+        let f = resolved_default();
         let k = TileKey::level0(1000, 0, 1000);
         let s = f.sample(k, Vec3::new(32.0, 100.0, 32.0), 0.08);
         assert!(s.sd.is_finite());
@@ -380,17 +523,25 @@ mod tests {
 
     // ── slope+height material rules ────────────────────────────────
 
-    fn flat_fbm() -> FbmTerrainFn {
-        // Flat heightmap (zero amplitude) at y = 5 — every slope probe
-        // returns 0°. Lets us isolate the height-band rules from the
-        // slope rule.
-        FbmTerrainFn {
+    /// Flat heightmap (zero amplitude) at y = 5 — every slope probe
+    /// returns 0°. Lets us isolate the height-band rules from the
+    /// slope rule. Explicit slot ids so material assertions can
+    /// distinguish grass/rock/snow/sand.
+    fn flat_fbm() -> FbmTerrainFnResolved {
+        FbmTerrainFnResolved {
+            seed: 42,
+            octaves: 5,
+            scale_m: 120.0,
             amplitude_m: 0.0,
             base_height_m: 5.0,
             sea_level_y: 0.0,
             snow_level_y: 100.0,
             slope_rock_threshold_deg: 35.0,
-            ..FbmTerrainFn::default()
+            slope_probe_m: 0.5,
+            grass_material: 1,
+            rock_material: 3,
+            snow_material: 4,
+            sand_material: 2,
         }
     }
 
@@ -423,7 +574,7 @@ mod tests {
     fn snow_takes_priority_over_rock_at_altitude() {
         // High-altitude steep slope: snow_level_y check fires first,
         // so the material is snow, not rock.
-        let mut f = FbmTerrainFn::default();
+        let mut f = flat_fbm();
         f.snow_level_y = 10.0;
         f.slope_rock_threshold_deg = 0.1;
         let m = f.material_at(0.0, 100.0, 0.0);
@@ -435,7 +586,7 @@ mod tests {
         // Construct a steep heightmap. amplitude_m = 50 over scale_m
         // = 10 produces gradients on the order of several units per
         // metre, well past the default 35° threshold.
-        let f = FbmTerrainFn {
+        let f = FbmTerrainFnResolved {
             seed: 42,
             octaves: 5,
             scale_m: 10.0,
@@ -499,7 +650,7 @@ mod tests {
     /// shortest-wavelength octave is still ≥ 2× the voxel size.
     #[test]
     fn octaves_for_voxel_clamps_at_nyquist() {
-        let mut f = FbmTerrainFn::default();
+        let mut f = resolved_default();
         f.scale_m = 120.0;
         f.octaves = 12;
         // vs = 1.0 m → log2(60) ≈ 5.9 → 6 octaves.
@@ -517,7 +668,7 @@ mod tests {
     /// it's a low-pass, not a re-amplification.
     #[test]
     fn octaves_for_voxel_never_exceeds_configured_octaves() {
-        let mut f = FbmTerrainFn::default();
+        let mut f = resolved_default();
         f.scale_m = 120.0;
         f.octaves = 3;
         // Even at sub-voxel resolution where Nyquist would allow 10+
@@ -536,7 +687,7 @@ mod tests {
     /// we drop high octaves.
     #[test]
     fn coarse_voxel_height_drops_high_frequency_content() {
-        let f = FbmTerrainFn {
+        let f = FbmTerrainFnResolved {
             seed: 42,
             octaves: 8,
             scale_m: 64.0,
@@ -594,7 +745,7 @@ mod tests {
     /// calling `height_at_with_octaves` with the clamped octave count.
     #[test]
     fn sample_uses_octaves_for_voxel() {
-        let f = FbmTerrainFn::default();
+        let f = resolved_default();
         let k = TileKey::level0(0, 0, 0);
         let local = Vec3::new(13.7, 0.0, 42.1);
         let world_origin = k.origin_world().to_vec3();
@@ -612,5 +763,51 @@ mod tests {
             (surface_y_from_sample - expected_surface_y).abs() < 1e-4,
             "sample(vs={vs_coarse}) must use octaves_for_voxel={octs}"
         );
+    }
+
+    /// `FbmTerrainFn::resolve` swaps every `MaterialRef::Path` for the
+    /// looked-up slot id; missing paths fall back to 0.
+    #[test]
+    fn resolve_swaps_paths_for_slot_ids() {
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+
+        struct MapLookup(HashMap<PathBuf, u16>);
+        impl arvx_core::MaterialLibraryLookup for MapLookup {
+            fn resolve_path(&self, p: &Path) -> Option<u16> {
+                self.0.get(p).copied()
+            }
+        }
+
+        let mut m = HashMap::new();
+        m.insert(PathBuf::from("assets/materials/grass.arvxmat"), 7);
+        m.insert(PathBuf::from("assets/materials/rock.arvxmat"), 9);
+        // snow + sand intentionally missing → resolve to 0.
+        let lookup = MapLookup(m);
+
+        let resolved = FbmTerrainFn::default().resolve(&lookup);
+        assert_eq!(resolved.grass_material, 7);
+        assert_eq!(resolved.rock_material, 9);
+        assert_eq!(resolved.snow_material, 0);
+        assert_eq!(resolved.sand_material, 0);
+    }
+
+    /// `MaterialRef::Slot` variants resolve unchanged (back-compat
+    /// with bare-u16 scenes).
+    #[test]
+    fn resolve_slot_variants_pass_through() {
+        use arvx_core::MaterialRef;
+        let f = FbmTerrainFn {
+            grass_material: MaterialRef::Slot(11),
+            rock_material: MaterialRef::Slot(22),
+            snow_material: MaterialRef::Slot(33),
+            sand_material: MaterialRef::Slot(44),
+            ..FbmTerrainFn::default()
+        };
+        let resolved = f.resolve(&NullMaterialLookup);
+        assert_eq!(resolved.grass_material, 11);
+        assert_eq!(resolved.rock_material, 22);
+        assert_eq!(resolved.snow_material, 33);
+        assert_eq!(resolved.sand_material, 44);
     }
 }

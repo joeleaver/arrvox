@@ -480,7 +480,7 @@ mod tests {
     fn bake_fbm_at_origin_produces_surface() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
-        let fbm = FbmTerrainFn::default();
+        let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
         let baked = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake");
         assert!(
             baked.vertex_count() > 100,
@@ -589,7 +589,7 @@ mod tests {
     fn adjacent_fbm_tiles_meet_at_shared_face() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
-        let fbm = FbmTerrainFn::default();
+        let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
 
         let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake A");
         let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake B");
@@ -708,7 +708,7 @@ mod tests {
     fn probe_fbm_seam_distances() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
-        let fbm = FbmTerrainFn::default();
+        let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
         let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake A");
         let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake B");
 
@@ -926,7 +926,7 @@ mod tests {
     fn flatten_stamp_forces_target_y() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
-        let fbm = FbmTerrainFn::default();
+        let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
 
         let target_y = 16.0;
         // Half-extents 40 m covers the full tile (64 m) + slack so every

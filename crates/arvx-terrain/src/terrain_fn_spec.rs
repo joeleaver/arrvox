@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use arvx_core::MaterialLibraryLookup;
+
 use crate::fbm::FbmTerrainFn;
 use crate::terrain_fn::TerrainFn;
 
@@ -34,9 +36,17 @@ impl Default for TerrainFnSpec {
 
 impl TerrainFnSpec {
     /// Build the runtime trait object handed to the bake worker.
-    pub fn to_dyn(&self) -> Arc<dyn TerrainFn> {
+    ///
+    /// Variants whose fields carry [`arvx_core::MaterialRef`]s
+    /// (currently `Fbm`) resolve them against `lookup` here so the
+    /// bake hot path stays `u16`-only. Pass
+    /// [`arvx_core::NullMaterialLookup`] in tests / pre-engine code
+    /// paths where the [`arvx_engine::MaterialLibrary`] isn't
+    /// available — every `Path` ref then resolves to slot 0 with the
+    /// usual warn-once message.
+    pub fn to_dyn(&self, lookup: &dyn MaterialLibraryLookup) -> Arc<dyn TerrainFn> {
         match self {
-            Self::Fbm(f) => Arc::new(*f),
+            Self::Fbm(f) => Arc::new(f.resolve(lookup)),
         }
     }
 
@@ -74,6 +84,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_fbm() {
+        use arvx_core::MaterialRef;
         let original = TerrainFnSpec::Fbm(FbmTerrainFn {
             seed: 1234,
             octaves: 3,
@@ -84,10 +95,10 @@ mod tests {
             snow_level_y: 100.0,
             slope_rock_threshold_deg: 40.0,
             slope_probe_m: 0.5,
-            grass_material: 1,
-            rock_material: 3,
-            snow_material: 4,
-            sand_material: 2,
+            grass_material: MaterialRef::Slot(1),
+            rock_material: MaterialRef::Slot(3),
+            snow_material: MaterialRef::Slot(4),
+            sand_material: MaterialRef::Slot(2),
         });
         let json = serde_json::to_string(&original).unwrap();
         let back: TerrainFnSpec = serde_json::from_str(&json).unwrap();
@@ -97,7 +108,7 @@ mod tests {
     #[test]
     fn to_dyn_produces_callable_sampler() {
         let spec = TerrainFnSpec::default();
-        let dyn_fn = spec.to_dyn();
+        let dyn_fn = spec.to_dyn(&arvx_core::NullMaterialLookup);
         let s = dyn_fn.sample(
             crate::tile_key::TileKey::level0(0, 0, 0),
             glam::Vec3::ZERO,

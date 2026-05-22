@@ -22,7 +22,7 @@ use std::collections::HashSet;
 fn scan_whole_tile_for_holes() {
     let t = Terrain::default();
     let vs = t.voxel_size_for_level(0);
-    let fbm = FbmTerrainFn::default();
+    let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
     let baked = bake_tile(
         TileKey::level0(0, 0, 2),
         vs,
@@ -137,7 +137,7 @@ fn scan_whole_tile_for_holes() {
 fn dissect_cells_in_bug_region() {
     let t = Terrain::default();
     let vs = t.voxel_size_for_level(0);
-    let fbm = FbmTerrainFn::default();
+    let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
     let baked = bake_tile(
         TileKey::level0(0, 0, 2),
         vs,

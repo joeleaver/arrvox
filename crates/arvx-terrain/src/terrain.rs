@@ -11,6 +11,7 @@ use crate::region_snapshot::{TerrainRegionSnapshot, TerrainRegionSnapshotHandle}
 use crate::stamp_index::{StampIndex, StampIndexHandle};
 use crate::terrain_fn::TerrainFn;
 use crate::terrain_fn_spec::TerrainFnSpec;
+use arvx_core::{MaterialLibraryLookup, NullMaterialLookup};
 use std::sync::Arc;
 
 /// Per-scene terrain feature. Singleton enforced by the editor.
@@ -101,8 +102,12 @@ impl std::fmt::Debug for Terrain {
 
 impl Default for Terrain {
     fn default() -> Self {
+        // No material library available here — `Path` refs in the
+        // default FBM fall back to slot 0. The engine refreshes the
+        // runtime trait object via `refresh_terrain_fn` as soon as
+        // the library is wired (see `arvx-engine` tick).
         let spec = TerrainFnSpec::default();
-        let terrain_fn = spec.to_dyn();
+        let terrain_fn = spec.to_dyn(&NullMaterialLookup);
         Self {
             bounds: TerrainBounds::default(),
             base_tier: arvx_core::constants::DEFAULT_TERRAIN_TIER,
@@ -121,8 +126,13 @@ impl Terrain {
     /// Replace the procedural source. Updates both `spec` and the
     /// cached runtime `terrain_fn` in lockstep so subsequent bake
     /// jobs use the new source.
-    pub fn set_spec(&mut self, spec: TerrainFnSpec) {
-        self.terrain_fn = spec.to_dyn();
+    ///
+    /// `lookup` resolves any [`arvx_core::MaterialRef::Path`]s in the
+    /// new spec to concrete slot ids at trait-object build time. The
+    /// engine passes its `MaterialLibrary`; tests pass
+    /// [`arvx_core::NullMaterialLookup`].
+    pub fn set_spec(&mut self, spec: TerrainFnSpec, lookup: &dyn MaterialLibraryLookup) {
+        self.terrain_fn = spec.to_dyn(lookup);
         self.spec = spec;
     }
 
@@ -130,15 +140,24 @@ impl Terrain {
     /// time) and refresh the runtime trait object. The closure
     /// returns whether it actually changed anything — `false`
     /// skips the trait-object rebuild.
-    pub fn mutate_spec<F>(&mut self, f: F) -> bool
+    pub fn mutate_spec<F>(&mut self, f: F, lookup: &dyn MaterialLibraryLookup) -> bool
     where
         F: FnOnce(&mut TerrainFnSpec) -> bool,
     {
         let changed = f(&mut self.spec);
         if changed {
-            self.terrain_fn = self.spec.to_dyn();
+            self.terrain_fn = self.spec.to_dyn(lookup);
         }
         changed
+    }
+
+    /// Rebuild the runtime `terrain_fn` from the existing `spec` using
+    /// `lookup`. Call this when the [`MaterialLibraryLookup`] changes
+    /// (e.g. the engine's `MaterialLibrary` re-scanned a project) but
+    /// the spec itself is unchanged — the resolved slot ids may now
+    /// differ.
+    pub fn refresh_terrain_fn(&mut self, lookup: &dyn MaterialLibraryLookup) {
+        self.terrain_fn = self.spec.to_dyn(lookup);
     }
 
     /// Voxel size in metres for a tile at the given LOD level.

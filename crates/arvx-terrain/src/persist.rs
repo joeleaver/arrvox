@@ -260,7 +260,7 @@ mod tests {
         let baked = bake_tile(
             key,
             voxel_size_m,
-            &FbmTerrainFn::default(),
+            &FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup),
             &[],
             &crate::TerrainRegionSnapshot::new(),
         )
