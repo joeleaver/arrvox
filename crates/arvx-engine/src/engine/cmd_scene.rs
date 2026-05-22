@@ -739,14 +739,19 @@ impl EngineState {
                         // the scene file's directory.
                         let scene_path = project_dir.join(format!("scenes/{}.arvxscene", project.default_scene));
                         self.scene_path = Some(scene_path.clone());
-                        if scene_path.exists() {
-                            self.publish_phase(Some(mk(
-                                ProjectLoadPhase::LoadingScene,
-                                scene_path.file_name().and_then(|s| s.to_str()).map(str::to_owned),
-                            )));
-                            self.load_scene_from_file(&scene_path);
-                        }
 
+                        // Scan project assets BEFORE loading the scene.
+                        // The Terrain component's `MaterialRef::Path`
+                        // slots resolve against `self.material_lib`
+                        // during `init_terrain_runtime` (which the
+                        // scene-load helper calls when it spots a
+                        // saved Terrain). If the library is empty at
+                        // that moment, every Path silently collapses
+                        // to slot 0 — and the streamer bakes every
+                        // procedural tile against material 0, so the
+                        // whole terrain reloads with the default
+                        // material. User shaders need the same treatment
+                        // for any future shader-keyed component.
                         self.publish_phase(Some(mk(ProjectLoadPhase::ScanningAssets, None)));
                         self.scan_models();
                         if let Some(ref dir) = self.project_dir {
@@ -761,6 +766,14 @@ impl EngineState {
                         }
                         self.init_file_watcher();
                         let _ = self.reload_user_shaders();
+
+                        if scene_path.exists() {
+                            self.publish_phase(Some(mk(
+                                ProjectLoadPhase::LoadingScene,
+                                scene_path.file_name().and_then(|s| s.to_str()).map(str::to_owned),
+                            )));
+                            self.load_scene_from_file(&scene_path);
+                        }
 
                         self.publish_phase(Some(mk(ProjectLoadPhase::ImportingMeshes, None)));
                         self.auto_import_meshes();

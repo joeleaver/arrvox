@@ -163,6 +163,22 @@ impl super::state::EngineState {
         // construct the Terrain through the component registry, which
         // can't see the material library — its `terrain_fn` resolves
         // every `MaterialRef::Path` to slot 0 until refreshed here.
+        //
+        // Catch the "scene loaded before material scan" footgun: the
+        // refresh below silently collapses every `MaterialRef::Path`
+        // to slot 0 against an empty library, so the streamer would
+        // bake every procedural tile against the default material.
+        // The orchestration in `OpenProject` is supposed to scan
+        // materials first; this warn fires if a future refactor
+        // reorders things.
+        if self.material_lib.slot_count() == 0 {
+            self.console.warn(
+                "init_terrain_runtime called before MaterialLibrary scan — \
+                 terrain materials will collapse to slot 0. Check OpenProject \
+                 ordering (material_lib.scan must run before load_scene_from_file)."
+                    .to_string(),
+            );
+        }
         self.rebuild_terrain_fn_from_material_lib();
         let mut runtime = Box::new(
             crate::terrain_state::TerrainRuntime::new(terrain_entity),
