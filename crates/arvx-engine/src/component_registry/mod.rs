@@ -61,6 +61,16 @@ pub struct ComponentEntry {
     pub on_add: Option<fn(&mut hecs::World, hecs::Entity)>,
     /// Called when this component is about to be removed from an entity (during command flush).
     pub on_remove: Option<fn(&mut hecs::World, hecs::Entity)>,
+
+    /// Optional per-field visibility predicate. `None` (the common
+    /// case) → every field in `meta` shows up unconditionally. When
+    /// set, the snapshot builder calls this for each field name and
+    /// skips fields where it returns `false`. Used by Stamp to hide
+    /// variant-specific knobs (e.g. `edge_falloff_m` on Mountain,
+    /// where the field exists in `meta` for layout uniformity but
+    /// the kind has no backing storage so reads always returned 0
+    /// and writes silently no-op'd).
+    pub field_visible: Option<fn(&hecs::World, hecs::Entity, &str) -> bool>,
 }
 
 inventory::collect!(ComponentEntry);

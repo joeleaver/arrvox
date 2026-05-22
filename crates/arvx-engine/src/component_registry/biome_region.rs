@@ -108,6 +108,7 @@ pub fn biome_region_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 

@@ -481,6 +481,42 @@ pub fn stamp_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: Some(stamp_field_visible),
+    }
+}
+
+/// Per-variant field visibility. Mountain / Hill don't carry
+/// `corner_radius_m` / `edge_falloff_m` / `tilt`; Lake doesn't carry
+/// the ridge knobs; rect kinds don't carry `aspect` / `ridge_*` /
+/// `floor_flat_frac`. Hiding the irrelevant rows makes the
+/// Inspector match each variant's actual storage — no more "drag
+/// this field and nothing happens" because the kind silently
+/// no-ops the write.
+fn stamp_field_visible(world: &hecs::World, entity: hecs::Entity, field: &str) -> bool {
+    let Ok(s) = world.get::<&Stamp>(entity) else {
+        return true; // surface every field if we can't introspect — caller error
+    };
+    let is_mountain_or_hill = matches!(s.kind, StampKind::Mountain { .. } | StampKind::Hill { .. });
+    let is_circular = matches!(
+        s.kind,
+        StampKind::Mountain { .. } | StampKind::Hill { .. } | StampKind::Lake { .. }
+    );
+    let is_lake = matches!(s.kind, StampKind::Lake { .. });
+    let is_rect = matches!(s.kind, StampKind::Plateau { .. } | StampKind::Flatten { .. });
+    match field {
+        // Always-on knobs.
+        "kind_name" | "amplitude" | "radius" | "priority"
+        | "noise_amp_m" | "noise_scale_m" | "noise_seed" => true,
+        // Circular-only (Mountain / Hill / Lake have anisotropic radii).
+        "aspect" => is_circular,
+        // Mountain / Hill only (spinal ridges).
+        "ridge_strength" | "ridge_count" => is_mountain_or_hill,
+        // Lake only (flat-bottom basin).
+        "floor_flat_frac" => is_lake,
+        // Plateau / Flatten only (rounded corners + soft rim + tilt).
+        "corner_radius_m" | "edge_falloff_m" => is_rect,
+        // Unknown field — surface it so the bug is obvious.
+        _ => true,
     }
 }
 
@@ -634,6 +670,58 @@ mod tests {
             }
             _ => panic!("variant shifted"),
         }
+    }
+
+    #[test]
+    fn field_visible_hides_edge_falloff_on_mountain() {
+        let mut w = World::new();
+        let m = Stamp::new(
+            StampKind::Mountain {
+                h_max: 50.0,
+                radius: 30.0,
+                falloff: arvx_terrain::FalloffCurve::Smoothstep,
+                aspect: 1.0,
+                ridge_strength: 0.0,
+                ridge_count: 3,
+            },
+            Vec3::ZERO,
+        );
+        let e = w.spawn((m,));
+        let entry = stamp_entry();
+        let fv = entry.field_visible.expect("stamp has field_visible");
+        assert!(!fv(&w, e, "edge_falloff_m"));
+        assert!(!fv(&w, e, "corner_radius_m"));
+        assert!(!fv(&w, e, "floor_flat_frac"));
+        // Mountain DOES have these.
+        assert!(fv(&w, e, "ridge_strength"));
+        assert!(fv(&w, e, "ridge_count"));
+        assert!(fv(&w, e, "aspect"));
+        // Always-on knobs.
+        assert!(fv(&w, e, "noise_amp_m"));
+        assert!(fv(&w, e, "amplitude"));
+    }
+
+    #[test]
+    fn field_visible_shows_edge_falloff_on_plateau() {
+        let mut w = World::new();
+        let p = Stamp::new(
+            StampKind::Plateau {
+                half_extents: glam::Vec2::new(10.0, 10.0),
+                corner_radius_m: 0.0,
+                edge_falloff_m: 0.0,
+                tilt: glam::Vec2::ZERO,
+            },
+            Vec3::ZERO,
+        );
+        let e = w.spawn((p,));
+        let entry = stamp_entry();
+        let fv = entry.field_visible.expect("stamp has field_visible");
+        assert!(fv(&w, e, "edge_falloff_m"));
+        assert!(fv(&w, e, "corner_radius_m"));
+        // Plateau doesn't have ridge / aspect / floor_flat_frac.
+        assert!(!fv(&w, e, "ridge_strength"));
+        assert!(!fv(&w, e, "aspect"));
+        assert!(!fv(&w, e, "floor_flat_frac"));
     }
 
     #[test]

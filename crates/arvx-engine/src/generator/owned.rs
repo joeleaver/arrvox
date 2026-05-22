@@ -67,5 +67,6 @@ pub(crate) fn generator_owned_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }

@@ -149,6 +149,7 @@ pub(crate) fn generator_state_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 

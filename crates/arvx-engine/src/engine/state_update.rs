@@ -45,7 +45,12 @@ impl EngineState {
         // Build component snapshots from the registry.
         let mut components = Vec::new();
         for entry in self.registry.components_on(&self.world, selected) {
-            let fields: Vec<FieldSnapshot> = entry.meta.iter().map(|meta| {
+            let fields: Vec<FieldSnapshot> = entry.meta.iter()
+                .filter(|meta| {
+                    entry.field_visible
+                        .map_or(true, |f| f(&self.world, selected, meta.name))
+                })
+                .map(|meta| {
                 let mut value = (entry.get_field)(&self.world, selected, meta.name)
                     .unwrap_or(FieldValue::String("<error>".into()));
                 if entry.name == "Transform"

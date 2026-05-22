@@ -127,6 +127,7 @@ pub(super) fn procedural_geometry_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 
@@ -191,6 +192,7 @@ pub(super) fn transform_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 
@@ -238,6 +240,7 @@ pub(super) fn editor_metadata_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 

@@ -297,6 +297,7 @@ pub fn arvx_component(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
                 on_add: None,
                 on_remove: None,
+        field_visible: None,
             }
         }
     };

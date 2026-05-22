@@ -101,6 +101,7 @@ pub(super) fn rigid_body_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 
@@ -162,6 +163,7 @@ pub(super) fn skeleton_entry() -> ComponentEntry {
         ),
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 
@@ -249,5 +251,6 @@ pub(super) fn animation_player_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }

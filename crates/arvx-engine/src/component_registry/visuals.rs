@@ -69,6 +69,7 @@ pub(super) fn renderable_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 
@@ -136,6 +137,7 @@ pub(super) fn point_light_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 
@@ -221,6 +223,7 @@ pub(super) fn spot_light_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 
@@ -276,6 +279,7 @@ pub(super) fn camera_entry() -> ComponentEntry {
         },
         on_add: None,
         on_remove: None,
+        field_visible: None,
     }
 }
 
