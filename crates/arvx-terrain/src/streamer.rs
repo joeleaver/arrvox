@@ -649,6 +649,7 @@ impl TileStreamer {
                 stamps,
                 regions: Arc::clone(&terrain.regions),
                 skirt_depth_m: terrain.skirt_depth_m,
+                world_floor_y: terrain.world_floor_y(),
             };
             if self.worker.submit(job) {
                 slot.state = TileState::Submitted;

@@ -160,6 +160,21 @@ impl Terrain {
         self.terrain_fn = self.spec.to_dyn(lookup);
     }
 
+    /// World-Y of the bottom face of the terrain's solid envelope.
+    /// Used by the bake to clamp the composed surface height so
+    /// stamps (or a misbehaving TerrainFn) can't drive the entire
+    /// footprint above the world's solid envelope and produce a
+    /// fall-through hole. Returns `None` for `Unbounded` terrains
+    /// (no floor — the user owns this concern manually).
+    pub fn world_floor_y(&self) -> Option<f32> {
+        match self.bounds {
+            TerrainBounds::Bounded { origin, .. } => {
+                Some(origin.origin_world().to_vec3().y)
+            }
+            TerrainBounds::Unbounded => None,
+        }
+    }
+
     /// Voxel size in metres for a tile at the given LOD level.
     ///
     /// V2 LOD-pyramid semantics: each LOD level *doubles* the voxel

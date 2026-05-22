@@ -90,6 +90,13 @@ pub struct BakeJob {
     /// V2 LOD pyramid: lateral skirt depth (m). `0.0` disables.
     /// Threaded from `Terrain::skirt_depth_m`.
     pub skirt_depth_m: f32,
+    /// World-envelope floor Y, in absolute world coords. The bake
+    /// clamps the composed surface height to `world_floor_y + 2 *
+    /// voxel_size_m` so stamps (or a misbehaving TerrainFn) can't
+    /// drive the entire tile's surface below the world's solid
+    /// envelope and create a fall-through hole. `None` for
+    /// `Unbounded` terrains, which have no floor.
+    pub world_floor_y: Option<f32>,
 }
 
 /// Outcome of one worker job. `baked = None` means the bake failed —
@@ -226,6 +233,7 @@ fn worker_loop(
             stamps,
             regions,
             skirt_depth_m,
+            world_floor_y,
         } = job;
 
         // Phase 4.4: if a `.arvxtile` is on disk for this key, load
@@ -269,6 +277,7 @@ fn worker_loop(
                 stamps.as_slice(),
                 regions.as_ref(),
                 skirt_depth_m,
+                world_floor_y,
             )
         }));
         drop(terrain_fn);

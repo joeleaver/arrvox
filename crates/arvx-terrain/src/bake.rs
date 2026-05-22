@@ -82,8 +82,9 @@ const TILE_HALO_VOXELS: u32 = 2;
 /// the broader biome wash. Authors who want a stamp to punch through
 /// a biome do so by stacking a higher-priority biome on the stamp.
 /// Convenience: same as [`bake_tile_with_skirts`] with skirts
-/// disabled (`skirt_depth_m = 0.0`). Kept for tests + persist
-/// roundtrip code that don't care about skirts.
+/// disabled (`skirt_depth_m = 0.0`) and no world envelope clamp
+/// (`world_floor_y = None`). Kept for tests + persist roundtrip
+/// code that don't care about skirts or envelope safety.
 pub fn bake_tile(
     key: TileKey,
     voxel_size_m: f32,
@@ -91,7 +92,7 @@ pub fn bake_tile(
     stamps: &[Stamp],
     regions: &TerrainRegionSnapshot,
 ) -> Option<BakedTile> {
-    bake_tile_with_skirts(key, voxel_size_m, terrain_fn, stamps, regions, 0.0)
+    bake_tile_with_skirts(key, voxel_size_m, terrain_fn, stamps, regions, 0.0, None)
 }
 
 pub fn bake_tile_with_skirts(
@@ -101,6 +102,7 @@ pub fn bake_tile_with_skirts(
     stamps: &[Stamp],
     regions: &TerrainRegionSnapshot,
     skirt_depth_m: f32,
+    world_floor_y: Option<f32>,
 ) -> Option<BakedTile> {
     let t0 = std::time::Instant::now();
 
@@ -114,6 +116,12 @@ pub fn bake_tile_with_skirts(
         max: tile_origin_world + Vec3::splat(extent),
     };
 
+    // World-envelope safety margin. Surface nets needs at least one
+    // interior cell below the surface to extract the surface; we
+    // give it two so the basin bottom always has solid voxels under
+    // it even at the coarsest voxel size in a tile.
+    let envelope_floor = world_floor_y.map(|f| f + 2.0 * voxel_size_m);
+
     // SDF callback: receives a batch of absolute-world positions from
     // the voxelizer, translates each to tile-local, asks the TerrainFn,
     // and folds Layer-2 stamps over the heightmap before repacking.
@@ -124,6 +132,10 @@ pub fn bake_tile_with_skirts(
                 let local = world_pos - tile_origin_world;
                 let mut s = terrain_fn.sample(key, local, voxel_size_m);
 
+                let wy = world_pos.y;
+                let mut h = wy - s.sd;
+                let mut mat_override: Option<u16> = None;
+
                 // Layer 2 — heightmap-style stamps. The V2 stamp
                 // API returns `(target_h, weight)`; we blend the
                 // combine_op'd target back toward the running `h`
@@ -132,9 +144,6 @@ pub fn bake_tile_with_skirts(
                 // effect down to zero at the rim without changing
                 // the combine_op contract.
                 if !stamps.is_empty() {
-                    let wy = world_pos.y;
-                    let mut h = wy - s.sd;
-                    let mut mat_override: Option<u16> = None;
                     for stamp in stamps {
                         if let Some(sample) =
                             stamp.sample_height(world_pos.x, world_pos.z)
@@ -153,12 +162,27 @@ pub fn bake_tile_with_skirts(
                             }
                         }
                     }
-                    s.sd = wy - h;
-                    if let Some(m) = mat_override {
-                        s.primary_mat = m;
-                        s.secondary_mat = m;
-                        s.blend = 0.0;
+                }
+
+                // World-envelope clamp. Stamps (and even the base
+                // TerrainFn) can otherwise drive the composed height
+                // below the world's solid envelope, leaving the
+                // entire footprint above the surface — i.e. a hole
+                // through the tile that the player falls through.
+                // Lifting `h` back up to `floor + 2 voxels` keeps a
+                // solid floor everywhere; lakes deeper than the
+                // world allows simply bottom out at that floor.
+                if let Some(floor_h) = envelope_floor {
+                    if h < floor_h {
+                        h = floor_h;
                     }
+                }
+
+                s.sd = wy - h;
+                if let Some(m) = mat_override {
+                    s.primary_mat = m;
+                    s.secondary_mat = m;
+                    s.blend = 0.0;
                 }
 
                 // Phase 7 — biome regions. Highest-priority overlapping
@@ -1018,6 +1042,161 @@ mod tests {
         assert!(max_y > 38.0, "mountain should push max y above 38; got {max_y}");
     }
 
+    // ── world-envelope clamp ─────────────────────────────────────────
+
+    /// Collect the unique LOD-0 vertex (x, y, z) positions that fall
+    /// inside a circular XZ footprint. Used by the envelope-clamp
+    /// tests to assert the presence / absence of a surface inside
+    /// the basin — the unclamped lake leaves the basin empty, the
+    /// clamped lake gives it a solid floor.
+    fn lod0_verts_in_xz_footprint(
+        baked: &BakedTile,
+        cx: f32,
+        cz: f32,
+        radius: f32,
+    ) -> Vec<(f32, f32, f32)> {
+        let v_stride = 32usize;
+        let i_stride = 4usize;
+        let lod0_n = baked.mesh.lod0_index_count as usize;
+        let r2 = radius * radius;
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for i in 0..lod0_n {
+            let base = i * i_stride;
+            let id = u32::from_le_bytes(
+                baked.mesh.indices[base..base + i_stride].try_into().unwrap(),
+            );
+            if !seen.insert(id) {
+                continue;
+            }
+            let vbase = id as usize * v_stride;
+            let x = f32::from_le_bytes(
+                baked.mesh.vertices[vbase..vbase + 4].try_into().unwrap(),
+            );
+            let y = f32::from_le_bytes(
+                baked.mesh.vertices[vbase + 4..vbase + 8].try_into().unwrap(),
+            );
+            let z = f32::from_le_bytes(
+                baked.mesh.vertices[vbase + 8..vbase + 12].try_into().unwrap(),
+            );
+            let dx = x - cx;
+            let dz = z - cz;
+            if dx * dx + dz * dz <= r2 {
+                out.push((x, y, z));
+            }
+        }
+        out
+    }
+
+    /// A Lake stamp deep enough to drive the composed surface far
+    /// below the world's floor must still produce a solid floor
+    /// inside the basin — players don't fall through. The bake's
+    /// `world_floor_y` clamp lifts the composed h back to
+    /// `floor + 2 * voxel_size_m` so surface nets always finds a
+    /// surface to extract above the floor.
+    #[test]
+    fn world_floor_clamp_keeps_basin_floor_solid() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+
+        // Lake centred on the tile, depth = 5000 m — well below the
+        // tile's bottom face at y=0.
+        let stamp = crate::stamp::Stamp::new(
+            StampKind::Lake {
+                depth: 5000.0,
+                radius: 20.0,
+                falloff: FalloffCurve::Smoothstep,
+                aspect: 1.0,
+                floor_flat_frac: 0.0,
+            },
+            Vec3::new(32.0, 32.0, 32.0),
+        );
+
+        // Clamped bake: world floor at y=0. Basin should pin near y=0.
+        let clamped = bake_tile_with_skirts(
+            TileKey::level0(0, 0, 0),
+            vs,
+            &FlatHalf,
+            &[stamp],
+            &empty_regions(),
+            0.0,
+            Some(0.0),
+        )
+        .expect("clamped bake");
+
+        // The basin (inner 15 m of the 20 m footprint) should
+        // contain LOD-0 vertices — the clamped floor.
+        let basin_inner_radius = 15.0;
+        let clamped_verts =
+            lod0_verts_in_xz_footprint(&clamped, 32.0, 32.0, basin_inner_radius);
+        assert!(
+            clamped_verts.len() > 50,
+            "clamped basin should have a solid floor; got {} LOD-0 verts inside r={basin_inner_radius}",
+            clamped_verts.len(),
+        );
+
+        // And those verts must sit near the floor (y ~ 0..5 m
+        // depending on rim transition), well below the FlatHalf
+        // surface at y=32.
+        let min_basin_y = clamped_verts
+            .iter()
+            .map(|v| v.1)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            min_basin_y >= -vs && min_basin_y < 5.0,
+            "clamped basin floor should sit near y=0; got min_y={min_basin_y}",
+        );
+    }
+
+    /// Without the clamp (None), the same deep stamp leaves the
+    /// basin EMPTY — no LOD-0 vertices inside the footprint —
+    /// because the bake's composed surface is far below the tile's
+    /// vertical span. This is the fall-through bug the clamp fixes.
+    #[test]
+    fn no_clamp_leaves_basin_empty() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+        let stamp = crate::stamp::Stamp::new(
+            StampKind::Lake {
+                depth: 5000.0,
+                radius: 20.0,
+                falloff: FalloffCurve::Smoothstep,
+                aspect: 1.0,
+                floor_flat_frac: 0.0,
+            },
+            Vec3::new(32.0, 32.0, 32.0),
+        );
+
+        let unclamped = bake_tile_with_skirts(
+            TileKey::level0(0, 0, 0),
+            vs,
+            &FlatHalf,
+            &[stamp],
+            &empty_regions(),
+            0.0,
+            None,
+        )
+        .expect("unclamped bake still produces a tile (rim is intact)");
+
+        // Inner basin — no surface verts at all. The rim still has
+        // surface (where the stamp's weight goes to zero), but the
+        // basin interior is "all sky" from the tile's perspective.
+        let _ = vs; // silence unused
+        let basin_inner_radius = 10.0;
+        let unclamped_verts = lod0_verts_in_xz_footprint(
+            &unclamped,
+            32.0,
+            32.0,
+            basin_inner_radius,
+        );
+        assert_eq!(
+            unclamped_verts.len(),
+            0,
+            "unclamped deep lake should leave the basin interior empty — fall-through bug; got {} verts inside r={basin_inner_radius}",
+            unclamped_verts.len(),
+        );
+    }
+
     // ── Phase 7 — biome region material overrides ─────────────────
 
     /// Collect the set of primary material ids appearing on LOD-0
@@ -1134,7 +1313,7 @@ mod tests {
     fn skirts_disabled_when_depth_zero() {
         let vs = 0.5;
         let baked_no_skirts =
-            bake_tile_with_skirts(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions(), 0.0)
+            bake_tile_with_skirts(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions(), 0.0, None)
                 .expect("bake");
         let baked_baseline =
             bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions())
@@ -1156,7 +1335,7 @@ mod tests {
     fn skirts_append_geometry_when_enabled() {
         let vs = 0.5;
         let baked_with =
-            bake_tile_with_skirts(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions(), 4.0)
+            bake_tile_with_skirts(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions(), 4.0, None)
                 .expect("bake");
         let baked_without =
             bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions())
@@ -1189,7 +1368,7 @@ mod tests {
         let vs = 0.5;
         let depth = 6.0;
         let baked_with =
-            bake_tile_with_skirts(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions(), depth)
+            bake_tile_with_skirts(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions(), depth, None)
                 .expect("bake");
         let baked_without =
             bake_tile(TileKey::level0(0, 0, 0), vs, &FlatHalf, &[], &empty_regions())
