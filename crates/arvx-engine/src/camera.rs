@@ -114,6 +114,13 @@ pub enum CameraMode {
 }
 
 fn fly_direction(yaw: f32, pitch: f32) -> Vec3 {
+    look_dir(yaw, pitch)
+}
+
+/// Camera look direction in world space from yaw + pitch. Shared with
+/// debug dump paths that want the camera's forward vector without
+/// going through the full fly-mode controller.
+pub fn look_dir(yaw: f32, pitch: f32) -> Vec3 {
     Vec3::new(
         -yaw.sin() * pitch.cos(),
         pitch.sin(),
@@ -162,6 +169,16 @@ pub fn default_action_map() -> arvx_runtime::input::ActionMap {
         // Delete
         ActionDef::new("edit.delete", ControlType::Digital, vec![
             Binding::simple(PhysicalInput::Key(InputKeyCode::Delete)),
+        ]),
+        // Debug: dump camera world position + look direction to the
+        // console. Useful for capturing repro coords for visual bugs
+        // (e.g., the open jagged-normal patches investigation).
+        // Function keys (F7, F10) get intercepted by window managers
+        // on some Linux desktops before they reach the editor, so
+        // a regular letter key is more reliable. K is unbound in
+        // the editor's other shortcuts.
+        ActionDef::new("debug.dump_camera", ControlType::Digital, vec![
+            Binding::simple(PhysicalInput::Key(InputKeyCode::K)),
         ]),
     ])
 }

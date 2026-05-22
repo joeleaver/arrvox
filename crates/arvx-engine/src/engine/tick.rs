@@ -212,6 +212,26 @@ pub(crate) fn tick_loop(
             &mut state.camera.yaw,
             &mut state.camera.pitch,
         );
+        // F10 — debug dump camera position + look direction. Sized for
+        // copy-paste into a test fixture; tile key included so the
+        // user can immediately point at which `bake_tile` call to
+        // reproduce.
+        if state.input_system.just_pressed("debug.dump_camera") {
+            let p = state.camera.position;
+            let look = crate::camera::look_dir(state.camera.yaw, state.camera.pitch);
+            let tile_x = (p.x / arvx_terrain::TILE_SIZE_M).floor() as i32;
+            let tile_y = (p.y / arvx_terrain::TILE_SIZE_M).floor() as i32;
+            let tile_z = (p.z / arvx_terrain::TILE_SIZE_M).floor() as i32;
+            let msg = format!(
+                "camera pos=({:.2}, {:.2}, {:.2}) look=({:.3}, {:.3}, {:.3}) \
+                 yaw={:.2}° pitch={:.2}° -> level-0 tile=({}, {}, {})",
+                p.x, p.y, p.z, look.x, look.y, look.z,
+                state.camera.yaw.to_degrees(), state.camera.pitch.to_degrees(),
+                tile_x, tile_y, tile_z,
+            );
+            eprintln!("[debug.dump_camera] {msg}");
+            state.console.info(msg);
+        }
         state.sync_main_viewport_from_legacy_camera();
 
         // 3. Update gizmo hover + drag — MAIN targets the entity
