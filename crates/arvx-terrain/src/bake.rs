@@ -222,8 +222,9 @@ pub fn bake_tile_with_skirts(
     );
 
     // V2 LOD pyramid: append lateral skirts so LOD-band cracks aren't
-    // see-through. Per-vertex vertical strips; adjacent strips overlap
-    // visually into a curtain when viewed horizontally. `0.0` disables.
+    // see-through. Edge-stitched quads with sculpt-aware per-face depth
+    // (drops to span the local height delta if it exceeds the baseline).
+    // `0.0` disables.
     append_lateral_skirts(
         &mut mesh,
         tile_origin_world,
@@ -243,23 +244,35 @@ pub fn bake_tile_with_skirts(
 
 /// Append lateral-tile-boundary skirts to `mesh`.
 ///
-/// V2 LOD pyramid follow-up: at LOD-band boundaries adjacent tiles
-/// use different voxel sizes, producing surface vertices at slightly
-/// different heights at the shared edge. Cameras see through the gap
-/// as a thin sky-coloured slit. Skirts mask the slit by emitting a
-/// thin vertical strip dropping `skirt_depth_m` below each
-/// boundary-surface vertex. Adjacent strips overlap into a visually
-/// continuous curtain when viewed from horizontal angles.
+/// V2 LOD pyramid: at LOD-band boundaries adjacent tiles use different
+/// voxel sizes, producing surface vertices at slightly different heights
+/// at the shared edge. Cameras see through the gap as a thin
+/// sky-coloured slit. Skirts mask the slit by emitting a vertical strip
+/// dropping below the boundary surface.
 ///
-/// Per-vertex strips (not edge-stitched) are a deliberate V1
-/// simplification: cheaper to implement, robust to non-manifold
-/// surface meshes, and adjacent strips are ≈ voxel_size apart so the
-/// overlap closes the visual gap. Trade-off: from directly above the
-/// boundary, the strips contribute no horizontal extent (they're
-/// vertical). Acceptable for a Y-up world where players rarely look
-/// straight down at a tile seam.
+/// V2.x — **edge-stitched + sculpt-aware**:
 ///
-/// `skirt_depth_m <= 0` or an empty mesh is a no-op.
+/// - **Edge-stitched**: walk the boundary edges of the surface mesh
+///   (triangle edges whose two endpoints both lie on the same boundary
+///   plane). Each boundary edge emits a connected 4-vertex quad
+///   spanning the edge. Replaces the prior per-vertex vertical strips,
+///   which had zero horizontal extent when viewed straight down at a
+///   seam.
+/// - **Sculpt-aware depth**: per boundary face, the drop is sized to
+///   span the local height delta:
+///   `depth = max(skirt_depth_m, span_on_face + margin)`. A deep cut
+///   at a tile boundary (say, a 10 m sculpt pit) used to leave the
+///   bottom of the cliff exposed because the curtain stopped at the
+///   fixed `skirt_depth_m`. The per-face dynamic depth now drops the
+///   whole face's skirt to clear the deepest cut on that face.
+///
+/// All four boundary faces are processed independently. The skirt
+/// vertices inherit `normal_oct` and `leaf_attr_id` from the source
+/// edge endpoint so the resolve pass picks consistent material/normal
+/// at shading time. CCW winding gives an outward-facing normal per
+/// face.
+///
+/// `skirt_depth_m <= 0` or a mesh with no triangles is a no-op.
 fn append_lateral_skirts(
     mesh: &mut arvx_core::asset_file::MeshSectionsBlob,
     tile_origin_world: Vec3,
@@ -271,13 +284,15 @@ fn append_lateral_skirts(
         MeshletCluster, CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE, PARENT_GROUP_ERROR_ROOT,
     };
     use arvx_core::mesh_extract::MeshVertex;
+    use std::collections::BTreeSet;
 
     if skirt_depth_m <= 0.0 || mesh.vertices.is_empty() {
         return;
     }
 
     let verts: &[MeshVertex] = bytemuck::cast_slice(&mesh.vertices);
-    if verts.is_empty() {
+    let tris: &[u32] = bytemuck::cast_slice(&mesh.indices);
+    if verts.is_empty() || tris.is_empty() || tris.len() % 3 != 0 {
         return;
     }
 
@@ -291,87 +306,150 @@ fn append_lateral_skirts(
     // plane — the SN cube vertex centres land on cell-edge midpoints
     // which can be slightly inside the tile.
     let eps = voxel_size_m * 0.5;
-    // Each per-vertex strip is voxel_size wide so adjacent strips meet.
-    let half_w = voxel_size_m * 0.5;
+
+    // Per-face bit indices (also the BTreeSet array index).
+    const F_XMIN: usize = 0;
+    const F_XMAX: usize = 1;
+    const F_ZMIN: usize = 2;
+    const F_ZMAX: usize = 3;
+    const N_FACES: usize = 4;
+
+    // Per-vertex face membership: bit f is set iff the vertex sits on
+    // face f's plane. Computed once, reused during edge discovery and
+    // per-face min-Y aggregation.
+    let vert_face_flags: Vec<u8> = verts
+        .iter()
+        .map(|v| {
+            let p = v.local_pos;
+            let mut f = 0u8;
+            if (p[0] - x_min).abs() < eps {
+                f |= 1 << F_XMIN;
+            }
+            if (p[0] - x_max).abs() < eps {
+                f |= 1 << F_XMAX;
+            }
+            if (p[2] - z_min).abs() < eps {
+                f |= 1 << F_ZMIN;
+            }
+            if (p[2] - z_max).abs() < eps {
+                f |= 1 << F_ZMAX;
+            }
+            f
+        })
+        .collect();
+
+    // Per-face boundary edges, stored as canonical (min_idx, max_idx)
+    // so duplicate triangle owners (the watertight seam tris produced
+    // by halo extraction) dedup into a single quad. BTreeSet for stable
+    // iteration order — keeps quad emission deterministic for tests.
+    let mut face_edges: [BTreeSet<(u32, u32)>; N_FACES] =
+        std::array::from_fn(|_| BTreeSet::new());
+
+    for tri in tris.chunks_exact(3) {
+        for &(ia, ib) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            let fa = vert_face_flags[ia as usize];
+            let fb = vert_face_flags[ib as usize];
+            let shared = fa & fb;
+            if shared == 0 {
+                continue;
+            }
+            let (lo, hi) = if ia < ib { (ia, ib) } else { (ib, ia) };
+            for face_idx in 0..N_FACES {
+                if shared & (1 << face_idx) != 0 {
+                    face_edges[face_idx].insert((lo, hi));
+                }
+            }
+        }
+    }
+
+    // Per-face drop_y. The skirt for face F drops to a single Y so the
+    // bottom edge of that face's curtain is flat — visually consistent
+    // and easier to read. The depth is sized to clear the local height
+    // span (sculpt-aware) but never less than `skirt_depth_m` (LOD-band
+    // baseline). `margin` adds a small overshoot so the curtain bottom
+    // is unambiguously below any cliff floor.
+    let margin = (skirt_depth_m * 0.25).max(voxel_size_m);
+    let mut face_drop_y = [0.0f32; N_FACES];
+    let mut has_any = false;
+    for face_idx in 0..N_FACES {
+        if face_edges[face_idx].is_empty() {
+            continue;
+        }
+        has_any = true;
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for &(lo, hi) in &face_edges[face_idx] {
+            let y0 = verts[lo as usize].local_pos[1];
+            let y1 = verts[hi as usize].local_pos[1];
+            min_y = min_y.min(y0).min(y1);
+            max_y = max_y.max(y0).max(y1);
+        }
+        let span = max_y - min_y;
+        let depth = skirt_depth_m.max(span + margin);
+        face_drop_y[face_idx] = min_y - depth;
+    }
+    if !has_any {
+        return;
+    }
 
     let pre_vertex_count = verts.len() as u32;
-    let pre_index_count = (mesh.indices.len() / std::mem::size_of::<u32>()) as u32;
-
+    let pre_index_count = tris.len() as u32;
     let mut new_verts: Vec<MeshVertex> = Vec::new();
     let mut new_indices: Vec<u32> = Vec::new();
     let mut patch_min = [f32::INFINITY; 3];
     let mut patch_max = [f32::NEG_INFINITY; 3];
 
-    let update_aabb = |min: &mut [f32; 3], max: &mut [f32; 3], p: [f32; 3]| {
-        for k in 0..3 {
-            if p[k] < min[k] {
-                min[k] = p[k];
-            }
-            if p[k] > max[k] {
-                max[k] = p[k];
-            }
+    for face_idx in 0..N_FACES {
+        if face_edges[face_idx].is_empty() {
+            continue;
         }
-    };
-
-    // Per-face skirt: emit a 4-vertex / 2-triangle strip facing
-    // outward. CCW winding from the outward POV: TL, BL, BR / TL, BR, TR.
-    let mut emit_strip =
-        |pos: [f32; 3], normal_oct: u32, leaf_attr_id: u32, tangent: [f32; 3]| {
-            let p = pos;
-            let tl = [p[0] - tangent[0] * half_w, p[1], p[2] - tangent[2] * half_w];
-            let tr = [p[0] + tangent[0] * half_w, p[1], p[2] + tangent[2] * half_w];
-            let bl = [tl[0], tl[1] - skirt_depth_m, tl[2]];
-            let br = [tr[0], tr[1] - skirt_depth_m, tr[2]];
-
+        let drop_y = face_drop_y[face_idx];
+        for &(ia, ib) in &face_edges[face_idx] {
+            let va = verts[ia as usize];
+            let vb = verts[ib as usize];
+            // Sort the edge endpoints into (TL, TR) so that CCW
+            // winding (TL→TR→BR, TL→BR→BL) gives an outward-facing
+            // normal. "Right" of the outward viewer = outward_normal ×
+            // +Y; the TR vertex sits on the +right side relative to TL.
+            //   x_min outward -X → right -Z → TR.z < TL.z
+            //   x_max outward +X → right +Z → TR.z > TL.z
+            //   z_min outward -Z → right +X → TR.x > TL.x
+            //   z_max outward +Z → right -X → TR.x < TL.x
+            let (tl, tr) = match face_idx {
+                F_XMIN => if va.local_pos[2] > vb.local_pos[2] { (va, vb) } else { (vb, va) },
+                F_XMAX => if va.local_pos[2] < vb.local_pos[2] { (va, vb) } else { (vb, va) },
+                F_ZMIN => if va.local_pos[0] < vb.local_pos[0] { (va, vb) } else { (vb, va) },
+                F_ZMAX => if va.local_pos[0] > vb.local_pos[0] { (va, vb) } else { (vb, va) },
+                _ => unreachable!(),
+            };
+            let tl_pos = tl.local_pos;
+            let tr_pos = tr.local_pos;
+            let bl_pos = [tl_pos[0], drop_y, tl_pos[2]];
+            let br_pos = [tr_pos[0], drop_y, tr_pos[2]];
             let base = pre_vertex_count + new_verts.len() as u32;
-
-            // All 4 skirt verts inherit the source vertex's attrs so
-            // the resolve pass picks the same material / normal at
-            // shading time. The strip's geometric normal is horizontal
-            // outward, but normal_oct stays equal to the source for
-            // visual continuity with the surface above.
-            for p in [tl, tr, bl, br] {
+            for (p, src) in [(tl_pos, &tl), (tr_pos, &tr), (br_pos, &tr), (bl_pos, &tl)] {
                 new_verts.push(MeshVertex {
                     local_pos: p,
-                    normal_oct,
-                    leaf_attr_id,
+                    normal_oct: src.normal_oct,
+                    leaf_attr_id: src.leaf_attr_id,
                     bone_indices: 0,
                     bone_weights: 0,
                     _pad: 0,
                 });
-                update_aabb(&mut patch_min, &mut patch_max, p);
+                for k in 0..3 {
+                    if p[k] < patch_min[k] {
+                        patch_min[k] = p[k];
+                    }
+                    if p[k] > patch_max[k] {
+                        patch_max[k] = p[k];
+                    }
+                }
             }
-            // tl=0, tr=1, bl=2, br=3. CCW from outward POV: TL→BL→BR, TL→BR→TR.
+            // TL=0, TR=1, BR=2, BL=3. CCW from outward POV.
             new_indices.extend_from_slice(&[
+                base, base + 1, base + 2,
                 base, base + 2, base + 3,
-                base, base + 3, base + 1,
             ]);
-        };
-
-    for v in verts {
-        let p = v.local_pos;
-        let on_x_min = (p[0] - x_min).abs() < eps;
-        let on_x_max = (p[0] - x_max).abs() < eps;
-        let on_z_min = (p[2] - z_min).abs() < eps;
-        let on_z_max = (p[2] - z_max).abs() < eps;
-
-        // A corner vertex may be on TWO boundaries — emit one strip per
-        // side. Adjacent overlap is intentional (covers the gap).
-        if on_x_max {
-            // Outward +X, tangent +Z (cross(+X, +Y)).
-            emit_strip(p, v.normal_oct, v.leaf_attr_id, [0.0, 0.0, 1.0]);
-        }
-        if on_x_min {
-            // Outward -X, tangent -Z.
-            emit_strip(p, v.normal_oct, v.leaf_attr_id, [0.0, 0.0, -1.0]);
-        }
-        if on_z_max {
-            // Outward +Z, tangent -X (cross(+Z, +Y) = -X).
-            emit_strip(p, v.normal_oct, v.leaf_attr_id, [-1.0, 0.0, 0.0]);
-        }
-        if on_z_min {
-            // Outward -Z, tangent +X.
-            emit_strip(p, v.normal_oct, v.leaf_attr_id, [1.0, 0.0, 0.0]);
         }
     }
 
@@ -1359,6 +1437,186 @@ mod tests {
         assert!(
             baked_with.mesh.lod0_index_count > baked_without.mesh.lod0_index_count,
             "skirt indices count as LOD-0"
+        );
+    }
+
+    /// V2.x edge-stitched: a single boundary edge in the surface
+    /// triangle list produces exactly one quad (4 verts, 6 indices)
+    /// — NOT two per-vertex vertical strips. This is the topology
+    /// change that closes the overhead-view gap (per-vertex strips
+    /// had zero horizontal extent from directly above).
+    #[test]
+    fn edge_stitched_quad_from_single_boundary_edge() {
+        use arvx_core::asset_file::MeshSectionsBlob;
+        use arvx_core::mesh_extract::MeshVertex;
+
+        let v = |pos: [f32; 3]| MeshVertex {
+            local_pos: pos,
+            normal_oct: 0,
+            leaf_attr_id: 0,
+            bone_indices: 0,
+            bone_weights: 0,
+            _pad: 0,
+        };
+        // Unit tile [0,1]³. Two verts on x_max, one interior. One
+        // triangle. The (v0,v1) edge lies on x_max — that's the
+        // single boundary edge.
+        let verts = vec![
+            v([1.0, 0.5, 0.25]),
+            v([1.0, 0.5, 0.75]),
+            v([0.5, 0.5, 0.5]),
+        ];
+        let tris: Vec<u32> = vec![0, 1, 2];
+
+        let mut mesh = MeshSectionsBlob {
+            vertices: bytemuck::cast_slice(&verts).to_vec(),
+            indices: bytemuck::cast_slice(&tris).to_vec(),
+            clusters: Vec::new(),
+            lod0_index_count: tris.len() as u32,
+            dag_groups: Vec::new(),
+            dag_consumed: Vec::new(),
+            dag_produced: Vec::new(),
+        };
+        let pre_verts = verts.len();
+        let pre_indices = tris.len();
+
+        append_lateral_skirts(&mut mesh, Vec3::ZERO, 1.0, 0.5, 2.0);
+
+        let post_verts: &[MeshVertex] = bytemuck::cast_slice(&mesh.vertices);
+        let post_tris: &[u32] = bytemuck::cast_slice(&mesh.indices);
+
+        assert_eq!(
+            post_verts.len() - pre_verts,
+            4,
+            "one boundary edge ⇒ 4 skirt verts (TL, TR, BR, BL), got {}",
+            post_verts.len() - pre_verts,
+        );
+        assert_eq!(
+            post_tris.len() - pre_indices,
+            6,
+            "one boundary edge ⇒ 6 skirt indices (2 tris)",
+        );
+        // Skirt cluster is appended.
+        assert!(
+            !mesh.clusters.is_empty(),
+            "skirt emission must append a cluster",
+        );
+    }
+
+    /// V2.x sculpt-aware depth: when boundary edges span a height
+    /// delta larger than `skirt_depth_m`, the per-face drop_y is
+    /// sized to the local span (plus margin) instead of using the
+    /// fixed baseline. A 10 m sculpt pit at a boundary used to leak
+    /// daylight under the fixed-4 m skirt — now the curtain follows
+    /// the cliff.
+    #[test]
+    fn skirt_depth_spans_local_height_delta_on_deep_cut() {
+        use arvx_core::asset_file::MeshSectionsBlob;
+        use arvx_core::mesh_extract::MeshVertex;
+
+        let v = |pos: [f32; 3]| MeshVertex {
+            local_pos: pos,
+            normal_oct: 0,
+            leaf_attr_id: 0,
+            bone_indices: 0,
+            bone_weights: 0,
+            _pad: 0,
+        };
+        // x_max boundary with 10 m height span (simulating a sculpt
+        // pit cutting through the middle of the boundary). Two
+        // triangles, three x_max verts → two boundary edges on
+        // x_max.
+        let verts = vec![
+            v([1.0, 10.0, 0.0]),
+            v([1.0, 0.0, 0.5]),
+            v([1.0, 10.0, 1.0]),
+            v([0.5, 5.0, 0.5]),
+        ];
+        let tris: Vec<u32> = vec![0, 1, 3, 1, 2, 3];
+
+        let mut mesh = MeshSectionsBlob {
+            vertices: bytemuck::cast_slice(&verts).to_vec(),
+            indices: bytemuck::cast_slice(&tris).to_vec(),
+            clusters: Vec::new(),
+            lod0_index_count: tris.len() as u32,
+            dag_groups: Vec::new(),
+            dag_consumed: Vec::new(),
+            dag_produced: Vec::new(),
+        };
+        let pre_verts = verts.len();
+        let baseline_depth = 2.0_f32;
+
+        append_lateral_skirts(&mut mesh, Vec3::ZERO, 1.0, 0.5, baseline_depth);
+
+        let post_verts: &[MeshVertex] = bytemuck::cast_slice(&mesh.vertices);
+        let skirt_verts = &post_verts[pre_verts..];
+        assert!(!skirt_verts.is_empty(), "skirts must emit verts");
+        let min_skirt_y = skirt_verts
+            .iter()
+            .map(|v| v.local_pos[1])
+            .fold(f32::INFINITY, f32::min);
+
+        // span = 10, drop = max(baseline=2, span=10 + margin). The
+        // bottom of the curtain must clear the deepest boundary
+        // vertex (y=0) by at least the span — i.e., min_skirt_y
+        // ≤ 0 - 10 = -10.
+        assert!(
+            min_skirt_y <= -10.0 + 1e-3,
+            "skirt must drop ≥ local height span (10 m); got min_skirt_y = {min_skirt_y}",
+        );
+        // Sanity: it should NOT drop arbitrarily far past span+margin.
+        // Margin is max(baseline*0.25, voxel_size) = max(0.5, 0.5).
+        // Total expected drop = 10 + 0.5 = 10.5 below min_boundary_y=0.
+        assert!(
+            min_skirt_y >= -11.0,
+            "skirt overshoot ({min_skirt_y}) bigger than expected (span + margin)",
+        );
+    }
+
+    /// V2.x dedup: a boundary edge shared between two triangles (the
+    /// watertight-seam case where halo extraction emits duplicate
+    /// boundary tris) must produce exactly ONE quad, not two
+    /// overlapping ones.
+    #[test]
+    fn duplicate_boundary_edge_emits_single_quad() {
+        use arvx_core::asset_file::MeshSectionsBlob;
+        use arvx_core::mesh_extract::MeshVertex;
+
+        let v = |pos: [f32; 3]| MeshVertex {
+            local_pos: pos,
+            normal_oct: 0,
+            leaf_attr_id: 0,
+            bone_indices: 0,
+            bone_weights: 0,
+            _pad: 0,
+        };
+        let verts = vec![
+            v([1.0, 0.5, 0.25]),
+            v([1.0, 0.5, 0.75]),
+            v([0.5, 0.5, 0.5]),
+            v([0.5, 0.5, 0.6]),
+        ];
+        // Two triangles both containing the (0,1) edge.
+        let tris: Vec<u32> = vec![0, 1, 2, 0, 1, 3];
+
+        let mut mesh = MeshSectionsBlob {
+            vertices: bytemuck::cast_slice(&verts).to_vec(),
+            indices: bytemuck::cast_slice(&tris).to_vec(),
+            clusters: Vec::new(),
+            lod0_index_count: tris.len() as u32,
+            dag_groups: Vec::new(),
+            dag_consumed: Vec::new(),
+            dag_produced: Vec::new(),
+        };
+        let pre_verts = verts.len();
+
+        append_lateral_skirts(&mut mesh, Vec3::ZERO, 1.0, 0.5, 2.0);
+
+        let post_verts: &[MeshVertex] = bytemuck::cast_slice(&mesh.vertices);
+        assert_eq!(
+            post_verts.len() - pre_verts,
+            4,
+            "shared boundary edge must emit ONE quad (4 verts), not two",
         );
     }
 
