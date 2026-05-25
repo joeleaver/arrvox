@@ -221,6 +221,49 @@ pub fn bake_tile_with_skirts(
         TILE_HALO_VOXELS,
     );
 
+    // Project surface vertices onto the true heightfield. The
+    // surface-nets extractor places vertices at grid-quantized
+    // positions (staircase); this snaps each vertex's Y to the
+    // actual terrain height at its XZ, eliminating terracing.
+    // Boundary vertices (within halo margin of tile faces) are
+    // skipped to preserve watertight seams between adjacent tiles.
+    if !mesh.vertices.is_empty() {
+        let verts: &mut [arvx_core::mesh_extract::MeshVertex] =
+            bytemuck::cast_slice_mut(&mut mesh.vertices);
+        let height_threshold = voxel_size_m * 1.5;
+        for v in verts.iter_mut() {
+            let wx = v.local_pos[0];
+            let wy = v.local_pos[1];
+            let wz = v.local_pos[2];
+            let world_pos = Vec3::new(wx, wy, wz);
+            let local = world_pos - tile_origin_world;
+            let s = terrain_fn.sample(key, local, voxel_size_m);
+            let mut h = wy - s.sd;
+            if !stamps.is_empty() {
+                for stamp in stamps {
+                    if let Some(sample) = stamp.sample_height(wx, wz) {
+                        let combined = combine_heights(
+                            h,
+                            sample.target_h,
+                            stamp.combine_op,
+                            stamp.position.y,
+                        );
+                        h = h + (combined - h) * sample.weight;
+                    }
+                }
+            }
+            if let Some(floor_h) = envelope_floor {
+                if h < floor_h {
+                    h = floor_h;
+                }
+            }
+            if (wy - h).abs() > height_threshold {
+                continue;
+            }
+            v.local_pos[1] = h;
+        }
+    }
+
     // V2 LOD pyramid: append lateral skirts so LOD-band cracks aren't
     // see-through. Edge-stitched quads with sculpt-aware per-face depth
     // (drops to span the local height delta if it exceeds the baseline).

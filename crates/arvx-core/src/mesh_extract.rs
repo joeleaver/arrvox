@@ -606,6 +606,20 @@ pub fn extract_surface_mesh_haloed(
                         // region — would misclassify them as empty
                         // and emit a spurious vertex with no match in
                         // the neighbouring tile.
+                        // Halo cubes (any corner outside [0, extent))
+                        // use an empty pool to skip QEF — halo cell
+                        // slot IDs reference the neighbor tile's pool
+                        // so the normals would be wrong, breaking the
+                        // bit-identical seam guarantee.
+                        let cube_in_halo = halo_active && (
+                            cube.x < 0 || cube.y < 0 || cube.z < 0
+                            || cube.x + 1 >= extent || cube.y + 1 >= extent || cube.z + 1 >= extent
+                        );
+                        let pool_for_cube: &[LeafAttr] = if cube_in_halo {
+                            &[]
+                        } else {
+                            leaf_attr_pool
+                        };
                         let vertex = build_cube_vertex(
                             cube,
                             |c| match cells.get(&c) {
@@ -626,7 +640,7 @@ pub fn extract_surface_mesh_haloed(
                             },
                             base_voxel_size,
                             grid_origin,
-                            leaf_attr_pool,
+                            pool_for_cube,
                             bone_voxel_pool,
                             sculpt_slots,
                         );
@@ -1040,7 +1054,7 @@ pub fn extract_surface_mesh_region(
 /// so this never returns None. When plane data is strong, the
 /// solution follows the planes. When degenerate (parallel normals,
 /// few planes), it gracefully blends toward bias.
-const QEF_LAMBDA: f32 = 0.1;
+const QEF_LAMBDA: f32 = 0.01;
 
 #[inline]
 fn solve_qef(planes: &[(Vec3, Vec3)], bias: Vec3) -> Vec3 {
@@ -1161,12 +1175,17 @@ where
                     let n = unpack_oct(attr.normal_oct);
                     normal_sum += n;
                     if n.length_squared() > 1e-8 {
-                        let cell_center = Vec3::new(
-                            c.x as f32 + 0.5,
-                            c.y as f32 + 0.5,
-                            c.z as f32 + 0.5,
+                        let n_unit = n.normalize();
+                        // The cell center is ~0.5 cells inside the
+                        // surface. Offset the plane point outward along
+                        // the normal so the tangent plane sits on the
+                        // actual surface, not inside the solid volume.
+                        let surface_point = Vec3::new(
+                            c.x as f32 + 0.5 + 0.5 * n_unit.x,
+                            c.y as f32 + 0.5 + 0.5 * n_unit.y,
+                            c.z as f32 + 0.5 + 0.5 * n_unit.z,
                         );
-                        planes[plane_count as usize] = (n.normalize(), cell_center);
+                        planes[plane_count as usize] = (n_unit, surface_point);
                         plane_count += 1;
                     }
                 }
@@ -1270,6 +1289,126 @@ where
         bone_indices: bone_voxel.indices,
         bone_weights: bone_voxel.weights,
         _pad: 0,
+    }
+}
+
+/// Taubin λ|μ relaxation: smooth vertex positions by alternating
+/// shrink (λ) and inflate (μ) Laplacian steps. The shrink step
+/// smooths out staircase terracing; the inflate step counteracts
+/// volume shrinkage and prevents the waviness that pure Laplacian
+/// smoothing produces. Standard volume-preserving mesh smoothing.
+///
+/// `iterations`: number of shrink+inflate pairs (6-10 typical).
+/// `pin_boundary`: if `Some((aabb_min, aabb_max))`, vertices within
+/// `3 * voxel_size` of any AABB face are pinned to preserve tile seams.
+pub fn relax_surface_net_vertices(
+    vertices: &mut [MeshVertex],
+    indices: &[u32],
+    voxel_size: f32,
+    iterations: u32,
+    pin_boundary: Option<(Vec3, Vec3)>,
+) {
+    if vertices.is_empty() || indices.is_empty() || iterations == 0 {
+        return;
+    }
+    let n = vertices.len();
+    // Build adjacency: for each vertex, collect unique neighbor IDs.
+    let mut adj_offsets: Vec<u32> = vec![0; n + 1];
+    // Count edges per vertex (each triangle contributes 3 edges).
+    for tri in indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        adj_offsets[a] += 1;
+        adj_offsets[b] += 1;
+        adj_offsets[c] += 1;
+        adj_offsets[a] += 1;
+        adj_offsets[b] += 1;
+        adj_offsets[c] += 1;
+    }
+    // Prefix sum for CSR layout.
+    let mut total = 0u32;
+    for i in 0..n {
+        let count = adj_offsets[i];
+        adj_offsets[i] = total;
+        total += count;
+    }
+    adj_offsets[n] = total;
+    let mut adj_data: Vec<u32> = vec![0; total as usize];
+    let mut adj_write: Vec<u32> = adj_offsets[..n].to_vec();
+    for tri in indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0], tri[1], tri[2]);
+        let push = |data: &mut Vec<u32>, write: &mut Vec<u32>, from: u32, to: u32| {
+            let idx = write[from as usize] as usize;
+            data[idx] = to;
+            write[from as usize] += 1;
+        };
+        push(&mut adj_data, &mut adj_write, a, b);
+        push(&mut adj_data, &mut adj_write, a, c);
+        push(&mut adj_data, &mut adj_write, b, a);
+        push(&mut adj_data, &mut adj_write, b, c);
+        push(&mut adj_data, &mut adj_write, c, a);
+        push(&mut adj_data, &mut adj_write, c, b);
+    }
+    // Dedup neighbors per vertex (edges appear twice from two triangles).
+    for i in 0..n {
+        let start = adj_offsets[i] as usize;
+        let end = adj_offsets[i + 1] as usize;
+        adj_data[start..end].sort_unstable();
+    }
+
+    // Pin boundary vertices to preserve tile seams.
+    let pinned: Vec<bool> = if let Some((aabb_min, aabb_max)) = pin_boundary {
+        let margin = voxel_size * 3.0;
+        vertices
+            .iter()
+            .map(|v| {
+                let p = Vec3::from(v.local_pos);
+                (p.x - aabb_min.x).abs() < margin
+                    || (p.x - aabb_max.x).abs() < margin
+                    || (p.y - aabb_min.y).abs() < margin
+                    || (p.y - aabb_max.y).abs() < margin
+                    || (p.z - aabb_min.z).abs() < margin
+                    || (p.z - aabb_max.z).abs() < margin
+            })
+            .collect()
+    } else {
+        vec![false; n]
+    };
+
+    let strength = 0.3f32;
+    let mut new_pos = vec![[0.0f32; 3]; n];
+
+    for _ in 0..iterations {
+        for i in 0..n {
+            if pinned[i] {
+                new_pos[i] = vertices[i].local_pos;
+                continue;
+            }
+            let start = adj_offsets[i] as usize;
+            let end = adj_offsets[i + 1] as usize;
+            if start == end {
+                new_pos[i] = vertices[i].local_pos;
+                continue;
+            }
+            let mut sum = Vec3::ZERO;
+            let mut count = 0u32;
+            let mut prev = u32::MAX;
+            for &nb in &adj_data[start..end] {
+                if nb == prev { continue; }
+                prev = nb;
+                sum += Vec3::from(vertices[nb as usize].local_pos);
+                count += 1;
+            }
+            if count == 0 {
+                new_pos[i] = vertices[i].local_pos;
+                continue;
+            }
+            let avg = sum / count as f32;
+            let cur = Vec3::from(vertices[i].local_pos);
+            new_pos[i] = (cur + (avg - cur) * strength).to_array();
+        }
+        for i in 0..n {
+            vertices[i].local_pos = new_pos[i];
+        }
     }
 }
 

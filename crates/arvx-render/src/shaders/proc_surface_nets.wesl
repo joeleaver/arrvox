@@ -254,7 +254,7 @@ fn vertex_emit(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Regularized QEF using precomputed normals from `surface_normal`
     // pass. Buffer reads only — no SDF evaluations per vertex.
-    let qef_lambda: f32 = 0.1;
+    let qef_lambda: f32 = 0.01;
     var ata_xx = qef_lambda; var ata_xy = 0.0; var ata_xz = 0.0;
     var ata_yy = qef_lambda; var ata_yz = 0.0;
     var ata_zz = qef_lambda;
@@ -272,7 +272,7 @@ fn vertex_emit(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let packed = cell_normal[cell_storage_index(ci)];
                 if (packed != 0u) {
                     let n = unpack_oct_normal(packed);
-                    let p = vec3<f32>(c) + vec3<f32>(0.5);
+                    let p = vec3<f32>(c) + vec3<f32>(0.5) + 0.5 * n;
                     let d = dot(n, p);
                     ata_xx += n.x * n.x; ata_xy += n.x * n.y; ata_xz += n.x * n.z;
                     ata_yy += n.y * n.y; ata_yz += n.y * n.z;
