@@ -247,30 +247,39 @@ pub fn bake_tile_with_skirts(
 /// V2 LOD pyramid: at LOD-band boundaries adjacent tiles use different
 /// voxel sizes, producing surface vertices at slightly different heights
 /// at the shared edge. Cameras see through the gap as a thin
-/// sky-coloured slit. Skirts mask the slit by emitting a vertical strip
-/// dropping below the boundary surface.
+/// sky-coloured slit when the skirts ever become user-visible. Skirts
+/// emit a vertical curtain dropping below the boundary surface.
 ///
-/// V2.x — **edge-stitched + sculpt-aware**:
+/// V2.x topology + depth improvements (latent — see back-cull note in
+/// the function body):
 ///
 /// - **Edge-stitched**: walk the boundary edges of the surface mesh
 ///   (triangle edges whose two endpoints both lie on the same boundary
 ///   plane). Each boundary edge emits a connected 4-vertex quad
-///   spanning the edge. Replaces the prior per-vertex vertical strips,
-///   which had zero horizontal extent when viewed straight down at a
-///   seam.
+///   spanning the edge. Replaces the prior per-vertex vertical strips.
+///   Adjacent quads are deduped via a `BTreeSet<(min_idx, max_idx)>`
+///   per face — the watertight-seam tris produced by halo extraction
+///   would otherwise emit overlapping skirts.
 /// - **Sculpt-aware depth**: per boundary face, the drop is sized to
 ///   span the local height delta:
 ///   `depth = max(skirt_depth_m, span_on_face + margin)`. A deep cut
-///   at a tile boundary (say, a 10 m sculpt pit) used to leave the
-///   bottom of the cliff exposed because the curtain stopped at the
-///   fixed `skirt_depth_m`. The per-face dynamic depth now drops the
-///   whole face's skirt to clear the deepest cut on that face.
+///   at a tile boundary used to leave the bottom of the cliff exposed
+///   because the curtain stopped at the fixed `skirt_depth_m`. The
+///   per-face dynamic depth now drops the whole face's skirt to clear
+///   the deepest cut on that face.
 ///
-/// All four boundary faces are processed independently. The skirt
-/// vertices inherit `normal_oct` and `leaf_attr_id` from the source
-/// edge endpoint so the resolve pass picks consistent material/normal
-/// at shading time. CCW winding gives an outward-facing normal per
-/// face.
+/// The skirt vertices inherit `normal_oct` and `leaf_attr_id` from the
+/// source edge endpoint so the resolve pass picks consistent
+/// material/normal at shading time. Winding is CW-from-outside (i.e.
+/// the geometric triangle normal points INWARD into the tile) so the
+/// mesh raster pipeline's `cull_mode: Back` culls them from any
+/// outside view — this matches V1's effective behavior and avoids the
+/// inter-tile X-offset double-strip artifact that correctly-outward
+/// skirts would expose. Properly making skirts visible from outside
+/// is a separate "skirts go visible" project (needs snap-to-boundary-
+/// plane + horizontal lid + boundary-material reconciliation); the
+/// edge-stitched + sculpt-aware geometry here is forward-ready for
+/// that work.
 ///
 /// `skirt_depth_m <= 0` or a mesh with no triangles is a no-op.
 fn append_lateral_skirts(
@@ -399,6 +408,33 @@ fn append_lateral_skirts(
     let mut patch_min = [f32::INFINITY; 3];
     let mut patch_max = [f32::NEG_INFINITY; 3];
 
+    // V2.x design note — back-cull policy:
+    //
+    // The mesh raster pipeline runs `cull_mode: Back, front_face: Ccw`.
+    // We deliberately wind these skirt quads CW-from-outside (= CCW-
+    // from-inside), so they're back-faces from any outside viewer and
+    // get culled. This matches V1's *actual* on-screen behavior — V1's
+    // per-vertex strips were ALSO inward-facing (the comment claimed
+    // CCW-from-outside but the cross-product math gave an inward
+    // normal). V1 looked fine in practice precisely because the skirts
+    // were silently invisible; the geometry was latent gap-cover.
+    //
+    // Switching to correct outward winding (the "obvious" fix) exposes
+    // two underlying issues that aren't fixed at the skirt level:
+    //   1. inter-tile X gap (A's vert at x≈31.5, B's vert at x≈32.5 →
+    //      ~voxel_size apart) → A's and B's skirts sit in different
+    //      world planes → visible double-strip from oblique angles.
+    //   2. boundary-cell material inheritance: SN's per-cube
+    //      tie-break can pick a cliff-face cell (rock) on a sculpt
+    //      boundary even when the surface above looks like grass →
+    //      grey strip visible against green surrounds.
+    //
+    // Properly closing those needs snap-to-boundary-plane plus a
+    // horizontal lid quad bridging surface_vert.x → boundary.x, AND
+    // material reconciliation — a "skirts go visible" project that the
+    // session-endpoint memo flagged as "only worth doing if the
+    // overhead view becomes a common authoring camera." Until then,
+    // back-cull is the right policy.
     for face_idx in 0..N_FACES {
         if face_edges[face_idx].is_empty() {
             continue;
@@ -407,14 +443,10 @@ fn append_lateral_skirts(
         for &(ia, ib) in &face_edges[face_idx] {
             let va = verts[ia as usize];
             let vb = verts[ib as usize];
-            // Sort the edge endpoints into (TL, TR) so that CCW
-            // winding (TL→TR→BR, TL→BR→BL) gives an outward-facing
-            // normal. "Right" of the outward viewer = outward_normal ×
-            // +Y; the TR vertex sits on the +right side relative to TL.
-            //   x_min outward -X → right -Z → TR.z < TL.z
-            //   x_max outward +X → right +Z → TR.z > TL.z
-            //   z_min outward -Z → right +X → TR.x > TL.x
-            //   z_max outward +Z → right -X → TR.x < TL.x
+            // Same sort as for outward winding — picks a consistent
+            // (TL, TR) per edge across both tile bakes so duplicate
+            // boundary edges (watertight seam case) dedup to the same
+            // canonical orientation.
             let (tl, tr) = match face_idx {
                 F_XMIN => if va.local_pos[2] > vb.local_pos[2] { (va, vb) } else { (vb, va) },
                 F_XMAX => if va.local_pos[2] < vb.local_pos[2] { (va, vb) } else { (vb, va) },
@@ -445,10 +477,12 @@ fn append_lateral_skirts(
                     }
                 }
             }
-            // TL=0, TR=1, BR=2, BL=3. CCW from outward POV.
+            // TL=0, TR=1, BR=2, BL=3. CW-from-outside winding so the
+            // resulting triangles back-cull from any outside viewer —
+            // matches V1's effective behavior (see policy note above).
             new_indices.extend_from_slice(&[
-                base, base + 1, base + 2,
-                base, base + 2, base + 3,
+                base, base + 2, base + 1,
+                base, base + 3, base + 2,
             ]);
         }
     }
