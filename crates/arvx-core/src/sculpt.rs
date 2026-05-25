@@ -903,11 +903,6 @@ fn compute_inflate_edits(
                 // strength values.
                 let target_thickness = (s * op.strength).ceil() as u8;
                 if d_step <= target_thickness {
-                    // Inherit the surface seed's normal if brushfire
-                    // carried one this far; otherwise fall back to
-                    // the brush-radial gradient. Surface inheritance
-                    // is what kills the per-stamp normal stripes a
-                    // drag stroke produces with pure brush_add_normal.
                     let inherited = seed_normal[i];
                     let normal = if inherited != Vec3::ZERO {
                         inherited

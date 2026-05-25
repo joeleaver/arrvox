@@ -606,20 +606,6 @@ pub fn extract_surface_mesh_haloed(
                         // region — would misclassify them as empty
                         // and emit a spurious vertex with no match in
                         // the neighbouring tile.
-                        // Halo cubes (any corner outside [0, extent))
-                        // use an empty pool to skip QEF — halo cell
-                        // slot IDs reference the neighbor tile's pool
-                        // so the normals would be wrong, breaking the
-                        // bit-identical seam guarantee.
-                        let cube_in_halo = halo_active && (
-                            cube.x < 0 || cube.y < 0 || cube.z < 0
-                            || cube.x + 1 >= extent || cube.y + 1 >= extent || cube.z + 1 >= extent
-                        );
-                        let pool_for_cube: &[LeafAttr] = if cube_in_halo {
-                            &[]
-                        } else {
-                            leaf_attr_pool
-                        };
                         let vertex = build_cube_vertex(
                             cube,
                             |c| match cells.get(&c) {
@@ -640,7 +626,7 @@ pub fn extract_surface_mesh_haloed(
                             },
                             base_voxel_size,
                             grid_origin,
-                            pool_for_cube,
+                            leaf_attr_pool,
                             bone_voxel_pool,
                             sculpt_slots,
                         );
@@ -1151,10 +1137,6 @@ where
     let mut corner_solid = [false; 8];
     let mut normal_sum = Vec3::ZERO;
     let mut leaf_attr_id: u32 = 0;
-    // QEF tangent planes: (normal, point_in_cell_coords) per solid
-    // corner that has a valid LeafAttr normal.
-    let mut planes: [(Vec3, Vec3); 8] = [(Vec3::ZERO, Vec3::ZERO); 8];
-    let mut plane_count: u32 = 0;
     // `chosen` carries (coord, is_sculpt) so the per-corner tie-break
     // can prefer sculpt slots over pre-existing ones. Without that
     // bias the lowest-coord cell wins purely by position, and a
@@ -1172,22 +1154,7 @@ where
             corner_solid[i as usize] = true;
             if slot != CELL_INTERIOR {
                 if let Some(attr) = leaf_attr_pool.get(slot as usize) {
-                    let n = unpack_oct(attr.normal_oct);
-                    normal_sum += n;
-                    if n.length_squared() > 1e-8 {
-                        let n_unit = n.normalize();
-                        // The cell center is ~0.5 cells inside the
-                        // surface. Offset the plane point outward along
-                        // the normal so the tangent plane sits on the
-                        // actual surface, not inside the solid volume.
-                        let surface_point = Vec3::new(
-                            c.x as f32 + 0.5 + 0.5 * n_unit.x,
-                            c.y as f32 + 0.5 + 0.5 * n_unit.y,
-                            c.z as f32 + 0.5 + 0.5 * n_unit.z,
-                        );
-                        planes[plane_count as usize] = (n_unit, surface_point);
-                        plane_count += 1;
-                    }
+                    normal_sum += unpack_oct(attr.normal_oct);
                 }
                 let c_is_sculpt = sculpt_slots
                     .map(|s| s.contains(&slot))
@@ -1235,9 +1202,7 @@ where
         pack_oct(Vec3::Y)
     };
 
-    // Naive centroid (edge-crossing average) — used as the base for
-    // single-plane projection and as the fallback when QEF is degenerate.
-    let naive_centroid = if crossing_count > 0 {
+    let local_centroid = if crossing_count > 0 {
         crossing_sum / crossing_count as f32
     } else {
         Vec3::new(
@@ -1245,28 +1210,6 @@ where
             cube.y as f32 + 1.0,
             cube.z as f32 + 1.0,
         )
-    };
-
-    // SN-cube bounds for clamping: the cube's 8 corners span
-    // [cube, cube+2) along each axis (2×2×2 cells). The naive centroid
-    // falls in roughly [cube+0.5, cube+1.5]. Allow the QEF solution
-    // to reach the full cube extent with a small margin.
-    let cube_min = Vec3::new(
-        cube.x as f32 + 0.1,
-        cube.y as f32 + 0.1,
-        cube.z as f32 + 0.1,
-    );
-    let cube_max = Vec3::new(
-        cube.x as f32 + 1.9,
-        cube.y as f32 + 1.9,
-        cube.z as f32 + 1.9,
-    );
-
-    let local_centroid = if plane_count >= 1 {
-        solve_qef(&planes[..plane_count as usize], naive_centroid)
-            .clamp(cube_min, cube_max)
-    } else {
-        naive_centroid
     };
     let local_pos = grid_origin + local_centroid * voxel_size;
 
