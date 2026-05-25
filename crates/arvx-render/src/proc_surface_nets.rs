@@ -91,6 +91,8 @@ pub struct ExtractStats {
 pub struct GpuSurfaceNets {
     pipeline_classify_simple: wgpu::ComputePipeline,
     pipeline_classify_warps: wgpu::ComputePipeline,
+    pipeline_surface_normal_simple: wgpu::ComputePipeline,
+    pipeline_surface_normal_warps: wgpu::ComputePipeline,
     pipeline_vertex_simple: wgpu::ComputePipeline,
     pipeline_vertex_warps: wgpu::ComputePipeline,
     pipeline_index: wgpu::ComputePipeline,
@@ -102,6 +104,8 @@ pub struct GpuSurfaceNets {
     instructions_cap: usize,
     cell_solid_buf: Option<wgpu::Buffer>,
     cell_solid_cap: u64,
+    cell_normal_buf: Option<wgpu::Buffer>,
+    cell_normal_cap: u64,
     cube_map_buf: Option<wgpu::Buffer>,
     cube_map_cap: u64,
     /// Two atomic counters laid out as `[vertex_count, index_count]`.
@@ -197,6 +201,16 @@ impl GpuSurfaceNets {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -228,6 +242,8 @@ impl GpuSurfaceNets {
 
         let pipeline_classify_simple = make_pipeline("sn classify (simple)", "classify", false);
         let pipeline_classify_warps = make_pipeline("sn classify (warps)", "classify", true);
+        let pipeline_surface_normal_simple = make_pipeline("sn surface_normal (simple)", "surface_normal", false);
+        let pipeline_surface_normal_warps = make_pipeline("sn surface_normal (warps)", "surface_normal", true);
         let pipeline_vertex_simple = make_pipeline("sn vertex (simple)", "vertex_emit", false);
         let pipeline_vertex_warps = make_pipeline("sn vertex (warps)", "vertex_emit", true);
         // `index_emit` doesn't call into the procedural evaluator, so it
@@ -261,6 +277,8 @@ impl GpuSurfaceNets {
         Self {
             pipeline_classify_simple,
             pipeline_classify_warps,
+            pipeline_surface_normal_simple,
+            pipeline_surface_normal_warps,
             pipeline_vertex_simple,
             pipeline_vertex_warps,
             pipeline_index,
@@ -270,6 +288,8 @@ impl GpuSurfaceNets {
             instructions_cap: 0,
             cell_solid_buf: None,
             cell_solid_cap: 0,
+            cell_normal_buf: None,
+            cell_normal_cap: 0,
             cube_map_buf: None,
             cube_map_cap: 0,
             counters_buf,
@@ -334,6 +354,7 @@ impl GpuSurfaceNets {
         let t_upload = std::time::Instant::now();
         self.ensure_instructions_capacity(device, ins_slice.len());
         self.ensure_cell_capacity(device, cells);
+        self.ensure_cell_normal_capacity(device, cells);
         self.ensure_cube_capacity(device, cubes);
         self.ensure_vertex_capacity(device, vertex_cap as u64);
         self.ensure_index_capacity(device, index_cap as u64);
@@ -387,6 +408,10 @@ impl GpuSurfaceNets {
                     binding: 6,
                     resource: self.indices_buf.as_ref().unwrap().as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.cell_normal_buf.as_ref().unwrap().as_entire_binding(),
+                },
             ],
         });
         let upload_dt = t_upload.elapsed();
@@ -396,6 +421,11 @@ impl GpuSurfaceNets {
         } else {
             &self.pipeline_classify_simple
         };
+        let pipeline_surface_normal = if has_warps {
+            &self.pipeline_surface_normal_warps
+        } else {
+            &self.pipeline_surface_normal_simple
+        };
         let pipeline_vertex = if has_warps {
             &self.pipeline_vertex_warps
         } else {
@@ -403,6 +433,7 @@ impl GpuSurfaceNets {
         };
 
         let dispatch_classify = (grid_n + 3) / 4;
+        let dispatch_surface_normal = dispatch_classify;
         let dispatch_vertex = (cube_n + 3) / 4;
         let dispatch_index = (grid_n + 3) / 4;
 
@@ -434,6 +465,26 @@ impl GpuSurfaceNets {
                 .poll(wgpu::PollType::wait_indefinitely())
                 .expect("device poll");
             classify_dt = t.elapsed();
+        }
+
+        // Pass 1b: surface normals (gradient at surface cells only)
+        {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sn surface_normal encode"),
+            });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("sn surface_normal"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline_surface_normal);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(dispatch_surface_normal, dispatch_surface_normal, dispatch_surface_normal);
+            }
+            queue.submit(Some(enc.finish()));
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("device poll");
         }
 
         // Pass 2: vertex emit
@@ -568,6 +619,19 @@ impl GpuSurfaceNets {
                 mapped_at_creation: false,
             }));
             self.cell_solid_cap = new_cap;
+        }
+    }
+
+    fn ensure_cell_normal_capacity(&mut self, device: &wgpu::Device, needed: u64) {
+        if self.cell_normal_cap < needed {
+            let new_cap = (needed * 3) / 2;
+            self.cell_normal_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sn cell_normal"),
+                size: new_cap * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }));
+            self.cell_normal_cap = new_cap;
         }
     }
 

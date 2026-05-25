@@ -24,6 +24,7 @@
 
 import package::lib::types::ProcInstruction;
 import package::lib::oct_normal::pack_oct_normal;
+import package::lib::oct_normal::unpack_oct_normal;
 import package::proc_eval::eval_tree;
 import package::proc_eval::eval_tree_distance;
 import package::proc_eval::gradient_normal;
@@ -82,6 +83,9 @@ struct ProxyVertex {
 @group(0) @binding(4) var<storage, read_write> counters: array<atomic<u32>, 2>;
 @group(0) @binding(5) var<storage, read_write> vertices: array<ProxyVertex>;
 @group(0) @binding(6) var<storage, read_write> indices: array<u32>;
+// Packed oct normal per cell (u32). Zero for non-surface/empty cells.
+// Written by `surface_normal`, read by `vertex_emit` for QEF planes.
+@group(0) @binding(7) var<storage, read_write> cell_normal: array<u32>;
 
 const SOLID: u32 = 1u;
 const EMPTY: u32 = 0u;
@@ -132,6 +136,40 @@ fn classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = eval_tree_distance(center, params.instruction_count);
     let solid = select(EMPTY, SOLID, d <= 0.0);
     cell_solid[cell_storage_index(vec3<i32>(gid))] = solid;
+}
+
+// ── Pass 1b: compute gradient normals for surface cells ─────────────
+//
+// Runs after classify. For each solid cell with at least one empty
+// face-neighbor, compute a 6-tap gradient normal and pack it into
+// `cell_normal`. Interior cells (all 6 neighbors solid) write 0.
+// This precomputation lets `vertex_emit` read normals from a buffer
+// instead of evaluating the SDF per corner — avoids GPU timeouts.
+
+@compute @workgroup_size(4, 4, 4)
+fn surface_normal(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = params.grid_n;
+    if (gid.x >= n || gid.y >= n || gid.z >= n) { return; }
+    let c = vec3<i32>(gid);
+    let idx = cell_storage_index(c);
+    if (cell_solid[idx] == EMPTY) {
+        cell_normal[idx] = 0u;
+        return;
+    }
+    let neighbor_solid = read_cell_solid(c + vec3<i32>(1,0,0))
+        + read_cell_solid(c + vec3<i32>(-1,0,0))
+        + read_cell_solid(c + vec3<i32>(0,1,0))
+        + read_cell_solid(c + vec3<i32>(0,-1,0))
+        + read_cell_solid(c + vec3<i32>(0,0,1))
+        + read_cell_solid(c + vec3<i32>(0,0,-1));
+    if (neighbor_solid >= 6u) {
+        cell_normal[idx] = 0u;
+        return;
+    }
+    let center = params.aabb_min
+               + (vec3<f32>(gid) + vec3<f32>(0.5)) * params.cell_size;
+    let gn = gradient_normal(center, params.instruction_count, params.cell_size);
+    cell_normal[idx] = pack_oct_normal(gn);
 }
 
 // ── Pass 2: emit vertex per active SN cube ──────────────────────────
@@ -207,18 +245,70 @@ fn vertex_emit(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Defensive: an SN cube with mixed solidity always has at least
-    // one active edge. Fall back to the cube's nominal hub if not.
-    let local_centroid = select(
+    // Naive centroid (edge-crossing average) — bias for regularized QEF.
+    let naive_centroid = select(
         vec3<f32>(cell_base) + vec3<f32>(1.0),
         crossing_sum / max(f32(crossing_count), 1.0),
         crossing_count > 0u,
     );
+
+    // Regularized QEF using precomputed normals from `surface_normal`
+    // pass. Buffer reads only — no SDF evaluations per vertex.
+    let qef_lambda: f32 = 0.1;
+    var ata_xx = qef_lambda; var ata_xy = 0.0; var ata_xz = 0.0;
+    var ata_yy = qef_lambda; var ata_yz = 0.0;
+    var ata_zz = qef_lambda;
+    var atb_x = qef_lambda * naive_centroid.x;
+    var atb_y = qef_lambda * naive_centroid.y;
+    var atb_z = qef_lambda * naive_centroid.z;
+    var plane_count: u32 = 0u;
+    for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+        if (corner_solid[k] == SOLID) {
+            let c = cell_base + corner_offset(k);
+            let ci = vec3<i32>(c);
+            let n_i32 = i32(params.grid_n);
+            if (ci.x >= 0 && ci.y >= 0 && ci.z >= 0
+                && ci.x < n_i32 && ci.y < n_i32 && ci.z < n_i32) {
+                let packed = cell_normal[cell_storage_index(ci)];
+                if (packed != 0u) {
+                    let n = unpack_oct_normal(packed);
+                    let p = vec3<f32>(c) + vec3<f32>(0.5);
+                    let d = dot(n, p);
+                    ata_xx += n.x * n.x; ata_xy += n.x * n.y; ata_xz += n.x * n.z;
+                    ata_yy += n.y * n.y; ata_yz += n.y * n.z;
+                    ata_zz += n.z * n.z;
+                    atb_x += n.x * d; atb_y += n.y * d; atb_z += n.z * d;
+                    plane_count = plane_count + 1u;
+                }
+            }
+        }
+    }
+
+    var local_centroid: vec3<f32>;
+    if (plane_count >= 1u) {
+        let det = ata_xx * (ata_yy * ata_zz - ata_yz * ata_yz)
+            - ata_xy * (ata_xy * ata_zz - ata_yz * ata_xz)
+            + ata_xz * (ata_xy * ata_yz - ata_yy * ata_xz);
+        let inv_det = 1.0 / det;
+        let sx = (atb_x * (ata_yy * ata_zz - ata_yz * ata_yz)
+            - ata_xy * (atb_y * ata_zz - ata_yz * atb_z)
+            + ata_xz * (atb_y * ata_yz - ata_yy * atb_z)) * inv_det;
+        let sy = (ata_xx * (atb_y * ata_zz - ata_yz * atb_z)
+            - atb_x * (ata_xy * ata_zz - ata_yz * ata_xz)
+            + ata_xz * (ata_xy * atb_z - atb_y * ata_xz)) * inv_det;
+        let sz = (ata_xx * (ata_yy * atb_z - atb_y * ata_yz)
+            - ata_xy * (ata_xy * atb_z - atb_y * ata_xz)
+            + atb_x * (ata_xy * ata_yz - ata_yy * ata_xz)) * inv_det;
+        let cube_min = vec3<f32>(cell_base) + vec3<f32>(0.1);
+        let cube_max = vec3<f32>(cell_base) + vec3<f32>(1.9);
+        local_centroid = clamp(vec3<f32>(sx, sy, sz), cube_min, cube_max);
+    } else {
+        local_centroid = naive_centroid;
+    }
+
     let pos_world = params.aabb_min + local_centroid * params.cell_size;
 
-    // Gradient normal — `cell_size` is wide enough that the 6-tap
-    // central differences land in well-defined SDF territory rather
-    // than chasing finite-precision noise at the hit point.
+    // Gradient normal at the final vertex position for shading.
     let n = gradient_normal(pos_world, params.instruction_count, params.cell_size);
     let normal_oct = pack_oct_normal(n);
 

@@ -4,6 +4,25 @@ use wesl::{ManglerKind, Wesl};
 fn main() {
     let shaders_dir = Path::new("src/shaders");
     println!("cargo:rerun-if-changed={}", shaders_dir.display());
+    // Directory-level tracking misses in-place file edits on some
+    // platforms. Emit per-file rerun directives so cargo detects
+    // modified .wesl sources reliably.
+    for entry in std::fs::read_dir(shaders_dir).into_iter().flatten().flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("wesl") {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
+    }
+    // Also track the lib/ subdirectory (imported-only modules).
+    let lib_dir = shaders_dir.join("lib");
+    if lib_dir.is_dir() {
+        for entry in std::fs::read_dir(&lib_dir).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("wesl") {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+        }
+    }
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let out_dir = Path::new(&out_dir);
