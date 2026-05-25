@@ -392,6 +392,7 @@ impl EngineState {
                     target: target_handle,
                     target_face: neighbour_face,
                     source: source_handle,
+                    skip_remesh: touched_keys.contains(&neighbour_key),
                 });
             }
         }
@@ -592,6 +593,13 @@ impl EngineState {
         //
         // Skips the refresh when the brush stayed away from every
         // face — the common interior-stroke case pays nothing.
+        //
+        // `touched_keys` is forwarded so the refresh path can skip
+        // the slab re-mesh on tiles that were ALSO sculpted this
+        // stamp — `rebuild_dirty_clusters` already handled their
+        // mesh update, and a second re-mesh via
+        // `rebuild_face_band_clusters` would drop the sculpt patch
+        // tris (its filter region is wider than its extract region).
         self.maybe_refresh_neighbour_halos(world_pos, radius, &touched_keys);
 
         if total_removed > 0 {

@@ -60,6 +60,13 @@ pub struct HaloRefresh {
     /// Asset handle of the tile whose interior provides the new data
     /// (the sculpted tile).
     pub source: AssetHandle,
+    /// When true, refresh the halo cell data but skip the slab
+    /// re-mesh (`rebuild_face_band_clusters`). Set for targets that
+    /// were ALSO sculpted this stamp — their mesh was already updated
+    /// by `rebuild_dirty_clusters`, and a second re-mesh via the slab
+    /// path would drop the sculpt patch tris (the slab's filter region
+    /// is wider than its extract region).
+    pub skip_remesh: bool,
 }
 
 /// Resolved cell state for a single source coord. `Interior` means
@@ -86,11 +93,17 @@ impl ArvxSceneManager {
 
         let changed = self.refresh_halo_face(op.target, op.target_face, op.source)?;
         if changed > 0 {
-            // Phase 4.2b — slab path by default. Env-gated fallback
-            // routes through the full-tile re-extract for sanity
-            // comparison and as a safety valve if the slab path
-            // produces a visual regression in the field.
-            if std::env::var("ARVX_TERRAIN_HALO_FULL_REEXTRACT").is_ok() {
+            if op.skip_remesh {
+                // Target was also sculpted this stamp —
+                // `rebuild_dirty_clusters` already updated its mesh at
+                // the brush footprint, but that mesh was built against
+                // the PRE-refresh halo. A full re-extract incorporates
+                // both the sculpt edits AND the updated halo cells in
+                // one pass. The slab path can't be used here because
+                // its wider filter region would destroy the sculpt
+                // patch tris without re-emitting them.
+                self.rebuild_asset_mesh_haloed(op.target);
+            } else if std::env::var("ARVX_TERRAIN_HALO_FULL_REEXTRACT").is_ok() {
                 self.rebuild_asset_mesh_haloed(op.target);
             } else {
                 self.rebuild_face_band_clusters(op.target, op.target_face);
@@ -267,15 +280,23 @@ impl ArvxSceneManager {
                         new_entries.push((coord, new_slot));
                         changed += 1;
                     } else {
-                        // Existing real slot. Overwrite its LeafAttr
-                        // in place (only changed if the LeafAttr is
-                        // actually different — but cheap to write
-                        // unconditionally).
-                        overwrite_at.push((idx, source_slot));
-                        // Conservative: count as changed; the mesh
-                        // re-extract will pick up any normal/material
-                        // diff.
-                        changed += 1;
+                        // Existing real slot. Only count as changed
+                        // when the source LeafAttr actually differs
+                        // from the target — an unconditional
+                        // `changed += 1` here triggered a full-face
+                        // slab re-mesh on every sculpt near the
+                        // boundary, even when 99 % of the halo cells
+                        // were byte-identical. The re-mesh produced a
+                        // visible seam along the ENTIRE tile boundary
+                        // (slab patch vs original interior mesh) even
+                        // though only a handful of cells were actually
+                        // modified.
+                        let src_attr = *self.leaf_attr_pool.get(source_slot);
+                        let tgt_attr = *self.leaf_attr_pool.get(target_slot);
+                        if src_attr != tgt_attr {
+                            overwrite_at.push((idx, source_slot));
+                            changed += 1;
+                        }
                     }
                 }
                 (SourceCellState::Surface(_attr, source_slot), None) => {
