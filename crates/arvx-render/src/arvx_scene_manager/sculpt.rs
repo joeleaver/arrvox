@@ -30,7 +30,7 @@ use arvx_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aab
 use arvx_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use arvx_core::mesh_extract::{
     collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
-    extract_surface_mesh,
+    extract_surface_mesh, project_clay_strip, project_onto_brush_capsule,
 };
 use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sculpt::{
@@ -961,7 +961,8 @@ impl ArvxSceneManager {
         let _ph_t0 = t0;
 
         let (depth, base_vs, grid_origin, brush_lo, brush_hi,
-             brush_center_local, brush_radius_local, brush_radius_sq) = {
+             brush_center_local, brush_segment_start_local,
+             brush_radius_local, brush_radius_sq) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             if entry.meshlet_clusters.is_empty() {
                 return false;
@@ -977,15 +978,14 @@ impl ArvxSceneManager {
             let brush_lo = IVec3::new(lo.x as i32, lo.y as i32, lo.z as i32);
             let brush_hi = IVec3::new(hi.x as i32, hi.y as i32, hi.z as i32);
 
-            // Brush sphere in **object-local** space (same coords as
-            // `MeshVertex::local_pos`). `op.center` is in finest-grid
-            // units; convert to object-local via grid_origin + grid * vs.
             let brush_center_local = grid_origin + op.center * base_vs;
+            let brush_segment_start_local = grid_origin + op.segment_start * base_vs;
             let brush_radius_local = op.radius * base_vs;
             let brush_radius_sq = brush_radius_local * brush_radius_local;
 
             (depth, base_vs, grid_origin, brush_lo, brush_hi,
-             brush_center_local, brush_radius_local, brush_radius_sq)
+             brush_center_local, brush_segment_start_local,
+             brush_radius_local, brush_radius_sq)
         };
 
         if brush_lo.x >= brush_hi.x || brush_lo.y >= brush_hi.y || brush_lo.z >= brush_hi.z {
@@ -1100,7 +1100,7 @@ impl ArvxSceneManager {
         // same drop-and-replace dance; Smooth shares the mechanism
         // without changing occupancy.
         let needs_filter =
-            matches!(op.mode, BrushMode::Carve | BrushMode::Deflate | BrushMode::Smooth);
+            matches!(op.mode, BrushMode::Carve | BrushMode::Deflate | BrushMode::Smooth | BrushMode::ClayStrip);
         let results: Vec<(u32, Vec<u32>)> = if needs_filter {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             let clusters = &entry.meshlet_clusters;
@@ -1225,13 +1225,8 @@ impl ArvxSceneManager {
         let cells_count = cells.len();
         let _ph_t3b = std::time::Instant::now();
 
-        let (brush_verts, brush_indices) = {
+        let (mut brush_verts, brush_indices) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
-            // Halo-aware variant: for terrain tiles the entry carries
-            // halo cells from the original bake, so boundary cubes in
-            // the re-extract see the same 8-corner classification the
-            // initial mesh did. Non-terrain assets pass an empty slice
-            // → bit-identical to the pre-Phase-4 non-halo path.
             extract_mesh_region_from_cells_pooled_haloed(
                 &mut self.sculpt_extract_scratch,
                 &cells,
@@ -1249,6 +1244,30 @@ impl ArvxSceneManager {
             )
         };
         let _p_extract_mesh_ms = _ph_t3b.elapsed().as_secs_f64() * 1000.0;
+
+        match op.mode {
+            BrushMode::Raise | BrushMode::Carve => {
+                project_onto_brush_capsule(
+                    &mut brush_verts,
+                    brush_segment_start_local,
+                    brush_center_local,
+                    brush_radius_local,
+                    base_vs * 1.5,
+                );
+            }
+            BrushMode::ClayStrip => {
+                project_clay_strip(
+                    &mut brush_verts,
+                    brush_segment_start_local,
+                    brush_center_local,
+                    brush_radius_local,
+                    op.strength * base_vs,
+                    op.falloff_curve,
+                    base_vs,
+                );
+            }
+            _ => {}
+        }
 
         _p_extract_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
         let _ph_t4 = std::time::Instant::now();

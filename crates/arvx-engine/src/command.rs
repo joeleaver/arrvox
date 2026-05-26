@@ -814,6 +814,10 @@ pub enum SculptMode {
     Deflate,
     /// (P2) Normal-blend smoothing.
     Smooth,
+    /// Clay strips — deposits a fixed-height flat-topped strip above
+    /// the existing surface, swept along the stroke path. Width =
+    /// brush radius, height = strength cells.
+    ClayStrip,
     /// (P3) Flatten to local average plane.
     Flatten,
 }

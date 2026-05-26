@@ -15,6 +15,8 @@
 use glam::{IVec3, UVec3, Vec3};
 use rustc_hash::FxHashMap;
 
+use crate::sculpt::FalloffCurve;
+
 /// Per-cell occupancy lookup used by Surface Nets — keys are
 /// finest-grid integer coords, values are `leaf_attr_id`s (or the
 /// `CELL_INTERIOR` sentinel for INTERIOR-bulk cells).
@@ -1352,6 +1354,146 @@ pub fn relax_surface_net_vertices(
         for i in 0..n {
             vertices[i].local_pos = new_pos[i];
         }
+    }
+}
+
+/// Project sculpt-patch vertices onto the brush's analytical capsule
+/// surface, eliminating grid-quantized stairstepping. Analogous to
+/// terrain's heightfield projection but uses the brush shape instead.
+///
+/// For each vertex within `snap_threshold` of the brush capsule
+/// surface, moves it radially outward/inward to land exactly on
+/// the capsule. Vertices far from the brush surface (pre-existing
+/// geometry caught in the extract region) are left untouched.
+///
+/// All coordinates are in **object-local** space (same as
+/// `MeshVertex::local_pos`).
+pub fn project_onto_brush_capsule(
+    vertices: &mut [MeshVertex],
+    axis_start: Vec3,
+    axis_end: Vec3,
+    radius: f32,
+    snap_threshold: f32,
+) {
+    let ab = axis_end - axis_start;
+    let ab_len_sq = ab.length_squared();
+    let is_sphere = ab_len_sq < 1e-12;
+
+    for v in vertices.iter_mut() {
+        let p = Vec3::from(v.local_pos);
+
+        let nearest_on_axis = if is_sphere {
+            axis_end
+        } else {
+            let t = ((p - axis_start).dot(ab) / ab_len_sq).clamp(0.0, 1.0);
+            axis_start + ab * t
+        };
+
+        let to_p = p - nearest_on_axis;
+        let dist = to_p.length();
+        if dist < 1e-12 {
+            continue;
+        }
+
+        let sdf = dist - radius;
+        if sdf.abs() > snap_threshold {
+            continue;
+        }
+
+        let projected = nearest_on_axis + to_p * (radius / dist);
+        v.local_pos = projected.to_array();
+    }
+}
+
+/// Project clay strip patch vertices onto the analytical strip surface.
+/// The strip top is a plane; the shoulder follows the profile curve.
+/// All overlapping patches project to the same surface, so the z-buffer
+/// composites them seamlessly (same principle as Raise's capsule
+/// projection).
+///
+/// Discovers the strip-top Y from the highest dense cluster of flat-
+/// region vertex Y values — independent of axis Y (which drifts when
+/// the brush picks already-deposited clay).
+pub fn project_clay_strip(
+    vertices: &mut [MeshVertex],
+    axis_start: Vec3,
+    axis_end: Vec3,
+    radius: f32,
+    strength: f32,
+    falloff: FalloffCurve,
+    voxel_size: f32,
+) {
+    if vertices.is_empty() || radius < 1e-12 || strength < 1e-6 {
+        return;
+    }
+    let ab = axis_end - axis_start;
+    let ab_len_sq = ab.length_squared();
+    let is_sphere = ab_len_sq < 1e-12;
+
+    let nearest_on_axis = |p: Vec3| -> Vec3 {
+        if is_sphere {
+            axis_end
+        } else {
+            let t = ((p - axis_start).dot(ab) / ab_len_sq).clamp(0.0, 1.0);
+            axis_start + ab * t
+        }
+    };
+
+    let snap = voxel_size * 1.5;
+    let shoulder_width = 0.25 * radius;
+    let flat_radius = radius - shoulder_width;
+
+    // ── Calibrate: find strip-top Y ──
+    // Collect Y of all flat-region vertices. The strip top is the
+    // highest dense cluster. We bucket into voxel-sized bins and find
+    // the highest bin with enough vertices.
+    let mut flat_ys: Vec<f32> = Vec::new();
+    for v in vertices.iter() {
+        let p = Vec3::from(v.local_pos);
+        let ax = nearest_on_axis(p);
+        let diff = p - ax;
+        let horiz = Vec3::new(diff.x, 0.0, diff.z).length();
+        if horiz <= flat_radius {
+            flat_ys.push(p.y);
+        }
+    }
+    if flat_ys.len() < 3 {
+        return;
+    }
+    flat_ys.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    // Highest cluster: start from max, collect all within 2 voxels.
+    let max_y = flat_ys[flat_ys.len() - 1];
+    let cluster_lo = max_y - voxel_size * 2.0;
+    let top_cluster: Vec<f32> = flat_ys.iter().copied()
+        .filter(|&y| y >= cluster_lo)
+        .collect();
+    if top_cluster.is_empty() {
+        return;
+    }
+    let strip_top_y = top_cluster[top_cluster.len() / 2];
+    let base_y = strip_top_y - strength;
+
+    // ── Project ──
+    for v in vertices.iter_mut() {
+        let p = Vec3::from(v.local_pos);
+        let ax = nearest_on_axis(p);
+        let diff = p - ax;
+        let horiz = Vec3::new(diff.x, 0.0, diff.z).length();
+        if horiz > radius + snap {
+            continue;
+        }
+
+        use crate::sculpt::clay_strip_profile;
+        let profile_frac = clay_strip_profile(horiz, radius, strength, falloff) / strength;
+        if profile_frac < 1e-6 {
+            continue;
+        }
+        let ideal_y = base_y + strength * profile_frac;
+        let err = (p.y - ideal_y).abs();
+        if err > snap {
+            continue;
+        }
+        v.local_pos[1] = ideal_y;
     }
 }
 

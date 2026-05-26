@@ -112,6 +112,15 @@ pub enum BrushMode {
     /// space flip to empty, and the newly-exposed interior cells
     /// emit cavity-wall Adds on the outside rim.
     Deflate,
+    /// Clay strips — deposits a fixed-height flat-topped strip above
+    /// the pre-stroke surface, swept along the capsule axis. Width =
+    /// brush radius, height = `strength` cells. The cross-section has
+    /// a flat top (75% of radius) with falloff-shaped shoulders at
+    /// the lateral edges. Overlapping strokes stack: each adds its
+    /// fixed height on top of whatever surface was there when the
+    /// stroke began. Uses the same brushfire infrastructure as Inflate
+    /// but with a flat-top thickness profile instead of a dome.
+    ClayStrip,
     /// Geometry-and-normal smoothing. Per cell inside the brush capsule
     /// the kernel reads pre-stamp 6-neighbour occupancy from a dense
     /// scratch grid and applies one of three rules:
@@ -594,6 +603,15 @@ pub fn compute_brush_edits_in_stroke(
         BrushMode::Smooth => {
             return compute_smooth_edits(octree, brick_pool, leaf_attr_pool, &op);
         }
+        BrushMode::ClayStrip => {
+            return compute_clay_strip_edits(
+                octree,
+                brick_pool,
+                leaf_attr_pool,
+                &op,
+                is_stroke_edit,
+            );
+        }
         BrushMode::Carve | BrushMode::Raise => {}
     }
     let _ = leaf_attr_pool;
@@ -653,9 +671,9 @@ pub fn compute_brush_edits_in_stroke(
                         &mut edits, coord, state, &op, octree, brick_pool,
                         &mut cache, &mut n_neighbor_calls,
                     ),
-                    (BrushMode::Inflate | BrushMode::Deflate | BrushMode::Smooth, _) => {
+                    (BrushMode::Inflate | BrushMode::Deflate | BrushMode::Smooth | BrushMode::ClayStrip, _) => {
                         unreachable!(
-                            "Inflate / Deflate / Smooth are handled by the top-level dispatch above"
+                            "Inflate / Deflate / Smooth / ClayStrip are handled by the top-level dispatch above"
                         )
                     }
                 }
@@ -909,6 +927,231 @@ fn compute_inflate_edits(
                     } else {
                         brush_add_normal(c, op)
                     };
+                    edits.push(LeafEdit {
+                        coord: c,
+                        op: LeafEditOp::Add { material: op.material, normal },
+                    });
+                }
+            }
+        }
+    }
+
+    SculptDelta {
+        edits,
+        timing: ComputeBrushEditsTiming {
+            n_aabb_cells,
+            n_inside_sphere,
+            n_cell_state_calls,
+            n_neighbor_calls: 0,
+            t_total_ns: t_start.elapsed().as_nanos() as u64,
+        },
+    }
+}
+
+/// Flat-top cross-section profile for clay strips. Returns the target
+/// thickness in cells at perpendicular distance `d` from the capsule axis.
+/// Flat at full `strength` across the inner 75% of the radius, then
+/// tapers to zero over the 25% shoulder via the falloff curve.
+#[inline]
+pub fn clay_strip_profile(d: f32, radius: f32, strength: f32, falloff: FalloffCurve) -> f32 {
+    let shoulder = 0.25 * radius;
+    let flat = radius - shoulder;
+    if d <= flat {
+        strength
+    } else if d <= radius {
+        let t = (radius - d) / shoulder;
+        strength * falloff.evaluate(t)
+    } else {
+        0.0
+    }
+}
+
+/// Analytical normal for a clay strip cell. Flat-top cells get (0,1,0);
+/// shoulder cells get an outward-tilted normal derived from the profile
+/// gradient. `horiz_dist` is the horizontal distance from the axis,
+/// `diff` is the full vector from the nearest axis point to the cell.
+#[inline]
+fn clay_strip_normal(horiz_dist: f32, diff: Vec3, op: &BrushOp) -> Vec3 {
+    let shoulder = 0.25 * op.radius;
+    let flat = op.radius - shoulder;
+
+    if horiz_dist <= flat {
+        return Vec3::Y;
+    }
+    // Shoulder: compute the profile slope via finite difference.
+    let eps = 0.5;
+    let h0 = clay_strip_profile(horiz_dist - eps, op.radius, op.strength, op.falloff_curve);
+    let h1 = clay_strip_profile(horiz_dist + eps, op.radius, op.strength, op.falloff_curve);
+    let slope = (h0 - h1) / (2.0 * eps);
+
+    // Normal = (-slope * outward_horizontal, 1, 0), normalized.
+    let horiz_vec = Vec3::new(diff.x, 0.0, diff.z);
+    let horiz_len = horiz_vec.length();
+    if horiz_len < 1e-6 {
+        return Vec3::Y;
+    }
+    let outward = horiz_vec / horiz_len;
+    Vec3::new(-slope * outward.x, 1.0, -slope * outward.z).normalize()
+}
+
+/// Clay strip deposit. Same brushfire infrastructure as
+/// [`compute_inflate_edits`] but with a flat-top thickness profile:
+/// full `strength` cells across the inner 75% of the brush radius,
+/// tapering to zero over a 25% shoulder at the lateral edges.
+fn compute_clay_strip_edits(
+    octree: &SparseOctree,
+    brick_pool: &BrickPool,
+    leaf_attr_pool: &[LeafAttr],
+    op: &BrushOp,
+    is_stroke_edit: impl Fn(UVec3) -> bool,
+) -> SculptDelta {
+    use std::time::Instant;
+
+    let extent = octree.extent();
+    let max_k = op.strength.max(0.0).ceil() as u32;
+    if max_k == 0 || op.radius <= 0.0 {
+        return SculptDelta::default();
+    }
+    let max_k = max_k.min(254) as u8;
+
+    let (lo, hi) = brush_cell_range_padded(op, extent, max_k as u32);
+    if lo.x >= hi.x || lo.y >= hi.y || lo.z >= hi.z {
+        return SculptDelta::default();
+    }
+
+    let t_start = Instant::now();
+    let size = hi - lo;
+    let stride_y = size.x as usize;
+    let stride_z = (size.x * size.y) as usize;
+    let total = (size.x * size.y * size.z) as usize;
+    let idx = |c: UVec3| -> usize {
+        let l = c - lo;
+        (l.x as usize) + (l.y as usize) * stride_y + (l.z as usize) * stride_z
+    };
+
+    let mut dist: Vec<u8> = vec![u8::MAX; total];
+    let mut is_addable: Vec<bool> = vec![false; total];
+    let mut is_transit: Vec<bool> = vec![false; total];
+    let mut seed_normal: Vec<Vec3> = vec![Vec3::ZERO; total];
+
+    let mut cache = crate::sparse_octree::CellStateCache::new();
+    let mut n_cell_state_calls = 0u32;
+    let mut n_inside_sphere = 0u32;
+    let mut n_aabb_cells = 0u32;
+
+    // ── Init pass ──
+    for z in lo.z..hi.z {
+        for y in lo.y..hi.y {
+            for x in lo.x..hi.x {
+                n_aabb_cells += 1;
+                let c = UVec3::new(x, y, z);
+                let state = octree.cell_state_cached(c, brick_pool, &mut cache);
+                n_cell_state_calls += 1;
+                let i = idx(c);
+                let edited = is_stroke_edit(c);
+                match state {
+                    CellState::Solid(slot) => {
+                        if edited {
+                            is_transit[i] = true;
+                        } else {
+                            dist[i] = 0;
+                            if let Some(attr) = leaf_attr_pool.get(slot as usize) {
+                                seed_normal[i] = unpack_oct(attr.normal_oct);
+                            }
+                        }
+                    }
+                    CellState::Interior => {
+                        if edited {
+                            is_transit[i] = true;
+                        } else {
+                            dist[i] = 0;
+                        }
+                    }
+                    CellState::Empty => is_addable[i] = true,
+                    CellState::OutOfBounds => {}
+                }
+            }
+        }
+    }
+
+    // ── Brushfire ──
+    for step in 1..=max_k {
+        let prev = step - 1;
+        for z in lo.z..hi.z {
+            for y in lo.y..hi.y {
+                for x in lo.x..hi.x {
+                    let c = UVec3::new(x, y, z);
+                    let i = idx(c);
+                    if dist[i] != u8::MAX || (!is_addable[i] && !is_transit[i]) {
+                        continue;
+                    }
+                    let predecessors = [
+                        (x > lo.x).then(|| idx(UVec3::new(x - 1, y, z))),
+                        (x + 1 < hi.x).then(|| idx(UVec3::new(x + 1, y, z))),
+                        (y > lo.y).then(|| idx(UVec3::new(x, y - 1, z))),
+                        (y + 1 < hi.y).then(|| idx(UVec3::new(x, y + 1, z))),
+                        (z > lo.z).then(|| idx(UVec3::new(x, y, z - 1))),
+                        (z + 1 < hi.z).then(|| idx(UVec3::new(x, y, z + 1))),
+                    ];
+                    let mut found = false;
+                    let mut sum = Vec3::ZERO;
+                    for p in predecessors.iter().flatten() {
+                        if dist[*p] != prev {
+                            continue;
+                        }
+                        found = true;
+                        let n = seed_normal[*p];
+                        if n != Vec3::ZERO {
+                            sum += n;
+                        }
+                    }
+                    if found {
+                        dist[i] = step;
+                        let len_sq = sum.length_squared();
+                        seed_normal[i] = if len_sq > 1e-6 {
+                            sum * len_sq.sqrt().recip()
+                        } else {
+                            Vec3::ZERO
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Emit pass: flat-top profile instead of dome ──
+    let mut edits = Vec::new();
+    for z in lo.z..hi.z {
+        for y in lo.y..hi.y {
+            for x in lo.x..hi.x {
+                let c = UVec3::new(x, y, z);
+                let i = idx(c);
+                if !is_addable[i] {
+                    continue;
+                }
+                let d_step = dist[i];
+                if d_step == 0 || d_step == u8::MAX {
+                    continue;
+                }
+
+                let cell_center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                // Horizontal distance from the capsule axis — use
+                // only XZ so the strip profile evaluates the cross-
+                // section width correctly. 3D distance would make
+                // the flat top narrower at higher cells because the
+                // vertical offset inflates the distance.
+                let closest = closest_on_axis(cell_center, op);
+                let diff = cell_center - closest;
+                let horiz_dist = Vec3::new(diff.x, 0.0, diff.z).length();
+                if horiz_dist > op.radius {
+                    continue;
+                }
+                n_inside_sphere += 1;
+                let target_thickness = clay_strip_profile(
+                    horiz_dist, op.radius, op.strength, op.falloff_curve,
+                ).ceil() as u8;
+                if d_step <= target_thickness {
+                    let normal = clay_strip_normal(horiz_dist, diff, op);
                     edits.push(LeafEdit {
                         coord: c,
                         op: LeafEditOp::Add { material: op.material, normal },
@@ -1804,7 +2047,7 @@ fn brush_add_normal(coord: UVec3, op: &BrushOp) -> Vec3 {
         // — the analytical brush gradient is still the right
         // direction because the added layer is centered on the
         // brush, not on the underlying surface.
-        BrushMode::Raise | BrushMode::Inflate => outward_from_brush,
+        BrushMode::Raise | BrushMode::Inflate | BrushMode::ClayStrip => outward_from_brush,
         // Cavity wall / Deflate-revealed wall faces into the carved
         // pocket (toward the brush center, where the empty volume
         // now lives).

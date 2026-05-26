@@ -512,6 +512,13 @@ fn sculpt_mode_row(
                 Memo::new(move || store.sculpt_mode.get() == SculptMode::Smooth),
                 move || store.sculpt_mode.set(SculptMode::Smooth),
             )}
+            {gizmo_button(
+                __scope,
+                TablerIcon::LayoutRows,
+                "Clay Strip — deposit a flat-topped strip above the surface (ZBrush Clay Strips equivalent)",
+                Memo::new(move || store.sculpt_mode.get() == SculptMode::ClayStrip),
+                move || store.sculpt_mode.set(SculptMode::ClayStrip),
+            )}
         }
     }
 }

@@ -119,10 +119,11 @@ impl EngineState {
             SculptMode::Inflate => arvx_core::sculpt::BrushMode::Inflate,
             SculptMode::Deflate => arvx_core::sculpt::BrushMode::Deflate,
             SculptMode::Smooth => arvx_core::sculpt::BrushMode::Smooth,
+            SculptMode::ClayStrip => arvx_core::sculpt::BrushMode::ClayStrip,
             SculptMode::Flatten => {
                 self.console.warn(format!(
                     "Sculpt mode {mode:?} not implemented yet — \
-                     Raise / Carve / Inflate / Deflate / Smooth are wired through P2.",
+                     Raise / Carve / Inflate / Deflate / Smooth / ClayStrip are wired through.",
                 ));
                 return 0;
             }
@@ -230,7 +231,7 @@ impl EngineState {
         // next has_glass check rescans. Carve cannot *add* glass
         // (only remove), so a stale-true verdict for the asset is
         // just an empty glass pass — perf cost only, no visual bug.
-        if matches!(mode, SculptMode::Raise) {
+        if matches!(mode, SculptMode::Raise | SculptMode::ClayStrip) {
             let is_glass_brush = (material_id as usize) < self.material_is_glass.len()
                 && self.material_is_glass[material_id as usize];
             if is_glass_brush {
@@ -455,10 +456,11 @@ impl EngineState {
             SculptMode::Inflate => arvx_core::sculpt::BrushMode::Inflate,
             SculptMode::Deflate => arvx_core::sculpt::BrushMode::Deflate,
             SculptMode::Smooth => arvx_core::sculpt::BrushMode::Smooth,
+            SculptMode::ClayStrip => arvx_core::sculpt::BrushMode::ClayStrip,
             SculptMode::Flatten => {
                 self.console.warn(format!(
                     "Sculpt mode {mode:?} not implemented yet — \
-                     Raise / Carve / Inflate / Deflate / Smooth are wired through P2.",
+                     Raise / Carve / Inflate / Deflate / Smooth / ClayStrip are wired through.",
                 ));
                 return 0;
             }
@@ -549,7 +551,7 @@ impl EngineState {
                 .or_default()
                 .push(brush_aabb);
 
-            if matches!(mode, SculptMode::Raise) {
+            if matches!(mode, SculptMode::Raise | SculptMode::ClayStrip) {
                 let is_glass_brush = (material_id as usize) < self.material_is_glass.len()
                     && self.material_is_glass[material_id as usize];
                 if is_glass_brush {
