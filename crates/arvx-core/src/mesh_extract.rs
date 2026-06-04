@@ -1269,13 +1269,50 @@ where
     }
 }
 
-/// Taubin λ|μ relaxation: smooth vertex positions by alternating
-/// shrink (λ) and inflate (μ) Laplacian steps. The shrink step
-/// smooths out staircase terracing; the inflate step counteracts
-/// volume shrinkage and prevents the waviness that pure Laplacian
-/// smoothing produces. Standard volume-preserving mesh smoothing.
+/// **Gibson Constrained Elastic Surface Net** — occupancy-only smooth
+/// vertex placement, robust to the CPU sculpt path's deliberately
+/// rank-1 (homogenized) per-leaf normals.
 ///
-/// `iterations`: number of shrink+inflate pairs (6-10 typical).
+/// Naive surface-net vertices sit at SN-cube edge-crossing centroids,
+/// which staircase on slopes that aren't grid-aligned. This relaxer:
+///
+/// 1. **Captures each vertex's original cell-box origin** so the final
+///    position can be bounded to `±h/2` of it (`h = voxel_size`).
+/// 2. **Taubin λ|μ smoothing** — alternates a shrink step (λ toward the
+///    1-ring mean) and an inflate step (μ, negative) so the mesh
+///    de-staircases without the global volume shrinkage that pure
+///    Laplacian smoothing produces.
+/// 3. **Box constraint (the Gibson part):** after *every* step each
+///    component is clamped to `[orig[i] − h/2, orig[i] + h/2]`. This is
+///    the only load-bearing use of `voxel_size`, and it bounds the
+///    per-vertex displacement so smoothing can never exceed the
+///    occupancy field's own `±h/2` positional ambiguity (the floor the
+///    A1 falsification tests pin). Clamping every intermediate step
+///    keeps the whole trajectory inside the box, so the final position
+///    is provably in-box regardless of iteration count.
+/// 4. **Soft anchor (small weight, once after the Taubin pass):** convex
+///    features erode when smoothing drags a vertex *inward* (behind the
+///    plane through its original position with its original normal). The
+///    anchor pulls such inward-eroded vertices a small fraction back out
+///    toward that plane, still inside the box. It is deliberately
+///    one-sided — vertices that smoothed onto or past their plane (e.g.
+///    staircase terraces flattening onto the true slope) are untouched,
+///    so the guard never re-imposes the staircase the relaxer just
+///    removed. It's a guard, not the placer — small weight, applied once.
+///
+/// After the position loop, per-vertex normals are recomputed as the
+/// **area-weighted average of incident triangle face normals from the
+/// relaxed positions** (Task A3) so shading agrees with the de-staircased
+/// geometry instead of carrying the stale lattice-quantized normals.
+///
+/// IMPORTANT: this is *not* a QEF. The CPU sculpt path homogenizes
+/// per-leaf normals (anti-shading-stripe), so the tangent-plane set is
+/// rank-1 and a normal-driven QEF degenerates — commit `9b4930c8`
+/// removed exactly that. Occupancy + the box clamp is the correct,
+/// field-free placer here. The GPU `proc_surface_nets.wesl` QEF is
+/// untouched (it has full-rank live-field gradients).
+///
+/// `iterations`: number of Taubin shrink+inflate pairs (6-10 typical).
 /// `pin_boundary`: if `Some((aabb_min, aabb_max))`, vertices within
 /// `3 * voxel_size` of any AABB face are pinned to preserve tile seams.
 pub fn relax_surface_net_vertices(
@@ -1289,23 +1326,44 @@ pub fn relax_surface_net_vertices(
         return;
     }
     let n = vertices.len();
+
+    // Capture origins and the cell-box half-extent. Every final vertex
+    // position is clamped componentwise to `orig ± half`.
+    let orig: Vec<Vec3> = vertices.iter().map(|v| Vec3::from(v.local_pos)).collect();
+    let half = voxel_size * 0.5;
+
+    // Capture original normals for the soft anchor. The anchor pulls each
+    // smoothed vertex toward the plane through its origin with this
+    // normal — using the *original* (pre-relax) normals keeps the anchor
+    // a fixed reference rather than chasing the moving surface. Falls back
+    // to +Y on a degenerate-packed normal.
+    let orig_normals: Vec<Vec3> = vertices
+        .iter()
+        .map(|v| {
+            let nrm = unpack_oct(v.normal_oct);
+            if nrm.length_squared() > 1e-8 {
+                nrm.normalize()
+            } else {
+                Vec3::Y
+            }
+        })
+        .collect();
+
     // Build adjacency: for each vertex, collect unique neighbor IDs.
     let mut adj_offsets: Vec<u32> = vec![0; n + 1];
-    // Count edges per vertex (each triangle contributes 3 edges).
+    // Count edges per vertex (each triangle contributes 2 directed edges
+    // per incident vertex; deduped below to one entry per neighbor).
     for tri in indices.chunks_exact(3) {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-        adj_offsets[a] += 1;
-        adj_offsets[b] += 1;
-        adj_offsets[c] += 1;
-        adj_offsets[a] += 1;
-        adj_offsets[b] += 1;
-        adj_offsets[c] += 1;
+        adj_offsets[a] += 2;
+        adj_offsets[b] += 2;
+        adj_offsets[c] += 2;
     }
     // Prefix sum for CSR layout.
     let mut total = 0u32;
-    for i in 0..n {
-        let count = adj_offsets[i];
-        adj_offsets[i] = total;
+    for slot in adj_offsets.iter_mut().take(n) {
+        let count = *slot;
+        *slot = total;
         total += count;
     }
     adj_offsets[n] = total;
@@ -1313,23 +1371,44 @@ pub fn relax_surface_net_vertices(
     let mut adj_write: Vec<u32> = adj_offsets[..n].to_vec();
     for tri in indices.chunks_exact(3) {
         let (a, b, c) = (tri[0], tri[1], tri[2]);
-        let push = |data: &mut Vec<u32>, write: &mut Vec<u32>, from: u32, to: u32| {
-            let idx = write[from as usize] as usize;
-            data[idx] = to;
-            write[from as usize] += 1;
+        let mut push = |from: u32, to: u32| {
+            let idx = adj_write[from as usize] as usize;
+            adj_data[idx] = to;
+            adj_write[from as usize] += 1;
         };
-        push(&mut adj_data, &mut adj_write, a, b);
-        push(&mut adj_data, &mut adj_write, a, c);
-        push(&mut adj_data, &mut adj_write, b, a);
-        push(&mut adj_data, &mut adj_write, b, c);
-        push(&mut adj_data, &mut adj_write, c, a);
-        push(&mut adj_data, &mut adj_write, c, b);
+        push(a, b);
+        push(a, c);
+        push(b, a);
+        push(b, c);
+        push(c, a);
+        push(c, b);
     }
-    // Dedup neighbors per vertex (edges appear twice from two triangles).
+    // Real dedup per vertex: sort then collapse runs in place, shrinking
+    // each vertex's adjacency span to its set of UNIQUE neighbors and
+    // recording the new end in `adj_end`. The old code only sorted and
+    // relied on an adjacent-duplicate skip in the hot loop, which left
+    // self-edges and double-counted neighbors a step could silently
+    // accumulate; here the 1-ring mean is over true unique neighbors.
+    let mut adj_end: Vec<u32> = vec![0; n];
     for i in 0..n {
         let start = adj_offsets[i] as usize;
         let end = adj_offsets[i + 1] as usize;
-        adj_data[start..end].sort_unstable();
+        let span = &mut adj_data[start..end];
+        span.sort_unstable();
+        let mut write = 0usize;
+        let mut prev = u32::MAX;
+        for k in 0..span.len() {
+            let v = span[k];
+            // Drop duplicates and any self-edge (a vertex is never its
+            // own 1-ring neighbor).
+            if v == prev || v == i as u32 {
+                continue;
+            }
+            prev = v;
+            span[write] = v;
+            write += 1;
+        }
+        adj_end[i] = start as u32 + write as u32;
     }
 
     // Pin boundary vertices to preserve tile seams.
@@ -1351,41 +1430,117 @@ pub fn relax_surface_net_vertices(
         vec![false; n]
     };
 
-    let strength = 0.3f32;
-    let mut new_pos = vec![[0.0f32; 3]; n];
+    // Taubin λ|μ: shrink then inflate. λ > 0 smooths; μ < 0, |μ| > λ
+    // counteracts the shrink so volume is preserved. Standard
+    // pass-band values (λ=0.33, μ=−0.34).
+    const LAMBDA: f32 = 0.33;
+    const MU: f32 = -0.34;
+    let mut new_pos = vec![Vec3::ZERO; n];
 
-    for _ in 0..iterations {
+    // One Laplacian step with factor `factor`, then the Gibson box clamp.
+    // Reads `vertices`, writes `new_pos`, then commits.
+    let mut laplacian_step = |factor: f32, vertices: &mut [MeshVertex]| {
         for i in 0..n {
+            let cur = Vec3::from(vertices[i].local_pos);
             if pinned[i] {
-                new_pos[i] = vertices[i].local_pos;
+                new_pos[i] = cur;
                 continue;
             }
             let start = adj_offsets[i] as usize;
-            let end = adj_offsets[i + 1] as usize;
-            if start == end {
-                new_pos[i] = vertices[i].local_pos;
+            let end = adj_end[i] as usize;
+            let nbrs = &adj_data[start..end];
+            if nbrs.is_empty() {
+                new_pos[i] = cur;
                 continue;
             }
             let mut sum = Vec3::ZERO;
-            let mut count = 0u32;
-            let mut prev = u32::MAX;
-            for &nb in &adj_data[start..end] {
-                if nb == prev { continue; }
-                prev = nb;
+            for &nb in nbrs {
                 sum += Vec3::from(vertices[nb as usize].local_pos);
-                count += 1;
             }
-            if count == 0 {
-                new_pos[i] = vertices[i].local_pos;
-                continue;
-            }
-            let avg = sum / count as f32;
-            let cur = Vec3::from(vertices[i].local_pos);
-            new_pos[i] = (cur + (avg - cur) * strength).to_array();
+            let avg = sum / nbrs.len() as f32;
+            let p = cur + (avg - cur) * factor;
+
+            // Gibson constraint: clamp componentwise to the cell box.
+            let lo = orig[i] - Vec3::splat(half);
+            let hi = orig[i] + Vec3::splat(half);
+            new_pos[i] = p.clamp(lo, hi);
         }
         for i in 0..n {
-            vertices[i].local_pos = new_pos[i];
+            vertices[i].local_pos = new_pos[i].to_array();
         }
+    };
+
+    for _ in 0..iterations {
+        laplacian_step(LAMBDA, vertices);
+        laplacian_step(MU, vertices);
+    }
+
+    // Soft anchor (a guard, not the placer): a convex feature erodes when
+    // smoothing drags its vertex INWARD — behind the original tangent
+    // plane through `orig[i]` with normal `orig_normals[i]`. After the
+    // Taubin pass, pull each such inward-eroded vertex a small fraction
+    // back OUT toward that plane (still inside the cell box). The guard is
+    // deliberately one-sided: vertices that smoothed onto or past their
+    // original plane (e.g. staircase terraces flattening onto the true
+    // slope) are untouched, so the anchor never re-imposes the staircase
+    // it's the relaxer's whole job to remove. Applied once, after
+    // iterating, so it can't compound across steps into a dominant term.
+    //
+    // Weight is kept low (0.12) on purpose: a blanket erosion guard also
+    // fires on legitimate de-staircasing corrections (a high-terrace
+    // vertex moving down onto the true slope reads as "inward" against
+    // its +Y-ish normal), so a large weight would re-impose the staircase
+    // and dominate the placer (measured: 0.25 forces ~3× the iterations
+    // to clear a slope). 0.12 still nudges genuine convex creases back
+    // out while leaving de-staircasing convergence fast. Detecting true
+    // creases to anchor them hard is the deferred Task A6.
+    const ANCHOR_WEIGHT: f32 = 0.12;
+    for i in 0..n {
+        if pinned[i] {
+            continue;
+        }
+        let p = Vec3::from(vertices[i].local_pos);
+        let n_i = orig_normals[i];
+        // Signed distance off the original tangent plane (positive =
+        // outward along the normal, negative = eroded inward).
+        let signed = (p - orig[i]).dot(n_i);
+        if signed >= 0.0 {
+            continue; // not eroded — leave it.
+        }
+        // Move a fraction of the inward erosion back out.
+        let pulled = p - n_i * (signed * ANCHOR_WEIGHT);
+        let lo = orig[i] - Vec3::splat(half);
+        let hi = orig[i] + Vec3::splat(half);
+        vertices[i].local_pos = pulled.clamp(lo, hi).to_array();
+    }
+
+    // --- Task A3: recompute normals from the relaxed faces. ---
+    //
+    // Accumulate each triangle's geometric normal (length ∝ 2× face
+    // area) onto its three vertices, so the per-vertex normal is the
+    // area-weighted average of incident face normals at the RELAXED
+    // positions. Winding is the extractor's outward CCW order (the same
+    // order the `closed_cube_winds_outward` test pins), so the
+    // accumulated normal points outward.
+    let mut normal_accum = vec![Vec3::ZERO; n];
+    for tri in indices.chunks_exact(3) {
+        let (ia, ib, ic) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let a = Vec3::from(vertices[ia].local_pos);
+        let b = Vec3::from(vertices[ib].local_pos);
+        let c = Vec3::from(vertices[ic].local_pos);
+        // Cross product magnitude == 2× triangle area → area weighting
+        // falls out for free; no per-triangle normalize.
+        let face = (b - a).cross(c - a);
+        normal_accum[ia] += face;
+        normal_accum[ib] += face;
+        normal_accum[ic] += face;
+    }
+    for i in 0..n {
+        let acc = normal_accum[i];
+        if acc.length_squared() > 1e-12 {
+            vertices[i].normal_oct = pack_oct(acc.normalize());
+        }
+        // Else: isolated/degenerate vertex — keep its prior normal.
     }
 }
 
@@ -2954,5 +3109,248 @@ mod tests {
         // X and Y should be at the plane intersection, Z pulled toward bias.
         assert!((result.x - 1.0).abs() < 0.15, "x={}", result.x);
         assert!((result.y - 1.0).abs() < 0.15, "y={}", result.y);
+    }
+
+    // --- Task A2/A3: Gibson Constrained Elastic Surface Net tests. ---
+
+    /// Build a regular `(cols × rows)` triangulated grid in the XZ plane
+    /// with `y = height(col, row)`. Returns `(vertices, indices)` with
+    /// outward (+Y) winding and a default +Y normal on every vertex.
+    fn grid_mesh(
+        cols: usize,
+        rows: usize,
+        spacing: f32,
+        height: impl Fn(usize, usize) -> f32,
+    ) -> (Vec<MeshVertex>, Vec<u32>) {
+        let mut verts = Vec::with_capacity(cols * rows);
+        for r in 0..rows {
+            for c in 0..cols {
+                verts.push(MeshVertex {
+                    local_pos: [c as f32 * spacing, height(c, r), r as f32 * spacing],
+                    normal_oct: pack_oct(Vec3::Y),
+                    leaf_attr_id: 0,
+                    bone_indices: 0,
+                    bone_weights: 0,
+                    _pad: 0,
+                });
+            }
+        }
+        let idx = |c: usize, r: usize| (r * cols + c) as u32;
+        let mut indices = Vec::new();
+        for r in 0..rows - 1 {
+            for c in 0..cols - 1 {
+                let v00 = idx(c, r);
+                let v10 = idx(c + 1, r);
+                let v01 = idx(c, r + 1);
+                let v11 = idx(c + 1, r + 1);
+                // CCW seen from +Y (outward / up).
+                indices.extend_from_slice(&[v00, v01, v11]);
+                indices.extend_from_slice(&[v00, v11, v10]);
+            }
+        }
+        (verts, indices)
+    }
+
+    /// Signed mesh volume via the divergence theorem: sum of signed
+    /// tetrahedra `(0, a, b, c)` over all triangles. Outward winding ⇒
+    /// positive volume for a closed surface.
+    fn signed_volume(verts: &[MeshVertex], indices: &[u32]) -> f32 {
+        let mut vol = 0.0f64;
+        for tri in indices.chunks_exact(3) {
+            let a = Vec3::from(verts[tri[0] as usize].local_pos);
+            let b = Vec3::from(verts[tri[1] as usize].local_pos);
+            let c = Vec3::from(verts[tri[2] as usize].local_pos);
+            vol += a.dot(b.cross(c)) as f64 / 6.0;
+        }
+        vol as f32
+    }
+
+    /// Build a UV-sphere mesh of `radius` with `lat × lon` segments.
+    /// Outward winding, exact analytic normals. Used as a smooth-surface
+    /// reference: a good volume-preserving relaxer should barely move it.
+    fn uv_sphere(radius: f32, lat: usize, lon: usize) -> (Vec<MeshVertex>, Vec<u32>) {
+        use std::f32::consts::PI;
+        let mut verts = Vec::new();
+        for i in 0..=lat {
+            let theta = PI * i as f32 / lat as f32; // 0..PI (pole to pole)
+            let (st, ct) = theta.sin_cos();
+            for j in 0..=lon {
+                let phi = 2.0 * PI * j as f32 / lon as f32;
+                let (sp, cp) = phi.sin_cos();
+                let dir = Vec3::new(st * cp, ct, st * sp);
+                verts.push(MeshVertex {
+                    local_pos: (dir * radius).to_array(),
+                    normal_oct: pack_oct(dir),
+                    leaf_attr_id: 0,
+                    bone_indices: 0,
+                    bone_weights: 0,
+                    _pad: 0,
+                });
+            }
+        }
+        let stride = lon + 1;
+        let vid = |i: usize, j: usize| (i * stride + j) as u32;
+        let mut indices = Vec::new();
+        for i in 0..lat {
+            for j in 0..lon {
+                let v00 = vid(i, j);
+                let v01 = vid(i, j + 1);
+                let v10 = vid(i + 1, j);
+                let v11 = vid(i + 1, j + 1);
+                // Outward winding (verified by signed_volume > 0).
+                indices.extend_from_slice(&[v00, v11, v10]);
+                indices.extend_from_slice(&[v00, v01, v11]);
+            }
+        }
+        (verts, indices)
+    }
+
+    /// The Gibson box constraint: after relaxation no vertex may move
+    /// more than `h/2` from its origin on ANY axis. This is the floor the
+    /// A1 falsification tests pin — smoothing is allowed to recover the
+    /// `±h/2` positional ambiguity of the occupancy field and no more.
+    #[test]
+    fn box_clamp_bounds_displacement() {
+        let h = 1.0f32;
+        // A noisy slope so the relaxer has real work to do (and so the
+        // unconstrained Laplacian step would move some vertices far).
+        let (mut verts, indices) = grid_mesh(12, 12, h, |c, r| {
+            // Big staircase amplitude so an unclamped step overshoots h/2.
+            let smooth = 0.7 * c as f32 + 0.3 * r as f32;
+            (smooth / h).round() * h
+        });
+        let orig: Vec<Vec3> = verts.iter().map(|v| Vec3::from(v.local_pos)).collect();
+
+        relax_surface_net_vertices(&mut verts, &indices, h, 10, None);
+
+        let half = h * 0.5;
+        let eps = 1e-4;
+        for (i, v) in verts.iter().enumerate() {
+            let p = Vec3::from(v.local_pos);
+            let d = (p - orig[i]).abs();
+            assert!(
+                d.x <= half + eps && d.y <= half + eps && d.z <= half + eps,
+                "vertex {i} moved {d:?} > h/2={half} from origin",
+            );
+        }
+    }
+
+    /// On a tilted plane sampled as a staircase (each height snapped to
+    /// the grid), naive vertices sit on terraces; the relaxer should pull
+    /// them onto the underlying smooth plane so the staircase RMS drops
+    /// below ~0.1h.
+    #[test]
+    fn relax_removes_staircase_on_synthetic_slope() {
+        let h = 1.0f32;
+        let slope_x = 0.35f32; // gentle, non-grid-aligned slope
+        let slope_z = 0.15f32;
+        // Smooth height field and its staircased (grid-snapped) version.
+        let smooth_h = |c: usize, r: usize| slope_x * c as f32 + slope_z * r as f32;
+        let (mut verts, indices) =
+            grid_mesh(16, 16, h, |c, r| (smooth_h(c, r) / h).round() * h);
+
+        // Pre-relax staircase RMS (deviation of each vertex y from the
+        // smooth plane). Interior vertices only — the open grid's border
+        // verts have no neighbors on one side and stay terraced.
+        let rms = |verts: &[MeshVertex]| -> f32 {
+            let cols = 16usize;
+            let mut sse = 0.0f64;
+            let mut count = 0u32;
+            for r in 1..15 {
+                for c in 1..15 {
+                    let v = &verts[r * cols + c];
+                    let dy = v.local_pos[1] - smooth_h(c, r);
+                    sse += (dy * dy) as f64;
+                    count += 1;
+                }
+            }
+            (sse / count as f64).sqrt() as f32
+        };
+
+        let before = rms(&verts);
+        assert!(before > 0.2 * h, "staircase should start coarse: {before}");
+
+        relax_surface_net_vertices(&mut verts, &indices, h, 15, None);
+
+        let after = rms(&verts);
+        assert!(
+            after < 0.1 * h,
+            "staircase RMS {after} (h={h}) should drop below 0.1h (was {before})",
+        );
+    }
+
+    /// Taubin relaxation preserves volume: a synthetic sphere should keep
+    /// its volume within a few percent (unbounded pure-Laplacian shrink
+    /// would collapse it). `voxel_size` is set generous relative to the
+    /// edge length so the box clamp doesn't dominate on this smooth mesh.
+    #[test]
+    fn relax_preserves_volume_within_few_percent() {
+        let radius = 8.0f32;
+        let (mut verts, indices) = uv_sphere(radius, 24, 32);
+        let v_before = signed_volume(&verts, &indices);
+        assert!(v_before > 0.0, "outward winding ⇒ positive volume");
+
+        // Edge length near the equator ≈ 2πr/lon ≈ 1.57; pick h ≈ 2× that
+        // so the ±h/2 box is wide enough not to clip a near-stationary
+        // smooth surface — the test then exercises Taubin's volume
+        // preservation, not the clamp.
+        let h = 3.0f32;
+        relax_surface_net_vertices(&mut verts, &indices, h, 8, None);
+
+        let v_after = signed_volume(&verts, &indices);
+        let ratio = (v_after / v_before - 1.0).abs();
+        assert!(
+            ratio < 0.05,
+            "volume changed {:.2}% ({v_before} → {v_after})",
+            ratio * 100.0,
+        );
+    }
+
+    /// A3: recomputed normals on a relaxed sphere vary continuously — no
+    /// 26-direction lattice banding. Across every mesh edge the angle
+    /// between the two endpoint normals stays small, and each normal
+    /// points outward (positive dot with the radial direction).
+    #[test]
+    fn relaxed_normals_vary_continuously_on_sphere() {
+        let radius = 8.0f32;
+        let (mut verts, indices) = uv_sphere(radius, 24, 32);
+        let h = 3.0f32;
+        relax_surface_net_vertices(&mut verts, &indices, h, 8, None);
+
+        // Outward check: recomputed normal vs radial direction.
+        for v in &verts {
+            let p = Vec3::from(v.local_pos);
+            if p.length_squared() < 1e-6 {
+                continue;
+            }
+            let radial = p.normalize();
+            let nrm = unpack_oct(v.normal_oct);
+            assert!(
+                nrm.dot(radial) > 0.7,
+                "normal {nrm:?} not outward vs radial {radial:?}",
+            );
+        }
+
+        // Continuity: across each triangle edge the normals differ by a
+        // small angle. A lattice-quantized normal would snap to one of 26
+        // directions and produce large jumps (≈ several tens of degrees)
+        // between adjacent verts; a smoothly-recomputed field stays tight.
+        let mut max_angle = 0.0f32;
+        for tri in indices.chunks_exact(3) {
+            for &(ia, ib) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                let na = unpack_oct(verts[ia as usize].normal_oct).normalize();
+                let nb = unpack_oct(verts[ib as usize].normal_oct).normalize();
+                let ang = na.dot(nb).clamp(-1.0, 1.0).acos();
+                max_angle = max_angle.max(ang);
+            }
+        }
+        // Adjacent verts on a 24×32 sphere are ≈ 7.5°–11° apart in normal;
+        // allow generous headroom but well below the ≈30°+ that lattice
+        // banding would inject.
+        assert!(
+            max_angle < 0.35, // ≈ 20°
+            "max adjacent-normal angle {:.1}° suggests lattice banding",
+            max_angle.to_degrees(),
+        );
     }
 }
