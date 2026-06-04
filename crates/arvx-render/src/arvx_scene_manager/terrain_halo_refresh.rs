@@ -604,6 +604,7 @@ impl ArvxSceneManager {
                 self.leaf_attr_pool.bones_as_slice(),
                 &entry.halo_cells,
                 Some(&entry.sculpt_owned_slots),
+                None::<&fn(glam::Vec3) -> f32>,
             );
             (verts, indices, cells_count)
         };

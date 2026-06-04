@@ -950,48 +950,25 @@ fn compute_inflate_edits(
 
 /// Flat-top cross-section profile for clay strips. Returns the target
 /// thickness in cells at perpendicular distance `d` from the capsule axis.
-/// Flat at full `strength` across the inner 75% of the radius, then
-/// tapers to zero over the 25% shoulder via the falloff curve.
+/// Full `strength` across the entire radius — no shoulder taper for now,
+/// because per-stamp shoulder falloff creates visible circular artifacts
+/// along drag strokes. Shoulder taper will be reintroduced once the
+/// kernel evaluates against the full stroke polyline instead of
+/// individual stamp capsules.
 #[inline]
-pub fn clay_strip_profile(d: f32, radius: f32, strength: f32, falloff: FalloffCurve) -> f32 {
-    let shoulder = 0.25 * radius;
-    let flat = radius - shoulder;
-    if d <= flat {
+pub fn clay_strip_profile(d: f32, radius: f32, strength: f32, _falloff: FalloffCurve) -> f32 {
+    if d <= radius {
         strength
-    } else if d <= radius {
-        let t = (radius - d) / shoulder;
-        strength * falloff.evaluate(t)
     } else {
         0.0
     }
 }
 
-/// Analytical normal for a clay strip cell. Flat-top cells get (0,1,0);
-/// shoulder cells get an outward-tilted normal derived from the profile
-/// gradient. `horiz_dist` is the horizontal distance from the axis,
-/// `diff` is the full vector from the nearest axis point to the cell.
+/// Analytical normal for a clay strip cell. All cells get (0,1,0)
+/// since the profile is flat across the entire radius (no shoulder).
 #[inline]
-fn clay_strip_normal(horiz_dist: f32, diff: Vec3, op: &BrushOp) -> Vec3 {
-    let shoulder = 0.25 * op.radius;
-    let flat = op.radius - shoulder;
-
-    if horiz_dist <= flat {
-        return Vec3::Y;
-    }
-    // Shoulder: compute the profile slope via finite difference.
-    let eps = 0.5;
-    let h0 = clay_strip_profile(horiz_dist - eps, op.radius, op.strength, op.falloff_curve);
-    let h1 = clay_strip_profile(horiz_dist + eps, op.radius, op.strength, op.falloff_curve);
-    let slope = (h0 - h1) / (2.0 * eps);
-
-    // Normal = (-slope * outward_horizontal, 1, 0), normalized.
-    let horiz_vec = Vec3::new(diff.x, 0.0, diff.z);
-    let horiz_len = horiz_vec.length();
-    if horiz_len < 1e-6 {
-        return Vec3::Y;
-    }
-    let outward = horiz_vec / horiz_len;
-    Vec3::new(-slope * outward.x, 1.0, -slope * outward.z).normalize()
+fn clay_strip_normal(_horiz_dist: f32, _diff: Vec3, _op: &BrushOp) -> Vec3 {
+    Vec3::Y
 }
 
 /// Clay strip deposit. Same brushfire infrastructure as

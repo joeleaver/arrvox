@@ -30,7 +30,9 @@ use arvx_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aab
 use arvx_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use arvx_core::mesh_extract::{
     collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
-    extract_surface_mesh, project_clay_strip, project_onto_brush_capsule,
+    extract_surface_mesh, nearest_on_polyline, project_clay_strip,
+    project_clay_strip_stroke, project_onto_brush_capsule,
+    project_onto_stroke_capsules,
 };
 use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sculpt::{
@@ -245,10 +247,8 @@ impl ArvxSceneManager {
         if stroke_seq != self.sculpt_stroke_seq {
             self.sculpt_stroke_seq = stroke_seq;
             self.sculpt_stroke_touched.clear();
-            // First stamp of a new stroke has no previous center — the
-            // kernel evaluates a degenerate capsule (sphere) by
-            // setting `segment_start == center` below.
             self.sculpt_stroke_prev_center_world = None;
+            self.sculpt_stroke_extracts.clear();
         }
         if brush_radius <= 0.0 {
             return None;
@@ -607,10 +607,12 @@ impl ArvxSceneManager {
         // full re-extract picks them up; cluster set then grows by
         // whatever meshopt produces. R5 will handle this case more
         // gracefully via re-clustering at idle.
-        let used_per_cluster = self.rebuild_dirty_clusters(handle, &op);
+        let used_per_cluster = if matches!(op.mode, BrushMode::ClayStrip) {
+            self.rebuild_stroke_clusters(handle, &op)
+        } else {
+            self.rebuild_dirty_clusters(handle, &op)
+        };
         if !used_per_cluster {
-            // Per-cluster path didn't fire (empty dirty set or asset
-            // was empty before); fall back to full re-extract.
             self.rebuild_asset_mesh(handle);
         }
         _p_rebuild_clusters_ms = _ph_t6.elapsed().as_secs_f64() * 1000.0;
@@ -1241,6 +1243,7 @@ impl ArvxSceneManager {
                 self.leaf_attr_pool.bones_as_slice(),
                 &entry.halo_cells,
                 Some(&entry.sculpt_owned_slots),
+                None::<&fn(Vec3) -> f32>,
             )
         };
         let _p_extract_mesh_ms = _ph_t3b.elapsed().as_secs_f64() * 1000.0;
@@ -1642,6 +1645,305 @@ impl ArvxSceneManager {
             entry.meshlet_clusters.len(),
             t0.elapsed().as_secs_f64() * 1000.0,
         );
+    }
+
+    /// Stroke-wide re-extract: replaces per-stamp patch clusters with
+    /// one unified mesh covering the full stroke region. Gives shared
+    /// vertices across stamp boundaries for seamless surfaces.
+    fn rebuild_stroke_clusters(&mut self, handle: AssetHandle, op: &BrushOp) -> bool {
+        let t0 = std::time::Instant::now();
+
+        let (depth, base_vs, grid_origin) = {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            if entry.meshlet_clusters.is_empty() {
+                return false;
+            }
+            let depth = entry.spatial_handle.depth;
+            let base_vs = entry.spatial_handle.base_voxel_size;
+            let extent_f = (1u32 << depth) as f32 * base_vs;
+            let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+            let grid_origin = aabb_center - Vec3::splat(extent_f * 0.5);
+            (depth, base_vs, grid_origin)
+        };
+
+        let extent = 1u32 << depth;
+        let (stamp_lo, stamp_hi) = brush_cell_range(op, extent);
+        let stamp_lo = IVec3::new(stamp_lo.x as i32, stamp_lo.y as i32, stamp_lo.z as i32);
+        let stamp_hi = IVec3::new(stamp_hi.x as i32, stamp_hi.y as i32, stamp_hi.z as i32);
+        let stamp_center_local = grid_origin + op.center * base_vs;
+        let brush_radius_local = op.radius * base_vs;
+
+        // ── Step 1: update stroke state ──
+        use super::manager::StrokeExtractState;
+        let stroke = self.sculpt_stroke_extracts
+            .entry(handle)
+            .or_insert_with(|| StrokeExtractState {
+                union_lo: stamp_lo,
+                union_hi: stamp_hi,
+                stroke_patch_cluster_ids: Vec::new(),
+                stroke_path_local: Vec::new(),
+                radius_local: brush_radius_local,
+                strength: op.strength,
+                falloff: op.falloff_curve,
+                base_vs,
+            });
+        stroke.union_lo = stroke.union_lo.min(stamp_lo);
+        stroke.union_hi = stroke.union_hi.max(stamp_hi);
+        stroke.stroke_path_local.push(stamp_center_local);
+
+        let union_lo = stroke.union_lo;
+        let union_hi = stroke.union_hi;
+        let stroke_path = stroke.stroke_path_local.clone();
+        let radius_local = stroke.radius_local;
+        let strength_local = stroke.strength * base_vs;
+        let falloff = stroke.falloff;
+        let prev_patch_ids = stroke.stroke_patch_cluster_ids.clone();
+
+        // ── Step 2: remove previous stroke patches ──
+        {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            for &cid in &prev_patch_ids {
+                if (cid as usize) < entry.meshlet_clusters.len() {
+                    let c = &entry.meshlet_clusters[cid as usize];
+                    if c.index_count > 0 {
+                        entry.free_index_range(c.index_offset, c.index_count);
+                    }
+                    entry.meshlet_clusters[cid as usize].index_count = 0;
+                }
+            }
+            entry.compact_empty_patches();
+        }
+
+        // ── Step 3: filter bake-time clusters inside the union AABB ──
+        // The stroke patch re-extracts the entire union AABB, so any
+        // bake-time tris inside it are redundant. Filter by AABB (not
+        // stroke tube) to avoid circular per-stamp artifacts.
+        let filter_min = grid_origin + union_lo.as_vec3() * base_vs;
+        let filter_max = grid_origin + union_hi.as_vec3() * base_vs;
+        let dirty = self.clusters_in_brush_grid_aabb(handle, union_lo, union_hi);
+        if !dirty.is_empty() {
+            use rayon::prelude::*;
+            let results: Vec<(u32, Vec<u32>)> = {
+                let Some(entry) = self.asset_cache.get(handle) else { return false; };
+                let clusters = &entry.meshlet_clusters;
+                let indices = &entry.mesh_indices;
+                let verts = &entry.mesh_vertices;
+                dirty
+                    .par_iter()
+                    .filter_map(|&cid| {
+                        let c = &clusters[cid as usize];
+                        let start = c.index_offset as usize;
+                        let count = c.index_count as usize;
+                        if count == 0 { return None; }
+                        let mut out = Vec::with_capacity(count);
+                        for tri_start in (start..start + count).step_by(3) {
+                            let i0 = indices[tri_start];
+                            let i1 = indices[tri_start + 1];
+                            let i2 = indices[tri_start + 2];
+                            let p0 = Vec3::from(verts[i0 as usize].local_pos);
+                            let p1 = Vec3::from(verts[i1 as usize].local_pos);
+                            let p2 = Vec3::from(verts[i2 as usize].local_pos);
+                            let in_aabb = |p: Vec3| -> bool {
+                                p.x >= filter_min.x && p.x <= filter_max.x
+                                    && p.y >= filter_min.y && p.y <= filter_max.y
+                                    && p.z >= filter_min.z && p.z <= filter_max.z
+                            };
+                            if !in_aabb(p0) || !in_aabb(p1) || !in_aabb(p2) {
+                                out.push(i0);
+                                out.push(i1);
+                                out.push(i2);
+                            }
+                        }
+                        Some((cid, out))
+                    })
+                    .collect()
+            };
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            for (cid, kept) in results {
+                let old_offset = entry.meshlet_clusters[cid as usize].index_offset;
+                let old_count = entry.meshlet_clusters[cid as usize].index_count;
+                let new_count = kept.len() as u32;
+                if new_count > 0 {
+                    entry.mesh_indices_write_at(old_offset, &kept);
+                }
+                if new_count < old_count {
+                    entry.free_index_range(old_offset + new_count, old_count - new_count);
+                }
+                entry.meshlet_clusters[cid as usize].index_count = new_count;
+            }
+        }
+
+        // ── Step 4: extract mesh over the union AABB ──
+        let cells_min = union_lo - IVec3::splat(3);
+        let cells_max = union_hi + IVec3::splat(3);
+        let cells = {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            collect_cell_map_in_region(
+                entry.cpu_octree.as_slice(),
+                depth,
+                self.brick_pool.as_slice(),
+                cells_min,
+                cells_max,
+            )
+        };
+        // SDF for the clay strip shape: the intersection of the stroke
+        // tube (cylindrical sides) with the slab (flat top). The tube
+        // SDF alone gives garbage for top-surface edges because both
+        // corners are deep inside the tube. The combined SDF traces
+        // both the flat top (height plane = 0) and the curved sides
+        // (tube distance = 0).
+        let stroke_sdf = |pos: Vec3| -> f32 {
+            let nearest = nearest_on_polyline(pos, &stroke_path);
+            let tube_d = (pos - nearest).length() - radius_local;
+            let top_d = pos.y - (nearest.y + strength_local);
+            tube_d.max(top_d)
+        };
+        let (mut stroke_verts, stroke_indices) = {
+            let Some(entry) = self.asset_cache.get(handle) else { return false; };
+            extract_mesh_region_from_cells_pooled_haloed(
+                &mut self.sculpt_extract_scratch,
+                &cells,
+                union_lo,
+                union_hi,
+                entry.cpu_octree.as_slice(),
+                depth,
+                base_vs,
+                grid_origin,
+                self.brick_pool.as_slice(),
+                self.leaf_attr_pool.as_slice(),
+                self.leaf_attr_pool.bones_as_slice(),
+                &entry.halo_cells,
+                Some(&entry.sculpt_owned_slots),
+                Some(&stroke_sdf),
+            )
+        };
+
+        // ── Step 5: project against the full stroke path ──
+        match op.mode {
+            BrushMode::Raise | BrushMode::Carve => {
+                project_onto_stroke_capsules(
+                    &mut stroke_verts,
+                    &stroke_path,
+                    radius_local,
+                    base_vs * 1.5,
+                );
+            }
+            BrushMode::ClayStrip => {
+                project_clay_strip_stroke(
+                    &mut stroke_verts,
+                    &stroke_path,
+                    radius_local,
+                    strength_local,
+                    falloff,
+                    base_vs,
+                );
+            }
+            _ => {}
+        }
+
+        // ── Step 6: append as unified patch cluster ──
+        if !stroke_verts.is_empty() {
+            let mut patch_aabb_min = [f32::INFINITY; 3];
+            let mut patch_aabb_max = [f32::NEG_INFINITY; 3];
+            for v in &stroke_verts {
+                for k in 0..3 {
+                    if v.local_pos[k] < patch_aabb_min[k] {
+                        patch_aabb_min[k] = v.local_pos[k];
+                    }
+                    if v.local_pos[k] > patch_aabb_max[k] {
+                        patch_aabb_max[k] = v.local_pos[k];
+                    }
+                }
+            }
+
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            let vertex_offset = entry.mesh_vertices.len() as u32;
+            let append_start_bytes = (vertex_offset as usize
+                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
+                as u32;
+            entry.mesh_vertices.extend_from_slice(&stroke_verts);
+            let append_len_bytes = (stroke_verts.len()
+                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
+                as u32;
+            if append_len_bytes > 0 {
+                entry
+                    .mesh_vertices_dirty
+                    .mark(append_start_bytes, append_len_bytes);
+            }
+
+            let patch_index_count = stroke_indices.len() as u32;
+            let new_index_offset = if patch_index_count > 0 {
+                let offset = entry.alloc_index_range(patch_index_count);
+                let rebased: Vec<u32> = stroke_indices
+                    .iter()
+                    .map(|&i| i + vertex_offset)
+                    .collect();
+                entry.mesh_indices_write_at(offset, &rebased);
+                offset
+            } else {
+                0
+            };
+
+            let patch_cluster = MeshletCluster {
+                aabb_min: patch_aabb_min,
+                _pad0: 0.0,
+                aabb_max: patch_aabb_max,
+                index_offset: new_index_offset,
+                index_count: patch_index_count,
+                lod_level: 0,
+                flags: arvx_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY,
+                cluster_error: 0.0,
+                parent_group_error: PARENT_GROUP_ERROR_ROOT,
+                group_above_idx: arvx_core::mesh_cluster::DAG_GROUP_NONE,
+                group_below_idx: arvx_core::mesh_cluster::DAG_GROUP_NONE,
+                _pad3: 0,
+            };
+            let patch_cluster_id = entry.meshlet_clusters.len() as u32;
+            entry.meshlet_clusters.push(patch_cluster);
+            entry.cluster_spatial_index.insert(
+                patch_cluster_id,
+                &patch_cluster,
+                grid_origin,
+                base_vs,
+            );
+
+            // Record the new cluster for replacement on next stamp.
+            if let Some(stroke) = self.sculpt_stroke_extracts.get_mut(&handle) {
+                stroke.stroke_patch_cluster_ids.clear();
+                stroke.stroke_patch_cluster_ids.push(patch_cluster_id);
+            }
+        }
+
+        // ── Step 7: LOD dirty + cleanup ──
+        let union_aabb_min_local = grid_origin + union_lo.as_vec3() * base_vs - Vec3::splat(base_vs);
+        let union_aabb_max_local = grid_origin + union_hi.as_vec3() * base_vs + Vec3::splat(base_vs);
+        {
+            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
+            mark_lod_dirty_chains(entry, &dirty, union_aabb_min_local, union_aabb_max_local);
+            entry.compact_empty_patches();
+            entry.mesh_lod0_index_count = entry
+                .meshlet_clusters
+                .iter()
+                .filter(|c| c.lod_level == 0)
+                .map(|c| c.index_count)
+                .sum();
+            entry.mesh_dirty = true;
+            entry.clusters_dirty = true;
+        }
+
+        eprintln!(
+            "[sculpt] stroke-extract: handle={:?} union=[{},{},{}→{},{},{}] path_len={} \
+             verts={} tris={} ({:.2}ms)",
+            handle,
+            union_lo.x, union_lo.y, union_lo.z,
+            union_hi.x, union_hi.y, union_hi.z,
+            stroke_path.len(),
+            stroke_verts.len(),
+            stroke_indices.len() / 3,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        true
     }
 }
 

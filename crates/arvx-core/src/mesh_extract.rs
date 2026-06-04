@@ -631,6 +631,7 @@ pub fn extract_surface_mesh_haloed(
                             leaf_attr_pool,
                             bone_voxel_pool,
                             sculpt_slots,
+                            None::<&fn(Vec3) -> f32>,
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
@@ -780,6 +781,7 @@ pub fn extract_mesh_region_from_cells_pooled(
         bone_voxel_pool,
         &[],
         sculpt_slots,
+        None::<&fn(Vec3) -> f32>,
     )
 }
 
@@ -803,7 +805,7 @@ pub fn extract_mesh_region_from_cells_pooled(
 /// When `halo_cells` is empty this function is bit-identical to
 /// [`extract_mesh_region_from_cells_pooled`].
 #[allow(clippy::too_many_arguments)]
-pub fn extract_mesh_region_from_cells_pooled_haloed(
+pub fn extract_mesh_region_from_cells_pooled_haloed<S>(
     scratch: &mut SculptExtractScratch,
     cells: &CellMap,
     region_min: IVec3,
@@ -817,7 +819,11 @@ pub fn extract_mesh_region_from_cells_pooled_haloed(
     bone_voxel_pool: &[BoneVoxel],
     halo_cells: &[(IVec3, u32)],
     sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
-) -> (Vec<MeshVertex>, Vec<u32>) {
+    sdf_fn: Option<&S>,
+) -> (Vec<MeshVertex>, Vec<u32>)
+where
+    S: Fn(Vec3) -> f32,
+{
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     if cells.is_empty() {
@@ -978,6 +984,7 @@ pub fn extract_mesh_region_from_cells_pooled_haloed(
                             leaf_attr_pool,
                             bone_voxel_pool,
                             sculpt_slots,
+                            sdf_fn,
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
@@ -1122,7 +1129,7 @@ fn solve_qef(planes: &[(Vec3, Vec3)], bias: Vec3) -> Vec3 {
 ///
 /// Falls back to the SN cube's grid corner (`cube + (1, 1, 1)`) when
 /// no edge crossings are detected — defensive only.
-fn build_cube_vertex<F>(
+fn build_cube_vertex<F, S>(
     cube: IVec3,
     cell_lookup: F,
     voxel_size: f32,
@@ -1130,9 +1137,11 @@ fn build_cube_vertex<F>(
     leaf_attr_pool: &[LeafAttr],
     bone_voxel_pool: &[BoneVoxel],
     sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
+    sdf_fn: Option<&S>,
 ) -> MeshVertex
 where
     F: Fn(IVec3) -> Option<u32>,
+    S: Fn(Vec3) -> f32,
 {
     // Pre-classify the 8 corner cells once; the edge loop reuses these.
     // Bit layout: index = bit0(+X) | bit1(+Y) | bit2(+Z).
@@ -1179,21 +1188,44 @@ where
         }
     }
 
-    // Walk the 12 edges; accumulate crossing midpoints for naive
-    // fallback. Midpoint of cells A and B (cube + oa, cube + ob) is at
-    // `cube + (oa + ob) * 0.5 + 0.5` in cell-coord units.
+    // Walk the 12 edges; accumulate crossing points. With an SDF
+    // evaluator, interpolate to the zero-crossing. Without, fall back
+    // to midpoints (naive surface nets).
     let mut crossing_sum = Vec3::ZERO;
     let mut crossing_count: u32 = 0;
     for &(a, b) in &CUBE_EDGES {
         if corner_solid[a as usize] != corner_solid[b as usize] {
             let oa = corner_offset(a);
             let ob = corner_offset(b);
-            let mid = Vec3::new(
-                cube.x as f32 + (oa.x + ob.x) as f32 * 0.5 + 0.5,
-                cube.y as f32 + (oa.y + ob.y) as f32 * 0.5 + 0.5,
-                cube.z as f32 + (oa.z + ob.z) as f32 * 0.5 + 0.5,
-            );
-            crossing_sum += mid;
+            let crossing = if let Some(sdf) = sdf_fn {
+                // Cell centers in grid coords.
+                let pa = Vec3::new(
+                    (cube.x + oa.x) as f32 + 0.5,
+                    (cube.y + oa.y) as f32 + 0.5,
+                    (cube.z + oa.z) as f32 + 0.5,
+                );
+                let pb = Vec3::new(
+                    (cube.x + ob.x) as f32 + 0.5,
+                    (cube.y + ob.y) as f32 + 0.5,
+                    (cube.z + ob.z) as f32 + 0.5,
+                );
+                let da = sdf(grid_origin + pa * voxel_size);
+                let db = sdf(grid_origin + pb * voxel_size);
+                let denom = da - db;
+                let t = if denom.abs() > 1e-12 {
+                    (da / denom).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                pa + (pb - pa) * t
+            } else {
+                Vec3::new(
+                    cube.x as f32 + (oa.x + ob.x) as f32 * 0.5 + 0.5,
+                    cube.y as f32 + (oa.y + ob.y) as f32 * 0.5 + 0.5,
+                    cube.z as f32 + (oa.z + ob.z) as f32 * 0.5 + 0.5,
+                )
+            };
+            crossing_sum += crossing;
             crossing_count += 1;
         }
     }
@@ -1495,6 +1527,136 @@ pub fn project_clay_strip(
         }
         v.local_pos[1] = ideal_y;
     }
+}
+
+/// Find the closest point on a polyline (sequence of connected line
+/// segments) to point `p`. For a single-point polyline, returns that
+/// point. Used by stroke-wide projection functions.
+pub fn nearest_on_polyline(p: Vec3, path: &[Vec3]) -> Vec3 {
+    debug_assert!(!path.is_empty());
+    if path.len() == 1 {
+        return path[0];
+    }
+    let mut best = path[0];
+    let mut best_dist_sq = f32::INFINITY;
+    for seg in path.windows(2) {
+        let ab = seg[1] - seg[0];
+        let len_sq = ab.length_squared();
+        let nearest = if len_sq < 1e-12 {
+            seg[0]
+        } else {
+            let t = ((p - seg[0]).dot(ab) / len_sq).clamp(0.0, 1.0);
+            seg[0] + ab * t
+        };
+        let d = (p - nearest).length_squared();
+        if d < best_dist_sq {
+            best_dist_sq = d;
+            best = nearest;
+        }
+    }
+    best
+}
+
+/// Stroke-wide capsule projection. Generalizes `project_onto_brush_capsule`
+/// from a single segment to a polyline stroke path. Each vertex is projected
+/// onto the nearest capsule segment in the path.
+pub fn project_onto_stroke_capsules(
+    vertices: &mut [MeshVertex],
+    path: &[Vec3],
+    radius: f32,
+    snap_threshold: f32,
+) {
+    if vertices.is_empty() || path.is_empty() {
+        return;
+    }
+    for v in vertices.iter_mut() {
+        let p = Vec3::from(v.local_pos);
+        let nearest = nearest_on_polyline(p, path);
+        let to_p = p - nearest;
+        let dist = to_p.length();
+        if dist < 1e-12 {
+            continue;
+        }
+        let sdf = dist - radius;
+        if sdf.abs() > snap_threshold {
+            continue;
+        }
+        let projected = nearest + to_p * (radius / dist);
+        v.local_pos = projected.to_array();
+    }
+}
+
+/// Stroke-wide clay strip projection. Generalizes `project_clay_strip`
+/// from a single segment to a polyline stroke path.
+pub fn project_clay_strip_stroke(
+    vertices: &mut [MeshVertex],
+    path: &[Vec3],
+    radius: f32,
+    strength: f32,
+    falloff: FalloffCurve,
+    voxel_size: f32,
+) {
+    if vertices.is_empty() || path.is_empty() || radius < 1e-12 || strength < 1e-6 {
+        return;
+    }
+    let snap = voxel_size * 1.5;
+    let shoulder_width = 0.25 * radius;
+    let flat_radius = radius - shoulder_width;
+
+    // ── Calibrate: find strip-top Y ──
+    let mut flat_ys: Vec<f32> = Vec::new();
+    for v in vertices.iter() {
+        let p = Vec3::from(v.local_pos);
+        let ax = nearest_on_polyline(p, path);
+        let diff = p - ax;
+        let horiz = Vec3::new(diff.x, 0.0, diff.z).length();
+        if horiz <= flat_radius {
+            flat_ys.push(p.y);
+        }
+    }
+    if flat_ys.len() < 3 {
+        return;
+    }
+    flat_ys.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    let max_y = flat_ys[flat_ys.len() - 1];
+    let cluster_lo = max_y - voxel_size * 2.0;
+    let top_cluster: Vec<f32> = flat_ys.iter().copied()
+        .filter(|&y| y >= cluster_lo)
+        .collect();
+    if top_cluster.is_empty() {
+        return;
+    }
+    let strip_top_y = top_cluster[top_cluster.len() / 2];
+    let base_y = strip_top_y - strength;
+
+    // ── Project ──
+    for v in vertices.iter_mut() {
+        let p = Vec3::from(v.local_pos);
+        let ax = nearest_on_polyline(p, path);
+        let diff = p - ax;
+        let horiz = Vec3::new(diff.x, 0.0, diff.z).length();
+        if horiz > radius + snap {
+            continue;
+        }
+        use crate::sculpt::clay_strip_profile;
+        let profile_frac = clay_strip_profile(horiz, radius, strength, falloff) / strength;
+        if profile_frac < 1e-6 {
+            continue;
+        }
+        let ideal_y = base_y + strength * profile_frac;
+        let err = (p.y - ideal_y).abs();
+        if err > snap {
+            continue;
+        }
+        v.local_pos[1] = ideal_y;
+    }
+}
+
+/// Test whether a point lies inside the stroke tube (the Minkowski sum
+/// of the stroke polyline with a sphere of the given radius squared).
+pub fn point_in_stroke_tube(p: Vec3, path: &[Vec3], radius_sq: f32) -> bool {
+    let nearest = nearest_on_polyline(p, path);
+    (p - nearest).length_squared() <= radius_sq
 }
 
 /// Cube corner offset for index `i` — bit 0 = +X, bit 1 = +Y, bit 2 = +Z.
@@ -2741,6 +2903,7 @@ mod tests {
             &pool,
             &[],
             None,
+            None::<&fn(Vec3) -> f32>,
         );
 
         // With naive SN, the vertex would sit at the centroid of

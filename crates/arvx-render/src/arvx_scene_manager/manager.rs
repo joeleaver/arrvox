@@ -16,7 +16,7 @@ use arvx_core::{BrickPool, LeafAttrPool, OctreeHandle, SparseOctree};
 use crate::octree_gpu::OctreeGpu;
 use crate::arvx_scene::GeometryUpload;
 
-use super::types::{emit_faces, AssetCache, FaceInstance};
+use super::types::{emit_faces, AssetCache, AssetHandle, FaceInstance};
 
 /// Process-start anchor used by [`process_elapsed_ns`]. Lazy-initialised
 /// on first read; nanos-since-this-anchor fit in u64 for ~584 years.
@@ -198,6 +198,37 @@ pub struct ArvxSceneManager {
     /// into the second tile's capsule, producing a stamp segment
     /// that spanned the entire neighbour tile.
     pub(super) sculpt_stroke_prev_center_world: Option<glam::Vec3>,
+
+    /// Per-asset stroke-wide extract state. On each stamp, the stroke
+    /// region (union AABB of all stamps) is re-extracted as one unified
+    /// mesh, replacing the previous stamp's patches. This gives shared
+    /// vertices across stamp boundaries → no seams.
+    pub(super) sculpt_stroke_extracts: rustc_hash::FxHashMap<AssetHandle, StrokeExtractState>,
+}
+
+/// Accumulated state for stroke-wide mesh re-extraction. One per
+/// `AssetHandle` touched by the current stroke (typically one for
+/// assets, multiple for terrain tiles).
+pub(super) struct StrokeExtractState {
+    /// Union AABB of all stamps in the stroke (finest-grid coords).
+    pub union_lo: glam::IVec3,
+    pub union_hi: glam::IVec3,
+    /// Cluster IDs of the stroke's unified patch (replaced on each
+    /// stamp). Usually just one cluster, but could be multiple if the
+    /// mesh exceeds a single cluster's capacity.
+    pub stroke_patch_cluster_ids: Vec<u32>,
+    /// Polyline of stamp centers in object-local coords. The stroke
+    /// path for projection: each window of 2 consecutive points is
+    /// one capsule segment.
+    pub stroke_path_local: Vec<glam::Vec3>,
+    /// Brush radius in object-local units (constant within a stroke).
+    pub radius_local: f32,
+    /// Brush strength in grid cells (for clay strip projection).
+    pub strength: f32,
+    /// Falloff curve (for clay strip projection).
+    pub falloff: arvx_core::sculpt::FalloffCurve,
+    /// Base voxel size (cached from asset).
+    pub base_vs: f32,
 }
 
 impl ArvxSceneManager {
@@ -219,6 +250,7 @@ impl ArvxSceneManager {
             sculpt_stroke_seq: 0,
             sculpt_stroke_touched: rustc_hash::FxHashSet::default(),
             sculpt_stroke_prev_center_world: None,
+            sculpt_stroke_extracts: rustc_hash::FxHashMap::default(),
         }
     }
 
