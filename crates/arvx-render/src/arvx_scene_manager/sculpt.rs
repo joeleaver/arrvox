@@ -30,9 +30,7 @@ use arvx_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aab
 use arvx_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use arvx_core::mesh_extract::{
     collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
-    extract_surface_mesh, nearest_on_polyline, project_clay_strip,
-    project_clay_strip_stroke, project_onto_brush_capsule,
-    project_onto_stroke_capsules,
+    extract_surface_mesh, relax_surface_net_vertices,
 };
 use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sculpt::{
@@ -963,7 +961,7 @@ impl ArvxSceneManager {
         let _ph_t0 = t0;
 
         let (depth, base_vs, grid_origin, brush_lo, brush_hi,
-             brush_center_local, brush_segment_start_local,
+             brush_center_local,
              brush_radius_local, brush_radius_sq) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             if entry.meshlet_clusters.is_empty() {
@@ -981,12 +979,11 @@ impl ArvxSceneManager {
             let brush_hi = IVec3::new(hi.x as i32, hi.y as i32, hi.z as i32);
 
             let brush_center_local = grid_origin + op.center * base_vs;
-            let brush_segment_start_local = grid_origin + op.segment_start * base_vs;
             let brush_radius_local = op.radius * base_vs;
             let brush_radius_sq = brush_radius_local * brush_radius_local;
 
             (depth, base_vs, grid_origin, brush_lo, brush_hi,
-             brush_center_local, brush_segment_start_local,
+             brush_center_local,
              brush_radius_local, brush_radius_sq)
         };
 
@@ -1243,34 +1240,23 @@ impl ArvxSceneManager {
                 self.leaf_attr_pool.bones_as_slice(),
                 &entry.halo_cells,
                 Some(&entry.sculpt_owned_slots),
+                // TODO(stage-b): sdf_fn param now always None on the
+                // sculpt path (brush projection deleted in A4); remove
+                // the generic sdf_fn thread from the extract fns in
+                // cleanup.
                 None::<&fn(Vec3) -> f32>,
             )
         };
         let _p_extract_mesh_ms = _ph_t3b.elapsed().as_secs_f64() * 1000.0;
 
-        match op.mode {
-            BrushMode::Raise | BrushMode::Carve => {
-                project_onto_brush_capsule(
-                    &mut brush_verts,
-                    brush_segment_start_local,
-                    brush_center_local,
-                    brush_radius_local,
-                    base_vs * 1.5,
-                );
-            }
-            BrushMode::ClayStrip => {
-                project_clay_strip(
-                    &mut brush_verts,
-                    brush_segment_start_local,
-                    brush_center_local,
-                    brush_radius_local,
-                    op.strength * base_vs,
-                    op.falloff_curve,
-                    base_vs,
-                );
-            }
-            _ => {}
-        }
+        // De-staircase the patch via the Gibson constrained elastic
+        // surface net (occupancy-only, box-clamped to ±h/2). This
+        // replaces the brush-aware projection layer: the mesher no
+        // longer needs to know the brush shape — it smooths from
+        // occupancy alone and recomputes normals from the relaxed
+        // faces. `pin_boundary = None`; the ±h/2 clamp keeps the
+        // patch seam tight against the kept geometry.
+        relax_surface_net_vertices(&mut brush_verts, &brush_indices, base_vs, 6, None);
 
         _p_extract_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
         let _ph_t4 = std::time::Instant::now();
@@ -1671,7 +1657,6 @@ impl ArvxSceneManager {
         let stamp_lo = IVec3::new(stamp_lo.x as i32, stamp_lo.y as i32, stamp_lo.z as i32);
         let stamp_hi = IVec3::new(stamp_hi.x as i32, stamp_hi.y as i32, stamp_hi.z as i32);
         let stamp_center_local = grid_origin + op.center * base_vs;
-        let brush_radius_local = op.radius * base_vs;
 
         // ── Step 1: update stroke state ──
         use super::manager::StrokeExtractState;
@@ -1682,10 +1667,6 @@ impl ArvxSceneManager {
                 union_hi: stamp_hi,
                 stroke_patch_cluster_ids: Vec::new(),
                 stroke_path_local: Vec::new(),
-                radius_local: brush_radius_local,
-                strength: op.strength,
-                falloff: op.falloff_curve,
-                base_vs,
             });
         stroke.union_lo = stroke.union_lo.min(stamp_lo);
         stroke.union_hi = stroke.union_hi.max(stamp_hi);
@@ -1694,9 +1675,6 @@ impl ArvxSceneManager {
         let union_lo = stroke.union_lo;
         let union_hi = stroke.union_hi;
         let stroke_path = stroke.stroke_path_local.clone();
-        let radius_local = stroke.radius_local;
-        let strength_local = stroke.strength * base_vs;
-        let falloff = stroke.falloff;
         let prev_patch_ids = stroke.stroke_patch_cluster_ids.clone();
 
         // ── Step 2: remove previous stroke patches ──
@@ -1786,18 +1764,6 @@ impl ArvxSceneManager {
                 cells_max,
             )
         };
-        // SDF for the clay strip shape: the intersection of the stroke
-        // tube (cylindrical sides) with the slab (flat top). The tube
-        // SDF alone gives garbage for top-surface edges because both
-        // corners are deep inside the tube. The combined SDF traces
-        // both the flat top (height plane = 0) and the curved sides
-        // (tube distance = 0).
-        let stroke_sdf = |pos: Vec3| -> f32 {
-            let nearest = nearest_on_polyline(pos, &stroke_path);
-            let tube_d = (pos - nearest).length() - radius_local;
-            let top_d = pos.y - (nearest.y + strength_local);
-            tube_d.max(top_d)
-        };
         let (mut stroke_verts, stroke_indices) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             extract_mesh_region_from_cells_pooled_haloed(
@@ -1814,32 +1780,21 @@ impl ArvxSceneManager {
                 self.leaf_attr_pool.bones_as_slice(),
                 &entry.halo_cells,
                 Some(&entry.sculpt_owned_slots),
-                Some(&stroke_sdf),
+                // TODO(stage-b): sdf_fn param now always None on the
+                // sculpt path (stroke projection deleted in A4); remove
+                // the generic sdf_fn thread from the extract fns in
+                // cleanup.
+                None::<&fn(Vec3) -> f32>,
             )
         };
 
-        // ── Step 5: project against the full stroke path ──
-        match op.mode {
-            BrushMode::Raise | BrushMode::Carve => {
-                project_onto_stroke_capsules(
-                    &mut stroke_verts,
-                    &stroke_path,
-                    radius_local,
-                    base_vs * 1.5,
-                );
-            }
-            BrushMode::ClayStrip => {
-                project_clay_strip_stroke(
-                    &mut stroke_verts,
-                    &stroke_path,
-                    radius_local,
-                    strength_local,
-                    falloff,
-                    base_vs,
-                );
-            }
-            _ => {}
-        }
+        // ── Step 5: de-staircase the unified stroke patch ──
+        // Gibson constrained elastic surface net (occupancy-only,
+        // box-clamped to ±h/2). Replaces the brush-aware stroke
+        // projection: the mesher smooths from occupancy alone and
+        // recomputes normals from the relaxed faces. `pin_boundary =
+        // None` for sculpt patches.
+        relax_surface_net_vertices(&mut stroke_verts, &stroke_indices, base_vs, 6, None);
 
         // ── Step 6: append as unified patch cluster ──
         if !stroke_verts.is_empty() {

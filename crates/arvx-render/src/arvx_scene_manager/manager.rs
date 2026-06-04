@@ -217,18 +217,11 @@ pub(super) struct StrokeExtractState {
     /// stamp). Usually just one cluster, but could be multiple if the
     /// mesh exceeds a single cluster's capacity.
     pub stroke_patch_cluster_ids: Vec<u32>,
-    /// Polyline of stamp centers in object-local coords. The stroke
-    /// path for projection: each window of 2 consecutive points is
-    /// one capsule segment.
+    /// Polyline of stamp centers in object-local coords. Retained for
+    /// the stroke-extract log line; the brush-aware projection that
+    /// previously consumed it was deleted in favour of occupancy-only
+    /// constrained relaxation (see `rebuild_stroke_clusters`).
     pub stroke_path_local: Vec<glam::Vec3>,
-    /// Brush radius in object-local units (constant within a stroke).
-    pub radius_local: f32,
-    /// Brush strength in grid cells (for clay strip projection).
-    pub strength: f32,
-    /// Falloff curve (for clay strip projection).
-    pub falloff: arvx_core::sculpt::FalloffCurve,
-    /// Base voxel size (cached from asset).
-    pub base_vs: f32,
 }
 
 impl ArvxSceneManager {
