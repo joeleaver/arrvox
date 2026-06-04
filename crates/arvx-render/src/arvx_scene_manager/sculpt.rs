@@ -30,7 +30,7 @@ use arvx_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aab
 use arvx_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use arvx_core::mesh_extract::{
     collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
-    extract_surface_mesh, relax_surface_net_vertices,
+    extract_surface_mesh, relax_surface_net_vertices, MeshVertex,
 };
 use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sculpt::{
@@ -947,6 +947,38 @@ impl ArvxSceneManager {
     /// Returns `true` when the V2 path fired; `false` when the dirty
     /// set is empty or the asset has no mesh — caller falls back to
     /// the full re-extract path.
+    ///
+    /// Re-derive the per-leaf shading normal from the relaxed surface.
+    /// The deferred resolve pass shades from `LeafAttr.normal_oct` in
+    /// the leaf_attr_pool (selected per-pixel by a ½-voxel-snapped
+    /// octree descent), NOT from the mesh vertex normal — so after
+    /// Gibson relaxation moves the geometry, the shaded normal stays
+    /// the stale, blocky brushfire-inherited value and the surface
+    /// still reads stippled. This splats the relaxed vertex normals
+    /// (recomputed from the relaxed faces) back into the pool per
+    /// `leaf_attr_id`, averaging where several SN cubes share a slot,
+    /// so shading reflects the smoothed surface. Skips slot 0 (the
+    /// global default LeafAttr — clobbering it would mis-light every
+    /// fallback pixel). This is "missing authority #2": move the
+    /// surface → re-derive its normal from the moved surface.
+    fn splat_relaxed_normals_to_pool(&mut self, verts: &[MeshVertex]) {
+        use std::collections::HashMap;
+        let mut acc: HashMap<u32, Vec3> = HashMap::new();
+        for v in verts {
+            if v.leaf_attr_id == 0 {
+                continue;
+            }
+            *acc.entry(v.leaf_attr_id).or_insert(Vec3::ZERO) +=
+                arvx_core::unpack_oct(v.normal_oct);
+        }
+        for (slot, n) in acc {
+            if n.length_squared() > 1e-12 {
+                self.leaf_attr_pool.get_mut(slot).normal_oct =
+                    arvx_core::pack_oct(n.normalize());
+            }
+        }
+    }
+
     fn rebuild_dirty_clusters(&mut self, handle: AssetHandle, op: &BrushOp) -> bool {
         let t0 = std::time::Instant::now();
         // D0 per-phase timings inside the cluster-patch path. Mirrors
@@ -1256,7 +1288,12 @@ impl ArvxSceneManager {
         // occupancy alone and recomputes normals from the relaxed
         // faces. `pin_boundary = None`; the ±h/2 clamp keeps the
         // patch seam tight against the kept geometry.
-        relax_surface_net_vertices(&mut brush_verts, &brush_indices, base_vs, 6, None);
+        relax_surface_net_vertices(&mut brush_verts, &brush_indices, base_vs, 10, None);
+        // Carry the relaxed-surface normal into the pool so the
+        // deferred resolve shades the smoothed surface (see
+        // `splat_relaxed_normals_to_pool`). Must run before the
+        // geometry-epoch bump re-uploads the leaf_attr pool.
+        self.splat_relaxed_normals_to_pool(&brush_verts);
 
         _p_extract_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
         let _ph_t4 = std::time::Instant::now();
@@ -1794,7 +1831,11 @@ impl ArvxSceneManager {
         // projection: the mesher smooths from occupancy alone and
         // recomputes normals from the relaxed faces. `pin_boundary =
         // None` for sculpt patches.
-        relax_surface_net_vertices(&mut stroke_verts, &stroke_indices, base_vs, 6, None);
+        relax_surface_net_vertices(&mut stroke_verts, &stroke_indices, base_vs, 10, None);
+        // Carry the relaxed-surface normal into the pool (see
+        // `splat_relaxed_normals_to_pool`); deferred resolve shades
+        // from the per-leaf normal, not the mesh vertex normal.
+        self.splat_relaxed_normals_to_pool(&stroke_verts);
 
         // ── Step 6: append as unified patch cluster ──
         if !stroke_verts.is_empty() {
