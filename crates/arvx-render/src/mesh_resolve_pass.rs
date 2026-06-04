@@ -91,6 +91,20 @@ impl MeshResolvePass {
                     },
                     count: None,
                 },
+                // vis_normal_in (Rgba16Float, sampled — the mesh-path
+                // per-pixel INTERPOLATED object-local normal; used as
+                // the smooth shading normal source. .w gates the
+                // fall-back to the per-leaf `LeafAttr.normal_oct`)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -174,6 +188,7 @@ impl MeshResolvePass {
         material_view: &wgpu::TextureView,
         glass_view: &wgpu::TextureView,
         rest_pos_view: &wgpu::TextureView,
+        vis_normal_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mesh_resolve g0 bg"),
@@ -185,6 +200,7 @@ impl MeshResolvePass {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(material_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(glass_view) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(rest_pos_view) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(vis_normal_view) },
             ],
         })
     }

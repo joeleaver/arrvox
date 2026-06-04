@@ -1,13 +1,17 @@
 // Mesh-resolve compute pass — derives the rest of the G-buffer from
 // the visibility-buffer attachments the mesh raster writes.
 //
-// The mesh raster writes (position, pick, leaf_slot, rest_pos). The
-// `rest_pos` target carries the pre-skin mesh-frame position
-// interpolated barycentrically across each triangle, so the FS-
-// fragment value is the per-pixel rest-pose surface point. Resolve
+// The mesh raster writes (position, pick, leaf_slot, rest_pos,
+// vis_normal). The `rest_pos` target carries the pre-skin mesh-frame
+// position interpolated barycentrically across each triangle, so the
+// FS-fragment value is the per-pixel rest-pose surface point. Resolve
 // walks the asset's octree at that point to recover the actual
-// per-pixel cell — fixes the chunky-per-triangle look caused by
-// `@interpolate(flat) leaf_attr_id` in `mesh.wesl`.
+// per-pixel cell for MATERIAL / COLOR / GLASS — fixes the chunky-per-
+// triangle look caused by `@interpolate(flat) leaf_attr_id` in
+// `mesh.wesl`. The SHADING NORMAL instead comes from the `vis_normal`
+// target (the interpolated per-vertex mesh normal), rotated into world
+// space — smooth across the triangle, unlike the per-cell descent's
+// winner-take-all per-leaf normal which facets at the voxel scale.
 //
 // Per pixel:
 //   leaf_slot_in == 0  →  miss. Write zeros to normal/material/glass.
@@ -53,6 +57,14 @@ import package::lib::brick::BRICK_CELL_INTERIOR;
 @group(0) @binding(3) var material_out:  texture_storage_2d<rg32uint,    write>;
 @group(0) @binding(4) var glass_out:     texture_storage_2d<rg32uint,    write>;
 @group(0) @binding(5) var rest_pos_in:   texture_2d<f32>;
+// `vis_normal_in` — the mesh raster's per-pixel INTERPOLATED object-
+// local normal (Rgba16Float). This is the smooth shading normal of the
+// relaxed mesh; we use it (rotated into world space) instead of the
+// per-leaf `LeafAttr.normal_oct`, which the per-cell octree descent
+// selects winner-take-all and which therefore facets at the voxel
+// scale. `.w == 0` (or a zero-length vector) ⇒ the raster didn't cover
+// this pixel; fall back to the per-leaf normal.
+@group(0) @binding(6) var vis_normal_in: texture_2d<f32>;
 
 // Group 1 — scene-wide buffers driving the lookup. The first three
 // entries match the existing layout (`leaf_attr_pool`, `color_pool`,
@@ -294,7 +306,20 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (attr.normal_oct == 0u && attr.material_packed == 0u) {
         attr = hint_attr;
     }
-    let n_local = unpack_oct_normal(attr.normal_oct);
+    // Shading normal source: prefer the mesh raster's INTERPOLATED
+    // per-vertex normal (smooth across the triangle) over the per-leaf
+    // `LeafAttr.normal_oct` (winner-take-all per voxel cell → facets at
+    // the voxel scale). Guard on the interpolated normal having non-
+    // trivial length so any pixel the raster didn't cover (or a
+    // degenerate zero from a discard early-out) falls back to the
+    // per-leaf normal.
+    let n_interp = textureLoad(vis_normal_in, coord, 0).xyz;
+    var n_local: vec3<f32>;
+    if (length(n_interp) > 0.001) {
+        n_local = normalize(n_interp);
+    } else {
+        n_local = unpack_oct_normal(attr.normal_oct);
+    }
     let world = inst.world;
     let world_basis = mat3x3<f32>(world[0].xyz, world[1].xyz, world[2].xyz);
     let n_world = normalize(world_basis * n_local);

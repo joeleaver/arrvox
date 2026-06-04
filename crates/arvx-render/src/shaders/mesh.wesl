@@ -367,8 +367,9 @@ fn lookup_cell_at(asset: ArvxAsset, oc_pos: vec3<f32>, hint_normal_oc: vec3<f32>
     return r.slot & OCTREE_PAYLOAD_MASK;
 }
 
-// Four-attachment fragment output — visibility-buffer triplet plus
-// rest_pos for per-pixel cell descent in `mesh_resolve`:
+// Five-attachment fragment output — visibility-buffer triplet plus
+// rest_pos for per-pixel cell descent in `mesh_resolve`, plus
+// vis_normal for the smooth shading normal:
 //   position   (Rgba32Float, 16 B): world.xyz + hit_distance
 //   pick       (R32Uint,      4 B): instance.object_id
 //   leaf_slot  (R32Uint,      4 B): leaf_attr_id (provoking vertex's
@@ -376,11 +377,19 @@ fn lookup_cell_at(asset: ArvxAsset, oc_pos: vec3<f32>, hint_normal_oc: vec3<f32>
 //                                   miss-path hint)
 //   rest_pos   (Rgba32Float, 16 B): local mesh-frame rest position
 //                                   (xyz) + valid-bit (.w = 1)
+//   vis_normal (Rgba16Float,  8 B): object-local INTERPOLATED per-vertex
+//                                   normal (xyz, normalized) + valid-bit
+//                                   (.w = 1). `mesh_resolve` rotates this
+//                                   into world space and uses it as the
+//                                   shading normal — smooth across the
+//                                   triangle, unlike the per-cell
+//                                   `LeafAttr.normal_oct` which facets.
 struct FsOut {
-    @location(0) position:  vec4<f32>,
-    @location(1) pick:      u32,
-    @location(2) leaf_slot: u32,
-    @location(3) rest_pos:  vec4<f32>,
+    @location(0) position:   vec4<f32>,
+    @location(1) pick:       u32,
+    @location(2) leaf_slot:  u32,
+    @location(3) rest_pos:   vec4<f32>,
+    @location(4) vis_normal: vec4<f32>,
 }
 
 @fragment
@@ -443,5 +452,12 @@ fn frag_main(in: VsOut) -> FsOut {
     // .w = 1 marks this pixel as "mesh wrote rest_pos" — mesh_resolve
     // gates the per-pixel descent on this.
     out.rest_pos  = vec4<f32>(in.local_rest_pos, 1.0);
+    // Interpolated per-vertex object-local normal — the smooth shading
+    // normal. `mesh_resolve` reads this, rotates it into world space,
+    // and writes it to the shading normal target. Re-normalize because
+    // barycentric interpolation across the triangle shortens the vector.
+    // .w = 1 ⇒ "raster wrote a valid normal" (resolve falls back to the
+    // per-leaf normal on a miss / zero pixel).
+    out.vis_normal = vec4<f32>(normalize(in.local_normal), 1.0);
     return out;
 }

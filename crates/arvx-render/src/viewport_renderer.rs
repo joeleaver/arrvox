@@ -970,6 +970,7 @@ impl ViewportRenderer {
                 &self.gbuffer.material_view,
                 &self.gbuffer.glass_view,
                 &self.gbuffer.rest_pos_view,
+                &self.gbuffer.vis_normal_view,
             ));
         }
         let scene_now = renderer.scene.buffers_epoch();

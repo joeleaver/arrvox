@@ -71,6 +71,20 @@ pub struct GBuffer {
     pub rest_pos_texture: wgpu::Texture,
     pub rest_pos_view: wgpu::TextureView,
 
+    /// Target "vis_normal": per-pixel INTERPOLATED mesh normal in
+    /// object-local frame. `Rgba16Float`. Written by `mesh.wesl`'s
+    /// fragment stage from the barycentrically-interpolated per-vertex
+    /// normal (`VsOut.local_normal`), so it carries the *smooth* shading
+    /// normal of the relaxed mesh — not the per-leaf
+    /// `LeafAttr.normal_oct` that the per-cell octree descent selects
+    /// winner-take-all (which facets at the voxel scale). `mesh_resolve`
+    /// reads this, rotates it into world space, and writes it to the
+    /// shading `normal_out` target. `.w == 1` ⇒ the raster covered this
+    /// pixel and wrote a valid normal; `.w == 0` ⇒ miss / not covered,
+    /// in which case the resolve falls back to the per-leaf normal.
+    pub vis_normal_texture: wgpu::Texture,
+    pub vis_normal_view: wgpu::TextureView,
+
     /// Depth texture for rasterization-based G-buffer writes. `Depth32Float`.
     /// Used by the forward rasterization pipeline; ignored by compute march paths.
     pub depth_texture: wgpu::Texture,
@@ -124,6 +138,13 @@ pub const GBUFFER_LEAF_SLOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R
 /// this format requires updating `mesh.wesl`'s 4th color target +
 /// `mesh_resolve.wesl`'s sample type.
 pub const GBUFFER_REST_POS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+/// Texture format for the mesh-path interpolated-normal visibility
+/// target. `Rgba16Float` — same precision as the shading normal target
+/// it ultimately feeds (`GBUFFER_NORMAL_FORMAT`). Object-local
+/// interpolated normal in `.xyz`, valid-bit in `.w`. Changing this
+/// format requires updating `mesh.wesl`'s last color target +
+/// `mesh_resolve.wesl`'s `vis_normal_in` sample type.
+pub const GBUFFER_VIS_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 impl GBuffer {
     /// Create the G-buffer with 4 render targets at the given resolution.
@@ -237,6 +258,25 @@ impl GBuffer {
             view_formats: &[],
         });
         let rest_pos_view = rest_pos_texture.create_view(&Default::default());
+
+        // Mesh-path interpolated-normal target — per-pixel object-local
+        // smooth mesh normal. Written by `mesh.wesl` as a 5th MRT
+        // attachment; consumed by `mesh_resolve.wesl` as the shading
+        // normal source. RENDER_ATTACHMENT for mesh writes,
+        // TEXTURE_BINDING for the resolve read. Mirrors `rest_pos`.
+        let vis_normal_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer vis_normal"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GBUFFER_VIS_NORMAL_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let vis_normal_view = vis_normal_texture.create_view(&Default::default());
 
         // Depth texture for rasterization-based G-buffer writes
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -381,6 +421,8 @@ impl GBuffer {
             leaf_slot_view,
             rest_pos_texture,
             rest_pos_view,
+            vis_normal_texture,
+            vis_normal_view,
             depth_texture,
             depth_view,
             write_bind_group_layout,

@@ -1244,6 +1244,7 @@ impl ArvxRenderer {
                 &viewport.pick_view,
                 &viewport.gbuffer.leaf_slot_view,
                 &viewport.gbuffer.rest_pos_view,
+                &viewport.gbuffer.vis_normal_view,
                 &viewport.gbuffer.depth_view,
                 None,
             );
