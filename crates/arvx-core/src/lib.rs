@@ -25,6 +25,7 @@ pub mod material_ref;
 pub mod mesh_cluster;
 pub mod mesh_extract;
 pub mod mesh_lod;
+pub mod mesh_test_bench;
 pub mod octree_allocator;
 pub mod prefilter;
 pub mod scene_node;

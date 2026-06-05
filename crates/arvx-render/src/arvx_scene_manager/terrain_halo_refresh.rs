@@ -42,8 +42,12 @@ pub const FACE_PZ: u8 = 4;
 pub const FACE_NZ: u8 = 5;
 
 /// Halo width (in finest-grid voxels) baked into terrain tiles. Must
-/// match `arvx_terrain::bake::TILE_HALO_VOXELS`.
-const TILE_HALO_VOXELS: i32 = 2;
+/// match `arvx_terrain::bake::TILE_HALO_VOXELS` (currently 4, widened to
+/// cover the smooth-mesh blur kernel reach `DENSITY_KERNEL_R + 1`).
+/// TODO(authority): this is a hand-mirrored copy — promote to one shared
+/// `arvx_core` constant so the two can't diverge (see the scattered-
+/// authority audit; `arvx-render` doesn't depend on `arvx-terrain`).
+const TILE_HALO_VOXELS: i32 = 4;
 
 /// One terrain neighbour's view of the shared face. Refresh op
 /// updates `target`'s halo cells on `target_face` using `source`'s

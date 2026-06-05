@@ -21,3 +21,6 @@ rustc-hash = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# Headless meshing test-bench (mesh_test_bench + examples/mesh_bench)
+# writes validation PNGs via the standard `image` encoder.
+image = { workspace = true }

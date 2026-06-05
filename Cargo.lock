@@ -308,6 +308,7 @@ dependencies = [
  "bytemuck",
  "glam 0.29.3",
  "half",
+ "image",
  "log",
  "lz4_flex",
  "meshopt",

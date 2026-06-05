@@ -30,7 +30,7 @@ use arvx_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aab
 use arvx_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
 use arvx_core::mesh_extract::{
     collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
-    extract_surface_mesh, relax_surface_net_vertices, MeshVertex,
+    extract_surface_mesh, MeshVertex,
 };
 use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sculpt::{
@@ -1256,7 +1256,7 @@ impl ArvxSceneManager {
         let cells_count = cells.len();
         let _ph_t3b = std::time::Instant::now();
 
-        let (mut brush_verts, brush_indices) = {
+        let (brush_verts, brush_indices) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             extract_mesh_region_from_cells_pooled_haloed(
                 &mut self.sculpt_extract_scratch,
@@ -1281,16 +1281,17 @@ impl ArvxSceneManager {
         };
         let _p_extract_mesh_ms = _ph_t3b.elapsed().as_secs_f64() * 1000.0;
 
-        // De-staircase the patch via the Gibson constrained elastic
-        // surface net (occupancy-only, box-clamped to ±h/2). This
-        // replaces the brush-aware projection layer: the mesher no
-        // longer needs to know the brush shape — it smooths from
-        // occupancy alone and recomputes normals from the relaxed
-        // faces. `pin_boundary = None`; the ±h/2 clamp keeps the
-        // patch seam tight against the kept geometry.
-        relax_surface_net_vertices(&mut brush_verts, &brush_indices, base_vs, 10, None);
-        // Carry the relaxed-surface normal into the pool so the
-        // deferred resolve shades the smoothed surface (see
+        // Smoothing now happens INSIDE the extract: vertex positions
+        // come from the `D = 0.5` density isosurface and normals from
+        // `∇D`, both reconstructed directly from the bounded-radius
+        // occupancy blur. No iterative relaxation (the old Gibson
+        // Taubin pass spread influence past the 2-cell halo over many
+        // iterations and broke watertight seams) — the density field
+        // is a pure local function of occupancy, so adjacent
+        // patches/tiles agree on the boundary by construction.
+        //
+        // Carry the extract's ∇D normal into the pool so the deferred
+        // resolve shades the smoothed surface (see
         // `splat_relaxed_normals_to_pool`). Must run before the
         // geometry-epoch bump re-uploads the leaf_attr pool.
         self.splat_relaxed_normals_to_pool(&brush_verts);
@@ -1801,7 +1802,7 @@ impl ArvxSceneManager {
                 cells_max,
             )
         };
-        let (mut stroke_verts, stroke_indices) = {
+        let (stroke_verts, stroke_indices) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             extract_mesh_region_from_cells_pooled_haloed(
                 &mut self.sculpt_extract_scratch,
@@ -1825,14 +1826,17 @@ impl ArvxSceneManager {
             )
         };
 
-        // ── Step 5: de-staircase the unified stroke patch ──
-        // Gibson constrained elastic surface net (occupancy-only,
-        // box-clamped to ±h/2). Replaces the brush-aware stroke
-        // projection: the mesher smooths from occupancy alone and
-        // recomputes normals from the relaxed faces. `pin_boundary =
-        // None` for sculpt patches.
-        relax_surface_net_vertices(&mut stroke_verts, &stroke_indices, base_vs, 10, None);
-        // Carry the relaxed-surface normal into the pool (see
+        // ── Step 5: smoothing is done in the extract ──
+        // Vertex positions come from the `D = 0.5` density isosurface
+        // and normals from `∇D`, reconstructed directly inside
+        // `extract_mesh_region_from_cells_pooled_haloed` from the
+        // bounded-radius (R = 2) occupancy blur. No iterative
+        // relaxation — the density field is a pure local function of
+        // occupancy, so the union patch and the neighbouring kept
+        // geometry agree on shared boundary cells by construction
+        // (watertight, no welding).
+        //
+        // Carry the extract's ∇D normal into the pool (see
         // `splat_relaxed_normals_to_pool`); deferred resolve shades
         // from the per-leaf normal, not the mesh vertex normal.
         self.splat_relaxed_normals_to_pool(&stroke_verts);

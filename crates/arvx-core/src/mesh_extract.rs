@@ -257,6 +257,30 @@ pub struct SculptExtractScratch {
     pub cells_grid: CellGrid,
     pub cube_vertex_grid: CellGrid,
     pub solid_cells: Vec<IVec3>,
+    /// Reusable smooth-density buffer, parallel to `cells_grid` (same
+    /// `[origin, origin + size)` extent and flat `x + sx*(y + sy*z)`
+    /// indexing). `D[i] ∈ [0, 1]` is the Gaussian-blurred binary
+    /// occupancy of the corresponding grid cell; the `D = 0.5`
+    /// isosurface is the smooth surface the extract places vertices on.
+    /// Grows to the largest footprint seen and never shrinks, mirroring
+    /// the `CellGrid` pool-reuse policy so no per-stamp allocation.
+    pub density: Vec<f32>,
+    /// Reusable smooth-gradient buffer, parallel to `density` (same flat
+    /// indexing). `G[i] = ∇D` evaluated at grid point `i` by central
+    /// differences of the smooth `density` grid (replicated/one-sided at
+    /// the grid edges). Stored per grid point and trilinearly
+    /// interpolated at vertex positions to derive the surface normal.
+    ///
+    /// **Why a precomputed grid-point gradient (not differentiating the
+    /// trilinear density at the vertex):** the gradient of a trilinear
+    /// interpolant is piecewise-constant and DISCONTINUOUS across cell
+    /// boundaries, so differencing the interpolated `D` flips the normal
+    /// cell-to-cell → voxel-scale speckle. Differencing the smooth `D`
+    /// grid first, then trilinearly interpolating the *gradient*, gives
+    /// a normal that is continuous across cells (C0). Same occupancy
+    /// dependency radius as the position reads (`±(R+1)`), so the
+    /// watertight seam property is preserved.
+    pub gradient: Vec<[f32; 3]>,
 }
 
 impl SculptExtractScratch {
@@ -267,6 +291,8 @@ impl SculptExtractScratch {
             cells_grid: CellGrid::empty(),
             cube_vertex_grid: CellGrid::empty(),
             solid_cells: Vec::new(),
+            density: Vec::new(),
+            gradient: Vec::new(),
         }
     }
 }
@@ -394,6 +420,195 @@ pub const CELL_INTERIOR: u32 = u32::MAX;
 /// reverses the remap. A real `leaf_attr_id` can never hit this
 /// value — `LeafAttrPool` capacities are well under `u32::MAX - 1`.
 const CELL_INTERIOR_GRID: u32 = u32::MAX - 1;
+
+/// Half-width (in cells) of the separable Gaussian density blur kernel
+/// used by [`extract_mesh_region_from_cells_pooled_haloed`]. The full
+/// support is `[-DENSITY_KERNEL_R, +DENSITY_KERNEL_R]³`.
+///
+/// **Watertight invariant:** R MUST be `≤` the boundary halo (terrain
+/// bakes with halo = 2). The blurred density `D[c]` is a *pure local*
+/// function of the occupancy in `c ± R`; two tiles/patches that share
+/// the same `2R+1`-wide boundary neighborhood (the interior cells of
+/// one side appear as halo cells of the other) therefore compute the
+/// *bit-identical* `D` — hence identical `D = 0.5` crossings and
+/// identical `∇D` normals — at every shared boundary cube. No welding,
+/// no iteration, no cross-tile divergence.
+///
+/// R = 2 for good smoothing everywhere. The kernel reach (`R + 1` for the
+/// edge-crossing reads, `R + 2` counting the ∇D normal's ½-voxel step) is
+/// fed two ways with NO dependence on the halo away from tile seams:
+///   • Mid-tile / single asset: the surrounding occupancy is collected
+///     into the same `cells_grid` from the tile's own octree, so the blur
+///     is fully supported — smoothness does not involve the halo at all.
+///   • Tile-to-tile seam (the ONLY place a neighbor tile's occupancy is
+///     needed): the baked halo must be `≥` the reach, so it is widened to
+///     `TILE_HALO_VOXELS = 4`. With that, both tiles share the full
+///     neighborhood and compute bit-identical seam vertices — watertight,
+///     and the halo is never the limiting factor on smoothness.
+const DENSITY_KERNEL_R: i32 = 2;
+
+/// Standard deviation (in cells) of the separable Gaussian density
+/// kernel. `σ ≈ 1.0` gives a gentle blur whose support is well within
+/// `±2` cells (the `R = 2` truncation drops < 5 % of the unit-area
+/// Gaussian per axis), enough to de-staircase grid-aligned occupancy
+/// into a smooth `[0, 1]` field while staying strictly local.
+const DENSITY_KERNEL_SIGMA: f32 = 1.0;
+
+/// Iso-threshold of the smooth density field: the surface is the
+/// `D = 0.5` level set. Inside (occupancy 1) blurs to `D > 0.5`,
+/// outside (occupancy 0) to `D < 0.5`, so `sdf = 0.5 - D` is negative
+/// inside / positive outside — matching `build_cube_vertex`'s
+/// edge-crossing sign convention (solid corner negative, empty corner
+/// positive).
+const DENSITY_ISO: f32 = 0.5;
+
+/// Precompute the normalized 1D Gaussian weights for the separable
+/// density blur over `[-DENSITY_KERNEL_R, +DENSITY_KERNEL_R]`. The
+/// returned `2R+1` weights sum to 1.0 so a fully-solid neighborhood
+/// blurs to exactly `D = 1.0` and a fully-empty one to `D = 0.0`.
+fn density_kernel_weights_1d() -> [f32; (2 * DENSITY_KERNEL_R + 1) as usize] {
+    let mut w = [0.0f32; (2 * DENSITY_KERNEL_R + 1) as usize];
+    let two_sigma_sq = 2.0 * DENSITY_KERNEL_SIGMA * DENSITY_KERNEL_SIGMA;
+    let mut sum = 0.0f32;
+    for (i, slot) in w.iter_mut().enumerate() {
+        let d = i as i32 - DENSITY_KERNEL_R;
+        let v = (-((d * d) as f32) / two_sigma_sq).exp();
+        *slot = v;
+        sum += v;
+    }
+    let inv = 1.0 / sum;
+    for slot in w.iter_mut() {
+        *slot *= inv;
+    }
+    w
+}
+
+/// Trilinearly sample the precomputed density grid `density` (laid out
+/// like `cells_grid`: `origin` lo-corner, `size` extent, flat
+/// `x + sx*(y + sy*z)`) at fractional grid coordinate `p` (in cells).
+///
+/// Out-of-bounds is handled by *clamping the sample coordinate into the
+/// grid*, NOT by reading 0. Reading 0 outside would synthesize a false
+/// `D = 0.5` crossing at the grid edge (a spurious surface); clamping
+/// instead extends the boundary value outward, which is the correct
+/// Neumann (zero-gradient) edge condition for a density field whose
+/// real support is fully captured by the halo.
+#[inline]
+fn sample_density_trilinear(
+    density: &[f32],
+    origin: IVec3,
+    size: IVec3,
+    p: Vec3,
+) -> f32 {
+    let sx = size.x as usize;
+    let sy = size.y as usize;
+    // Translate into local fractional coords.
+    let lx = p.x - origin.x as f32;
+    let ly = p.y - origin.y as f32;
+    let lz = p.z - origin.z as f32;
+    // Clamp the *base* integer cell so [i0, i0+1] stays in bounds, and
+    // clamp the fractional weight to [0, 1] outside the valid span so
+    // the sample saturates to the boundary value rather than reading 0.
+    let clamp_axis = |v: f32, n: i32| -> (usize, f32) {
+        let max_i0 = (n - 1).max(0); // last valid base cell index
+        if v <= 0.0 {
+            (0, 0.0)
+        } else if v >= (n - 1) as f32 {
+            // At/over the far edge: pin to the last cell, frac 0 so the
+            // upper sample (also pinned) returns the boundary value.
+            (max_i0 as usize, 0.0)
+        } else {
+            let i0 = v.floor();
+            (i0 as usize, v - i0)
+        }
+    };
+    let (x0, fx) = clamp_axis(lx, size.x);
+    let (y0, fy) = clamp_axis(ly, size.y);
+    let (z0, fz) = clamp_axis(lz, size.z);
+    let x1 = (x0 + 1).min((size.x - 1).max(0) as usize);
+    let y1 = (y0 + 1).min((size.y - 1).max(0) as usize);
+    let z1 = (z0 + 1).min((size.z - 1).max(0) as usize);
+    let at = |x: usize, y: usize, z: usize| -> f32 {
+        density[x + sx * (y + sy * z)]
+    };
+    let c000 = at(x0, y0, z0);
+    let c100 = at(x1, y0, z0);
+    let c010 = at(x0, y1, z0);
+    let c110 = at(x1, y1, z0);
+    let c001 = at(x0, y0, z1);
+    let c101 = at(x1, y0, z1);
+    let c011 = at(x0, y1, z1);
+    let c111 = at(x1, y1, z1);
+    let c00 = c000 + (c100 - c000) * fx;
+    let c10 = c010 + (c110 - c010) * fx;
+    let c01 = c001 + (c101 - c001) * fx;
+    let c11 = c011 + (c111 - c011) * fx;
+    let c0 = c00 + (c10 - c00) * fy;
+    let c1 = c01 + (c11 - c01) * fy;
+    c0 + (c1 - c0) * fz
+}
+
+/// Trilinearly sample the precomputed grid-point gradient `gradient`
+/// (vector-valued, laid out / clamped exactly like
+/// [`sample_density_trilinear`]) at fractional grid coordinate `p`.
+///
+/// Interpolating the *gradient field* (rather than differentiating the
+/// interpolated density) is what makes the surface normal continuous
+/// across cell boundaries — `gradient` is built from central
+/// differences of the smooth `density` grid at grid points, so it is
+/// itself smooth, and trilinear interpolation of a smooth field is C0.
+///
+/// Out-of-bounds clamps the sample coordinate (boundary replication),
+/// matching `sample_density_trilinear`'s edge policy so seam vertices
+/// near the grid edge read the same boundary gradient from either side.
+#[inline]
+fn sample_gradient_trilinear(
+    gradient: &[[f32; 3]],
+    origin: IVec3,
+    size: IVec3,
+    p: Vec3,
+) -> Vec3 {
+    let sx = size.x as usize;
+    let sy = size.y as usize;
+    let lx = p.x - origin.x as f32;
+    let ly = p.y - origin.y as f32;
+    let lz = p.z - origin.z as f32;
+    let clamp_axis = |v: f32, n: i32| -> (usize, f32) {
+        let max_i0 = (n - 1).max(0);
+        if v <= 0.0 {
+            (0, 0.0)
+        } else if v >= (n - 1) as f32 {
+            (max_i0 as usize, 0.0)
+        } else {
+            let i0 = v.floor();
+            (i0 as usize, v - i0)
+        }
+    };
+    let (x0, fx) = clamp_axis(lx, size.x);
+    let (y0, fy) = clamp_axis(ly, size.y);
+    let (z0, fz) = clamp_axis(lz, size.z);
+    let x1 = (x0 + 1).min((size.x - 1).max(0) as usize);
+    let y1 = (y0 + 1).min((size.y - 1).max(0) as usize);
+    let z1 = (z0 + 1).min((size.z - 1).max(0) as usize);
+    let at = |x: usize, y: usize, z: usize| -> Vec3 {
+        Vec3::from(gradient[x + sx * (y + sy * z)])
+    };
+    let c000 = at(x0, y0, z0);
+    let c100 = at(x1, y0, z0);
+    let c010 = at(x0, y1, z0);
+    let c110 = at(x1, y1, z0);
+    let c001 = at(x0, y0, z1);
+    let c101 = at(x1, y0, z1);
+    let c011 = at(x0, y1, z1);
+    let c111 = at(x1, y1, z1);
+    let c00 = c000 + (c100 - c000) * fx;
+    let c10 = c010 + (c110 - c010) * fx;
+    let c01 = c001 + (c101 - c001) * fx;
+    let c11 = c011 + (c111 - c011) * fx;
+    let c0 = c00 + (c10 - c00) * fy;
+    let c1 = c01 + (c11 - c01) * fy;
+    c0 + (c1 - c0) * fz
+}
 
 /// Walk a brick-terminated octree and emit the surface mesh as
 /// `(vertices, indices)`.
@@ -630,6 +845,7 @@ pub fn extract_surface_mesh_haloed(
                             bone_voxel_pool,
                             sculpt_slots,
                             None::<&fn(Vec3) -> f32>,
+                            None::<&fn(Vec3) -> Vec3>,
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
@@ -868,12 +1084,18 @@ where
     scratch.cells_grid.reuse(grid_min, grid_size);
     scratch.cube_vertex_grid.reuse(grid_min, grid_size);
     scratch.solid_cells.clear();
-    let cells_grid = &mut scratch.cells_grid;
-    let cube_vertex_grid = &mut scratch.cube_vertex_grid;
-    let solid_cells = &mut scratch.solid_cells;
-    if solid_cells.capacity() < cells.len() {
-        solid_cells.reserve(cells.len() - solid_cells.capacity());
-    }
+
+    // **Populate phase** — `cells_grid` and `solid_cells` are written
+    // here, then become read-only for the density precompute + cube
+    // loop. The `&mut` borrows below are scoped to this block so the
+    // subsequent split borrow (immutable `cells_grid` + `density`,
+    // mutable `cube_vertex_grid`) type-checks without `unsafe`.
+    {
+        let cells_grid = &mut scratch.cells_grid;
+        let solid_cells = &mut scratch.solid_cells;
+        if solid_cells.capacity() < cells.len() {
+            solid_cells.reserve(cells.len() - solid_cells.capacity());
+        }
 
     // Combined populate + filter pass — visits `cells.iter()` once,
     // mirroring D6.1's iteration win. Cells inside `[pad_min, pad_max)`
@@ -920,6 +1142,200 @@ where
         };
         cells_grid.set(coord, stored);
     }
+    } // end populate block — `cells_grid` / `solid_cells` now read-only.
+
+    // ── Smooth-density precompute (direct, non-iterative smoothing) ──
+    //
+    // Blur the binary occupancy `occ(c) = cells_grid.contains(c) ? 1 : 0`
+    // with a fixed separable Gaussian (R = DENSITY_KERNEL_R, σ =
+    // DENSITY_KERNEL_SIGMA) into a dense `[0, 1]` density field `D`,
+    // parallel to `cells_grid`. The `D = DENSITY_ISO` (0.5) isosurface
+    // is the smooth surface; `∇D` is its (inward) gradient. Because `D`
+    // is a *pure local* function of occupancy in `c ± R` and `R ≤` the
+    // boundary halo, the density at every shared boundary cell is
+    // identical from both sides → watertight by construction.
+    //
+    // One separable 3-pass blur over the dense grid: X then Y then Z.
+    // For a `104³` brush footprint this is ~1.1 M cells × 3 passes ×
+    // (2R+1=5) taps ≈ 17 M MACs — sub-millisecond, and replaces the
+    // 12-iteration Taubin relaxation (24 Laplacian sweeps over the
+    // mesh + adjacency build) that the render side used to run per
+    // stamp.
+    let g_origin = scratch.cells_grid.origin();
+    let g_size = scratch.cells_grid.size();
+    let sx = g_size.x as usize;
+    let sy = g_size.y as usize;
+    let sz = g_size.z as usize;
+    let total = sx * sy * sz;
+    let kern = density_kernel_weights_1d();
+    let r = DENSITY_KERNEL_R;
+
+    // Resize the reusable density buffer (grows, never shrinks).
+    if scratch.density.len() < total {
+        scratch.density.resize(total, 0.0);
+    }
+    // Pass 0: seed `density` with raw binary occupancy.
+    {
+        let cells_grid = &scratch.cells_grid;
+        let density = &mut scratch.density;
+        for z in 0..sz {
+            for y in 0..sy {
+                for x in 0..sx {
+                    let c = g_origin
+                        + IVec3::new(x as i32, y as i32, z as i32);
+                    density[x + sx * (y + sy * z)] =
+                        if cells_grid.contains(c) { 1.0 } else { 0.0 };
+                }
+            }
+        }
+    }
+    // Separable Gaussian: blur along X, then Y, then Z. Each pass reads
+    // `density` into a scratch row and writes the blurred result back.
+    // Out-of-grid taps clamp to the nearest in-bounds cell (boundary
+    // extension), matching `sample_density_trilinear`'s edge policy so
+    // a fully-solid block near the grid edge stays `D = 1`, not a
+    // false `< 1` that would pull a spurious surface inward.
+    {
+        let density = &mut scratch.density;
+        let mut row: Vec<f32> = vec![0.0; sx.max(sy).max(sz)];
+        // X pass.
+        for z in 0..sz {
+            for y in 0..sy {
+                let base = sx * (y + sy * z);
+                row[..sx].copy_from_slice(&density[base..base + sx]);
+                for x in 0..sx {
+                    let mut acc = 0.0f32;
+                    for k in -r..=r {
+                        let xi = (x as i32 + k).clamp(0, sx as i32 - 1) as usize;
+                        acc += kern[(k + r) as usize] * row[xi];
+                    }
+                    density[base + x] = acc;
+                }
+            }
+        }
+        // Y pass.
+        for z in 0..sz {
+            for x in 0..sx {
+                for y in 0..sy {
+                    row[y] = density[x + sx * (y + sy * z)];
+                }
+                for y in 0..sy {
+                    let mut acc = 0.0f32;
+                    for k in -r..=r {
+                        let yi = (y as i32 + k).clamp(0, sy as i32 - 1) as usize;
+                        acc += kern[(k + r) as usize] * row[yi];
+                    }
+                    density[x + sx * (y + sy * z)] = acc;
+                }
+            }
+        }
+        // Z pass.
+        for y in 0..sy {
+            for x in 0..sx {
+                for z in 0..sz {
+                    row[z] = density[x + sx * (y + sy * z)];
+                }
+                for z in 0..sz {
+                    let mut acc = 0.0f32;
+                    for k in -r..=r {
+                        let zi = (z as i32 + k).clamp(0, sz as i32 - 1) as usize;
+                        acc += kern[(k + r) as usize] * row[zi];
+                    }
+                    density[x + sx * (y + sy * z)] = acc;
+                }
+            }
+        }
+    }
+
+    // ── Smooth-gradient precompute (continuous normals) ──
+    //
+    // `G[c] = ∇D` at every grid point, by central differences of the
+    // SMOOTH `density` grid. We interpolate THIS gradient field at the
+    // vertex (in `build_cube_vertex`) rather than differentiating the
+    // trilinear density: the gradient of a trilinear interpolant is
+    // piecewise-constant and DISCONTINUOUS across cell boundaries (→
+    // voxel-scale normal speckle), whereas central-differencing the
+    // smooth `D` first yields a smooth grid-point gradient whose
+    // trilinear interpolation is continuous (C0) across cells.
+    //
+    // Edge handling: replicated / one-sided differences at the grid
+    // boundary (clamp the ±1 sample index into range), never reading 0
+    // outside — matching the density blur's and the trilinear sampler's
+    // boundary-extension policy. `G[c]` depends on `D` in `c ± 1` and
+    // each `D` depends on occupancy in `c ± R`, so `G`'s occupancy
+    // dependency is `± (R + 1)` — the same reach as the position
+    // crossings — so two tiles sharing the halo compute the identical
+    // `G` (and identical normals) at the seam.
+    if scratch.gradient.len() < total {
+        scratch.gradient.resize(total, [0.0; 3]);
+    }
+    {
+        let density = &scratch.density;
+        let gradient = &mut scratch.gradient;
+        let sxi = sx as i32;
+        let syi = sy as i32;
+        let szi = sz as i32;
+        let at = |x: i32, y: i32, z: i32| -> f32 {
+            let xc = x.clamp(0, sxi - 1) as usize;
+            let yc = y.clamp(0, syi - 1) as usize;
+            let zc = z.clamp(0, szi - 1) as usize;
+            density[xc + sx * (yc + sy * zc)]
+        };
+        for z in 0..szi {
+            for y in 0..syi {
+                for x in 0..sxi {
+                    // Central difference of the smooth D grid. When a
+                    // neighbour clamps (grid edge) the difference becomes
+                    // one-sided / zero on that axis, which is the correct
+                    // replicated-boundary behaviour.
+                    let gx = (at(x + 1, y, z) - at(x - 1, y, z)) * 0.5;
+                    let gy = (at(x, y + 1, z) - at(x, y - 1, z)) * 0.5;
+                    let gz = (at(x, y, z + 1) - at(x, y, z - 1)) * 0.5;
+                    gradient[(x as usize) + sx * ((y as usize) + sy * (z as usize))] =
+                        [gx, gy, gz];
+                }
+            }
+        }
+    }
+
+    // ── Split borrows for the cube loop ──
+    // `cells_grid` + `density` + `gradient` are read-only;
+    // `cube_vertex_grid` is mutable. Distinct scratch fields → safe
+    // split borrow.
+    let cells_grid = &scratch.cells_grid;
+    let cube_vertex_grid = &mut scratch.cube_vertex_grid;
+    let solid_cells = &scratch.solid_cells;
+    let density = &scratch.density[..total];
+    let gradient = &scratch.gradient[..total];
+
+    // Smooth density sampler in fractional grid (cell) coordinates.
+    let density_at = |p_grid: Vec3| -> f32 {
+        sample_density_trilinear(density, g_origin, g_size, p_grid)
+    };
+    // Smooth SDF in world space: `sdf = DENSITY_ISO - D(p)`. Inside
+    // (D high) → negative; outside (D low) → positive. `build_cube_vertex`
+    // interpolates the `t = da/(da-db)` zero-crossing on each active
+    // edge to place the vertex.
+    let smooth_sdf = |p_world: Vec3| -> f32 {
+        let g = (p_world - grid_origin) / base_voxel_size;
+        DENSITY_ISO - density_at(g)
+    };
+    // Outward surface normal at a world-space point: interpolate the
+    // precomputed grid-point gradient field `G = ∇D`, then negate.
+    // `∇D` points toward higher density = INTO the solid, so `-∇D`
+    // points toward EMPTY (outward). Interpolating the gradient FIELD
+    // (not differentiating the interpolated density) keeps the normal
+    // continuous across cell boundaries. Returns the raw (un-normalized)
+    // `-G`; `build_cube_vertex` normalizes and applies the degenerate
+    // fallback.
+    let outward_normal = |p_world: Vec3| -> Vec3 {
+        let g = (p_world - grid_origin) / base_voxel_size;
+        -sample_gradient_trilinear(gradient, g_origin, g_size, g)
+    };
+    // The caller-supplied `sdf_fn` is intentionally ignored for vertex
+    // placement now — the density-derived SDF is the authoritative
+    // smooth field. (Sculpt/terrain callers all pass `None`.)
+    let _ = sdf_fn;
 
     for &cell in solid_cells.iter() {
         for face in 0..6 {
@@ -982,7 +1398,8 @@ where
                             leaf_attr_pool,
                             bone_voxel_pool,
                             sculpt_slots,
-                            sdf_fn,
+                            Some(&smooth_sdf),
+                            Some(&outward_normal),
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
@@ -1127,7 +1544,7 @@ fn solve_qef(planes: &[(Vec3, Vec3)], bias: Vec3) -> Vec3 {
 ///
 /// Falls back to the SN cube's grid corner (`cube + (1, 1, 1)`) when
 /// no edge crossings are detected — defensive only.
-fn build_cube_vertex<F, S>(
+fn build_cube_vertex<F, S, N>(
     cube: IVec3,
     cell_lookup: F,
     voxel_size: f32,
@@ -1136,10 +1553,12 @@ fn build_cube_vertex<F, S>(
     bone_voxel_pool: &[BoneVoxel],
     sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
     sdf_fn: Option<&S>,
+    normal_fn: Option<&N>,
 ) -> MeshVertex
 where
     F: Fn(IVec3) -> Option<u32>,
     S: Fn(Vec3) -> f32,
+    N: Fn(Vec3) -> Vec3,
 {
     // Pre-classify the 8 corner cells once; the edge loop reuses these.
     // Bit layout: index = bit0(+X) | bit1(+Y) | bit2(+Z).
@@ -1228,12 +1647,6 @@ where
         }
     }
 
-    let normal_oct = if normal_sum.length_squared() > 1e-12 {
-        pack_oct(normal_sum)
-    } else {
-        pack_oct(Vec3::Y)
-    };
-
     let local_centroid = if crossing_count > 0 {
         crossing_sum / crossing_count as f32
     } else {
@@ -1244,6 +1657,39 @@ where
         )
     };
     let local_pos = grid_origin + local_centroid * voxel_size;
+
+    // **Normal.** The outward normal is `-∇D` (∇D points into the
+    // solid; its negation points toward EMPTY), obtained by trilinearly
+    // interpolating the precomputed grid-point gradient field at the
+    // vertex — NOT by central-differencing the trilinear density here.
+    //
+    // Differentiating the interpolated density (the previous approach)
+    // sampled the trilinear `D` at `vertex ± h/2`; the gradient of a
+    // trilinear interpolant is piecewise-constant and DISCONTINUOUS
+    // across cell boundaries, so the normal flipped cell-to-cell →
+    // voxel-scale speckle. The smooth grid-point gradient field is C0
+    // under trilinear interpolation, so the resulting normal is
+    // continuous across cells.
+    //
+    // `normal_fn(local_pos)` returns the raw (un-normalized) `-∇D`.
+    // Falls back to the averaged corner-leaf normal (then +Y) when no
+    // gradient field is supplied or the interpolated gradient is
+    // degenerate (locally-flat `D`, e.g. deep interior — shouldn't
+    // occur on a real surface cube).
+    let normal_oct = if let Some(nf) = normal_fn {
+        let n = nf(local_pos);
+        if n.length_squared() > 1e-12 {
+            pack_oct(n.normalize())
+        } else if normal_sum.length_squared() > 1e-12 {
+            pack_oct(normal_sum)
+        } else {
+            pack_oct(Vec3::Y)
+        }
+    } else if normal_sum.length_squared() > 1e-12 {
+        pack_oct(normal_sum)
+    } else {
+        pack_oct(Vec3::Y)
+    };
 
     // Bone weights come from the same chosen surface cell that
     // contributed `leaf_attr_id` — keeps the per-vertex attribution
@@ -2348,10 +2794,21 @@ mod tests {
             IVec3::splat(extent),
         );
         let _ = region_extent(extent);
+        // Topology comparison: the region path now smooths vertex
+        // positions (density `D = 0.5` isosurface) while the full-asset
+        // extract keeps naive centroids, so exact positions differ by
+        // design. The active-cube set — and hence the vertex count and
+        // triangle count — must still match: the same SN cubes are
+        // emitted, only their sub-voxel positions moved.
         assert_eq!(
-            triangle_position_set(&full_i, &full_v),
-            triangle_position_set(&region_i, &region_v),
-            "region covering full extent must match full-extract triangle set",
+            full_v.len(),
+            region_v.len(),
+            "region covering full extent must emit the same vertex count",
+        );
+        assert_eq!(
+            full_i.len(),
+            region_i.len(),
+            "region covering full extent must emit the same triangle count",
         );
     }
 
@@ -2431,10 +2888,19 @@ mod tests {
             IVec3::ZERO,
             IVec3::ONE,
         );
+        // Pad expansion reaches cell (1,0,0) iff the region emits the
+        // same active-cube set as the full extract — same vertex and
+        // triangle counts. (Positions differ now that the region path
+        // smooths; counts are the position-independent invariant.)
         assert_eq!(
-            triangle_position_set(&i_a, &v_a),
-            triangle_position_set(&full_i, &full_v),
-            "pad expansion of region [0..1) must reach cell (1,0,0)",
+            v_a.len(),
+            full_v.len(),
+            "pad expansion of region [0..1) must reach cell (1,0,0) (vertex count)",
+        );
+        assert_eq!(
+            i_a.len(),
+            full_i.len(),
+            "pad expansion of region [0..1) must reach cell (1,0,0) (triangle count)",
         );
 
         // Region [3..4) padded to [2..5) — neither solid cell is in pad.
@@ -2560,10 +3026,19 @@ mod tests {
             IVec3::ZERO,
             IVec3::splat(extent),
         );
+        // INTERIOR corner cells classified solid in both paths ⇒ the
+        // same active-cube set ⇒ identical vertex and triangle counts.
+        // (The region path smooths positions; counts are the
+        // position-independent invariant that pins the classification.)
         assert_eq!(
-            triangle_position_set(&full_i, &full_v),
-            triangle_position_set(&region_i, &region_v),
-            "INTERIOR corner cells must produce the same SN vertices in both paths",
+            full_v.len(),
+            region_v.len(),
+            "INTERIOR corner cells must produce the same vertex count in both paths",
+        );
+        assert_eq!(
+            full_i.len(),
+            region_i.len(),
+            "INTERIOR corner cells must produce the same triangle count in both paths",
         );
     }
 
@@ -2822,6 +3297,7 @@ mod tests {
             &[],
             None,
             None::<&fn(Vec3) -> f32>,
+            None::<&fn(Vec3) -> Vec3>,
         );
 
         // With naive SN, the vertex would sit at the centroid of
@@ -3114,6 +3590,623 @@ mod tests {
             max_angle < 0.35, // ≈ 20°
             "max adjacent-normal angle {:.1}° suggests lattice banding",
             max_angle.to_degrees(),
+        );
+    }
+
+    // ───────────────────────── Direct density-smoothing ─────────────
+    //
+    // The region extract (`extract_mesh_region_from_cells_pooled_haloed`)
+    // now reconstructs smooth vertex positions from the `D = 0.5`
+    // isosurface of a fixed Gaussian-blurred occupancy field and normals
+    // from `∇D`. The two tests below pin the watertight-by-construction
+    // property (the kernel is a pure local function of occupancy) and the
+    // smoothness + outward-normal behaviour on a synthetic slope.
+
+    /// Build a `CellMap` from a synthetic occupancy predicate over a
+    /// box of cell coords. Every solid cell gets `leaf_attr_id = 0`
+    /// (the default LeafAttr — its `+Y` normal is irrelevant here since
+    /// the smoothing path derives the normal from `∇D`, not the pool).
+    fn occupancy_cellmap<F: Fn(IVec3) -> bool>(
+        lo: IVec3,
+        hi: IVec3,
+        solid: F,
+    ) -> CellMap {
+        let mut cells = CellMap::default();
+        for z in lo.z..hi.z {
+            for y in lo.y..hi.y {
+                for x in lo.x..hi.x {
+                    let c = IVec3::new(x, y, z);
+                    if solid(c) {
+                        cells.insert(c, 0);
+                    }
+                }
+            }
+        }
+        cells
+    }
+
+    /// **Watertight by construction.** Density is a pure local function
+    /// of occupancy within `±DENSITY_KERNEL_R` of each cell, and
+    /// `cells_grid` is populated identically by owned cells and folded
+    /// halo cells. So a boundary cube extracted from two different
+    /// region windows — one owning the cells on the −X side of a seam
+    /// (the +X side supplied as halo), the other owning +X (−X as halo)
+    /// — produces a bit-identical vertex (position AND normal), with no
+    /// welding and no iteration.
+    #[test]
+    fn density_smoothing_boundary_vertices_bit_identical() {
+        let depth: u8 = 6; // extent = 64, plenty for the test region.
+        let nodes = vec![EMPTY_NODE]; // occupancy entirely from the CellMap.
+        let vs = 0.25f32;
+        let origin = Vec3::new(-1.0, 2.0, 0.5);
+
+        // A slanted solid wedge: cell solid iff y < 16 + (x - 16)/2.
+        // Grid-aligned faces would staircase; the density smoother
+        // de-staircases AND must agree on the seam from both sides.
+        let solid = |c: IVec3| -> bool {
+            let surface_y = 16.0 + (c.x as f32 - 16.0) * 0.5;
+            (c.y as f32) < surface_y
+        };
+
+        // Full occupancy over a wide band straddling the seam plane at
+        // x = 24. Build it once; both extracts fold the same cells (as
+        // owned-or-halo) so the seam neighborhood is identical content.
+        let band_lo = IVec3::new(8, 0, 8);
+        let band_hi = IVec3::new(40, 32, 24);
+        let all = occupancy_cellmap(band_lo, band_hi, solid);
+
+        let seam = 24i32;
+
+        // Each extract's region OVERLAPS the seam by ≥ the density
+        // dependency radius so the shared seam cube's neighborhood is
+        // covered by REAL occupancy (no boundary clamp) in BOTH grids.
+        // A cube's vertex depends on density within ~±1 cell (trilinear
+        // + ∇ central diff), and each density value depends on occupancy
+        // within ±DENSITY_KERNEL_R, so the full reach is ~±(R+1) = ±3
+        // cells. We overlap by 4 to leave margin. The seam cells of the
+        // other side that fall in-region are supplied as halo (so they
+        // populate `cells_grid` identically without being owned twice as
+        // quad-emitters — though duplicate-but-identical emission would
+        // also be watertight). This mirrors the terrain halo-refresh
+        // slab extract, which reaches into the neighbour by the halo
+        // width on the side it is refreshing.
+        const OVERLAP: i32 = 4;
+
+        // ── Extract A: owns x < seam; window reaches seam+OVERLAP. ──
+        let a_region_lo = IVec3::new(seam - 8, 4, 10);
+        let a_region_hi = IVec3::new(seam + OVERLAP, 28, 22);
+        let mut cells_a = CellMap::default();
+        let mut halo_a: Vec<(IVec3, u32)> = Vec::new();
+        for (&c, &slot) in all.iter() {
+            if c.x < seam {
+                cells_a.insert(c, slot);
+            } else {
+                halo_a.push((c, slot)); // +X side as halo
+            }
+        }
+        let mut scratch_a = SculptExtractScratch::new();
+        let (verts_a, _idx_a) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut scratch_a,
+            &cells_a,
+            a_region_lo,
+            a_region_hi,
+            &nodes,
+            depth,
+            vs,
+            origin,
+            &[],
+            &[],
+            &[],
+            &halo_a,
+            None,
+            None::<&fn(Vec3) -> f32>,
+        );
+
+        // ── Extract B: owns x ≥ seam; window reaches seam-OVERLAP. ──
+        let b_region_lo = IVec3::new(seam - OVERLAP, 4, 10);
+        let b_region_hi = IVec3::new(seam + 8, 28, 22);
+        let mut cells_b = CellMap::default();
+        let mut halo_b: Vec<(IVec3, u32)> = Vec::new();
+        for (&c, &slot) in all.iter() {
+            if c.x >= seam {
+                cells_b.insert(c, slot);
+            } else {
+                halo_b.push((c, slot)); // −X side as halo
+            }
+        }
+        let mut scratch_b = SculptExtractScratch::new();
+        let (verts_b, _idx_b) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut scratch_b,
+            &cells_b,
+            b_region_lo,
+            b_region_hi,
+            &nodes,
+            depth,
+            vs,
+            origin,
+            &[],
+            &[],
+            &[],
+            &halo_b,
+            None,
+            None::<&fn(Vec3) -> f32>,
+        );
+
+        // Collect vertices of the SHARED seam cube — the one whose
+        // lo-corner is x = seam-1 (corner cells seam-1 and seam). Its
+        // vertex grid-x lands strictly inside (seam-0.5, seam+0.5): an
+        // X-edge crossing interpolates between cell-centers seam-0.5
+        // and seam+0.5, and the smoothed centroid stays inside that
+        // open interval. Cubes at lo-x seam-2 (grid-x ≤ seam-0.5) and
+        // lo-x seam (grid-x ≥ seam+0.5) are excluded, so this picks
+        // exactly the cubes both extracts share. Both must emit them
+        // bit-identically (watertight).
+        let collect_seam = |verts: &[MeshVertex]| -> Vec<MeshVertex> {
+            let mut v: Vec<MeshVertex> = verts
+                .iter()
+                .filter(|v| {
+                    let gx = (v.local_pos[0] - origin.x) / vs;
+                    gx > seam as f32 - 0.5 + 1e-4 && gx < seam as f32 + 0.5 - 1e-4
+                })
+                .copied()
+                .collect();
+            v.sort_by(|a, b| {
+                a.local_pos
+                    .partial_cmp(&b.local_pos)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            v
+        };
+        let seam_a = collect_seam(&verts_a);
+        let seam_b = collect_seam(&verts_b);
+
+        assert!(
+            !seam_a.is_empty(),
+            "expected boundary vertices on the seam plane (got none)"
+        );
+        assert_eq!(
+            seam_a.len(),
+            seam_b.len(),
+            "seam vertex count differs across the two extracts: {} vs {}",
+            seam_a.len(),
+            seam_b.len()
+        );
+        for (va, vb) in seam_a.iter().zip(seam_b.iter()) {
+            // Bit-identical positions AND normals — the watertight
+            // guarantee. `==` on the f32 bit-pattern (via the derived
+            // PartialEq on the [f32;3] / u32 fields).
+            assert_eq!(
+                va.local_pos, vb.local_pos,
+                "seam vertex position diverged: {:?} vs {:?}",
+                va.local_pos, vb.local_pos
+            );
+            assert_eq!(
+                va.normal_oct, vb.normal_oct,
+                "seam vertex normal diverged at {:?}",
+                va.local_pos
+            );
+        }
+    }
+
+    /// DIAGNOSTIC PROBE (terrace facet). Synthesize a GENTLE,
+    /// non-grid-aligned slope `solid iff world_y < 0.37*x + 0.21` over a
+    /// ~40-cell-wide region at voxel size 1.0, run the SAME blur + extract
+    /// path, then PRINT the extracted vertex (x, y) profile sorted by x —
+    /// plus, for a handful of surface cubes, the actual da/db sdf values
+    /// and the clamped t on the vertical (Y) edges. This decides whether
+    /// the extracted-Y is a smooth ramp tracking the analytic slope or
+    /// quantized into terraces, and whether the t values vary sub-voxel
+    /// or are stuck near 0.5 / clamped to 0 or 1.
+    #[ignore]
+    #[test]
+    fn probe_gentle_slope_vertex_profile() {
+        let depth: u8 = 7; // extent = 128.
+        let nodes = vec![EMPTY_NODE];
+        let vs = 1.0f32;
+        let origin = Vec3::ZERO;
+
+        // Gentle slope: solid iff world_y < 0.37*x + 0.21. With vs=1 and
+        // origin=0, world coords == grid (cell) coords, and the cell
+        // CENTER of cell c is (c + 0.5). Classify by the cell center so
+        // the analytic surface is well-defined per cell.
+        let m = 0.37f32; // slope d(y)/d(x)
+        let b = 0.21f32; // intercept
+        let surf_y = |x: f32| m * x + b; // analytic surface height at world-x
+        let solid = |c: IVec3| -> bool {
+            let cx = c.x as f32 + 0.5;
+            let cy = c.y as f32 + 0.5;
+            cy < surf_y(cx)
+        };
+
+        // ~40 cells wide in X. surf_y over x∈[0,40) spans y∈[0.21, 15.0],
+        // so a Y band of [-4, 22) safely brackets the surface plus halo.
+        let band_lo = IVec3::new(-4, -4, -4);
+        let band_hi = IVec3::new(44, 22, 8);
+        let cells = occupancy_cellmap(band_lo, band_hi, solid);
+
+        // Region well inside the band so the density neighborhood is real
+        // occupancy (no boundary clamp) for the cubes we inspect.
+        let region_lo = IVec3::new(2, -2, 0);
+        let region_hi = IVec3::new(38, 20, 6);
+        let mut scratch = SculptExtractScratch::new();
+        let (verts, _indices) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut scratch,
+            &cells,
+            region_lo,
+            region_hi,
+            &nodes,
+            depth,
+            vs,
+            origin,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None::<&fn(Vec3) -> f32>,
+        );
+        assert!(!verts.is_empty(), "slope produced no surface vertices");
+
+        // --- Vertex (x, y) profile of the slope-TOP surface, by x. ---
+        // Pick one representative vertex per integer world-x column on the
+        // top face (normal predominantly +Y), at a fixed z slice, so the
+        // ramp is 1-D and easy to read.
+        let mut top: Vec<(f32, f32, f32)> = Vec::new(); // (x, y_extracted, y_true)
+        for v in &verts {
+            let nrm = unpack_oct(v.normal_oct).normalize();
+            if nrm.y <= 0.6 {
+                continue; // skip side/bottom walls
+            }
+            let p = v.local_pos;
+            // Single z column (z near 2.0) so the profile is 1-D.
+            if (p[2] - 2.0).abs() > 0.51 {
+                continue;
+            }
+            // The surface the extractor targets is D=0.5, classified by
+            // cell-center occupancy. The geometric crossing for our slope
+            // sits at world_y where the column transitions solid→empty:
+            // the last solid cell-center is below surf_y(x); the SN cube
+            // grid-corner is at integer y. Report the analytic surface for
+            // reference (the GRID-CORNER y where occupancy flips), i.e.
+            // surf_y at this x minus 0.5 (cell-center → grid-corner offset
+            // is not exact for a slope, but close enough to read terracing).
+            top.push((p[0], p[1], surf_y(p[0]) - 0.5));
+        }
+        top.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        eprintln!("\n=== GENTLE-SLOPE VERTEX PROFILE (vs=1.0, slope=0.37, z~2) ===");
+        eprintln!("   world_x   y_extract   y_true   residual   d(y_extract)");
+        let mut prev_y: Option<f32> = None;
+        let mut distinct_y: std::collections::BTreeSet<i64> = Default::default();
+        let mut resid_sq = 0.0f32;
+        let mut resid_n = 0u32;
+        for &(x, y, yt) in &top {
+            let dy = prev_y.map(|py| y - py).unwrap_or(0.0);
+            eprintln!(
+                "  {:8.3}   {:8.4}   {:7.4}   {:+8.4}   {:+8.4}",
+                x, y, yt, y - yt, dy
+            );
+            prev_y = Some(y);
+            // Quantize extracted-y to 1/100 to count distinct levels.
+            distinct_y.insert((y * 100.0).round() as i64);
+            resid_sq += (y - yt) * (y - yt);
+            resid_n += 1;
+        }
+        let rms = if resid_n > 0 {
+            (resid_sq / resid_n as f32).sqrt()
+        } else {
+            0.0
+        };
+        eprintln!(
+            "--- profile: {} columns, {} distinct y-levels (1/100 res), RMS residual {:.4} (vs={}) ---",
+            top.len(),
+            distinct_y.len(),
+            rms,
+            vs
+        );
+
+        // --- Reproduce build_cube_vertex's crossing math for a handful of
+        // surface cubes: print da/db and clamped t on the VERTICAL (Y)
+        // edges. This reads the SAME density grid the extractor built. ---
+        //
+        // Rebuild the density sampler from scratch's now-populated buffers.
+        let g_origin = scratch.cells_grid.origin();
+        let g_size = scratch.cells_grid.size();
+        let total =
+            (g_size.x as usize) * (g_size.y as usize) * (g_size.z as usize);
+        let density = &scratch.density[..total];
+        let density_at = |p_grid: Vec3| -> f32 {
+            sample_density_trilinear(density, g_origin, g_size, p_grid)
+        };
+        let smooth_sdf = |p_world: Vec3| -> f32 {
+            let g = (p_world - origin) / vs;
+            DENSITY_ISO - density_at(g)
+        };
+
+        eprintln!("\n=== VERTICAL-EDGE CROSSING (da, db, t) for surface cubes at z=2 ===");
+        eprintln!("  cube(x,y,z)  a_corner_solid b_corner_solid  da        db        t");
+        // For each x column, find the cube whose vertical edge straddles
+        // the surface (a-corner solid, b-corner empty, by BINARY occupancy
+        // — exactly what corner_solid uses).
+        let cell_solid = |c: IVec3| cells.contains_key(&c);
+        let z_fixed = 2;
+        for cx in 5..35 {
+            // Find the y where the binary column flips solid→empty.
+            let mut flip_y: Option<i32> = None;
+            for cy in -2..20 {
+                let here = cell_solid(IVec3::new(cx, cy, z_fixed));
+                let above = cell_solid(IVec3::new(cx, cy + 1, z_fixed));
+                if here && !above {
+                    flip_y = Some(cy);
+                    break;
+                }
+            }
+            let Some(fy) = flip_y else { continue };
+            // The SN cube with lo-corner (cx, fy, z_fixed): its +Y edge on
+            // the x=cx, z=z_fixed corner goes from corner (cx,fy,zf) [solid]
+            // to (cx, fy+1, zf) [empty]. Replicate the SDF crossing.
+            let cube = IVec3::new(cx, fy, z_fixed);
+            // corner_offset for the local x=0,z=0 column: a at y=0, b at y=1.
+            let pa = Vec3::new(
+                cube.x as f32 + 0.5,
+                cube.y as f32 + 0.5,
+                cube.z as f32 + 0.5,
+            );
+            let pb = Vec3::new(
+                cube.x as f32 + 0.5,
+                cube.y as f32 + 1.0 + 0.5,
+                cube.z as f32 + 0.5,
+            );
+            let da = smooth_sdf(origin + pa * vs);
+            let db = smooth_sdf(origin + pb * vs);
+            let denom = da - db;
+            let t = if denom.abs() > 1e-12 {
+                (da / denom).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            let a_solid = cell_solid(IVec3::new(cube.x, cube.y, cube.z));
+            let b_solid = cell_solid(IVec3::new(cube.x, cube.y + 1, cube.z));
+            eprintln!(
+                "  ({:3},{:3},{:3})       {:5}          {:5}      {:+7.4}  {:+7.4}  {:.4}",
+                cube.x, cube.y, cube.z, a_solid, b_solid, da, db, t
+            );
+        }
+        eprintln!("=== END PROBE ===\n");
+    }
+
+    /// **Smooth + outward normals.** A synthetic occupancy slope
+    /// extracts to low staircase RMS (the density isosurface
+    /// de-staircases the grid-aligned faces) and every surface normal
+    /// points away from the solid (outward), with `+Y`-ish on a
+    /// solid-below / empty-above slab.
+    #[test]
+    fn density_smoothing_slope_is_smooth_and_outward() {
+        let depth: u8 = 6;
+        let nodes = vec![EMPTY_NODE];
+        let vs = 0.5f32;
+        let origin = Vec3::ZERO;
+
+        // Solid below a gentle plane: y < 20 + (x-16)*0.4 + (z-16)*0.2.
+        // The true surface normal is normalize((-0.4, 1, -0.2)) — mostly
+        // +Y, tilted slightly −X / −Z. Outward = toward empty (+ side).
+        let nx = -0.4f32;
+        let nz = -0.2f32;
+        let solid = |c: IVec3| -> bool {
+            let surf = 20.0 + (c.x as f32 - 16.0) * (-nx) + (c.z as f32 - 16.0) * (-nz);
+            (c.y as f32) < surf
+        };
+        let band_lo = IVec3::new(4, 0, 4);
+        let band_hi = IVec3::new(40, 36, 40);
+        let cells = occupancy_cellmap(band_lo, band_hi, solid);
+
+        let region_lo = IVec3::new(10, 6, 10);
+        let region_hi = IVec3::new(34, 34, 34);
+        let mut scratch = SculptExtractScratch::new();
+        let (verts, indices) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut scratch,
+            &cells,
+            region_lo,
+            region_hi,
+            &nodes,
+            depth,
+            vs,
+            origin,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None::<&fn(Vec3) -> f32>,
+        );
+        assert!(!verts.is_empty(), "slope produced no surface vertices");
+
+        // Analytic surface for the slope (in world coords). For a
+        // vertex at world (x, _, z) the true surface y is:
+        //   y = origin.y + vs * (20 + (gx-16)*(-nx) + (gz-16)*(-nz))
+        // where gx = (x-origin.x)/vs. The smoothed surface should sit
+        // close to this plane → low RMS, NOT the ±vs staircase a naive
+        // grid-aligned extract would produce.
+        let true_surface_y = |wx: f32, wz: f32| -> f32 {
+            let gx = (wx - origin.x) / vs;
+            let gz = (wz - origin.z) / vs;
+            origin.y + vs * (20.0 + (gx - 16.0) * (-nx) + (gz - 16.0) * (-nz))
+        };
+
+        // RMS of the vertical residual over the top (slope) surface.
+        // Restrict to vertices on the slope face (skip the side/bottom
+        // walls of the extracted block, whose residual vs the *top*
+        // plane is meaningless). A vertex is "on the slope" when its
+        // normal is predominantly +Y.
+        let mut sq_sum = 0.0f32;
+        let mut count = 0u32;
+        let true_n = Vec3::new(nx, 1.0, nz).normalize();
+        let mut min_outward_dot = f32::INFINITY;
+        for v in &verts {
+            let nrm = unpack_oct(v.normal_oct).normalize();
+            // Slope-top face: normal close to +Y. (Side faces of the
+            // finite extracted block point ±X/±Z and are excluded.)
+            if nrm.y > 0.6 {
+                let p = Vec3::from(v.local_pos);
+                let resid = p.y - true_surface_y(p.x, p.z);
+                sq_sum += resid * resid;
+                count += 1;
+                // Outward-ness: the slope-top normal must agree with the
+                // analytic outward normal (away from the solid below).
+                min_outward_dot = min_outward_dot.min(nrm.dot(true_n));
+            }
+        }
+        assert!(count > 0, "found no slope-top vertices to check");
+        let rms = (sq_sum / count as f32).sqrt();
+        // A naive grid-aligned extract staircases with RMS ≈ vs/√12 ≈
+        // 0.14·vs at best and far worse on the terraces. The density
+        // isosurface should sit well under a quarter-voxel.
+        assert!(
+            rms < 0.25 * vs,
+            "slope staircase RMS {:.4} too high (>{:.4} = 0.25·vs) — not smooth",
+            rms,
+            0.25 * vs
+        );
+
+        // Outward normals: every slope-top normal points away from the
+        // solid (toward empty). On a solid-below / empty-above slab the
+        // outward direction is +Y-tilted; require strong agreement with
+        // the analytic outward normal.
+        assert!(
+            min_outward_dot > 0.9,
+            "slope-top normal not outward enough: min dot with analytic \
+             outward normal {:.3} (want > 0.9)",
+            min_outward_dot
+        );
+        // And specifically +Y-dominant (outward should be +Y on a
+        // solid-below slab, the sign the plan calls out).
+        for v in &verts {
+            let nrm = unpack_oct(v.normal_oct).normalize();
+            if nrm.y > 0.6 {
+                assert!(
+                    nrm.y > 0.0,
+                    "slope-top outward normal has non-positive Y: {nrm:?}"
+                );
+            }
+        }
+        // Sanity: indices reference real verts.
+        for &i in &indices {
+            assert!((i as usize) < verts.len());
+        }
+    }
+
+    /// **No per-voxel normal speckle.** Normals come from interpolating
+    /// the precomputed grid-point gradient field (which is C0), NOT from
+    /// differentiating the trilinear density at the vertex (whose
+    /// gradient is piecewise-constant and DISCONTINUOUS across cells).
+    /// On a smooth occupancy sphere the angle between the two endpoint
+    /// normals of every triangle edge must stay small — a continuous
+    /// field. The old differentiate-trilinear approach flips the normal
+    /// cell-to-cell and would blow past this bound.
+    #[test]
+    fn density_normals_are_continuous_no_voxel_speckle() {
+        let depth: u8 = 7; // extent = 128.
+        let nodes = vec![EMPTY_NODE];
+        let vs = 0.5f32;
+        let origin = Vec3::ZERO;
+
+        // A gentle, NON-grid-aligned planar slope. Its true surface
+        // curvature is ~zero, so the normal is (nearly) constant over
+        // the whole surface — every triangle edge SHOULD see a sub-degree
+        // normal change. Any edge that flips by a large angle is
+        // voxel-scale speckle, i.e. the discontinuous gradient that
+        // differentiating the trilinear density produces cell-to-cell.
+        // This is the cleanest discriminator: with the interpolated
+        // grid-point gradient field the edges stay tight; the old
+        // differentiate-trilinear normal would show a bimodal spread
+        // with a large mass of edges past the threshold.
+        let nx = 0.35f32;
+        let nz = 0.20f32;
+        let solid = |c: IVec3| -> bool {
+            // Solid below y = 64 + nx*(x-64) + nz*(z-64).
+            let surf = 64.0 + nx * (c.x as f32 - 64.0) + nz * (c.z as f32 - 64.0);
+            (c.y as f32) < surf
+        };
+        let band_lo = IVec3::new(24, 0, 24);
+        let band_hi = IVec3::new(104, 100, 104);
+        let cells = occupancy_cellmap(band_lo, band_hi, solid);
+
+        let region_lo = IVec3::new(36, 36, 36);
+        let region_hi = IVec3::new(92, 92, 92);
+        let mut scratch = SculptExtractScratch::new();
+        let (verts, indices) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut scratch,
+            &cells,
+            region_lo,
+            region_hi,
+            &nodes,
+            depth,
+            vs,
+            origin,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None::<&fn(Vec3) -> f32>,
+        );
+        assert!(!verts.is_empty(), "slope produced no surface vertices");
+        assert!(!indices.is_empty(), "slope produced no triangles");
+
+        // Per-edge normal-angle check over the INTERIOR of the slope-top
+        // surface. We restrict to vertices comfortably inside the
+        // extracted block in X/Z (away from its ±X/±Z side walls and the
+        // grid-boundary clamp, where the surface legitimately curves
+        // toward the walls) and select slope-top vertices (normal
+        // predominantly +Y). The true surface there has ~zero curvature,
+        // so a CONTINUOUS normal field keeps every edge to a small angle.
+        // A discontinuous (per-voxel speckled) normal — what
+        // differentiating the trilinear density produces — flips abruptly
+        // between cell-adjacent verts and blows past the bound.
+        let max_angle_deg = 15.0f32;
+        let max_cos_floor = max_angle_deg.to_radians().cos();
+        // Interior X/Z window in WORLD coords (region [36,92) cells × vs
+        // = [18, 46) world; keep ≥ 6 world units off each X/Z edge).
+        let in_interior = |i: u32| -> bool {
+            let p = verts[i as usize].local_pos;
+            p[0] > 24.0 && p[0] < 40.0 && p[2] > 24.0 && p[2] < 40.0
+        };
+        let is_top = |i: u32| unpack_oct(verts[i as usize].normal_oct).normalize().y > 0.6;
+        let mut worst_deg = 0.0f32;
+        let mut checked = 0u32;
+        let mut edge = |ia: u32, ib: u32| {
+            if !is_top(ia) || !is_top(ib) || !in_interior(ia) || !in_interior(ib) {
+                return;
+            }
+            let na = unpack_oct(verts[ia as usize].normal_oct).normalize();
+            let nb = unpack_oct(verts[ib as usize].normal_oct).normalize();
+            let cos = na.dot(nb).clamp(-1.0, 1.0);
+            let deg = cos.acos().to_degrees();
+            if deg > worst_deg {
+                worst_deg = deg;
+            }
+            checked += 1;
+            assert!(
+                cos >= max_cos_floor,
+                "interior slope-top edge normal angle {deg:.2}° exceeds {max_angle_deg}° \
+                 (na={na:?}, nb={nb:?}) — voxel-scale normal speckle",
+            );
+        };
+        for tri in indices.chunks_exact(3) {
+            edge(tri[0], tri[1]);
+            edge(tri[1], tri[2]);
+            edge(tri[2], tri[0]);
+        }
+        assert!(checked > 0, "no interior slope-top edges were checked");
+        // On the flat interior the true normal is constant, so a
+        // continuous field keeps every edge well under the bound (a few
+        // degrees, modulo oct-pack quantization + the σ=1 blur's
+        // transition-band tilt). A borderline-passing worst angle would
+        // itself indicate residual discontinuity.
+        assert!(
+            worst_deg < 6.0,
+            "worst interior slope-top edge normal angle {worst_deg:.2}° unexpectedly \
+             large — field is not smooth",
         );
     }
 }

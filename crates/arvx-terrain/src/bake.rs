@@ -33,7 +33,14 @@ use glam::Vec3;
 /// data. With both tiles iterating their shared boundary cells, every
 /// boundary cube is referenced by at least one quad in each tile and
 /// the meshes produce identical (overdrawn) triangles at the seam.
-const TILE_HALO_VOXELS: u32 = 2;
+// Widened from 2 → 4 so the seam neighborhood covers the smooth-mesh
+// blur kernel's full reach (DENSITY_KERNEL_R = 2 → ±3 for positions, ±4
+// counting the ∇D normal step). With halo ≥ reach, two tiles share the
+// entire blur neighborhood at their boundary and compute bit-identical
+// seam vertices — watertight smooth meshes with no tile-seam dots.
+// Smoothness away from seams never touches the halo (it reads the tile's
+// own occupancy), so this only affects the cross-tile boundary row.
+const TILE_HALO_VOXELS: u32 = 4;
 
 /// Bake one terrain tile end-to-end: voxelize the `TerrainFn` across
 /// the tile's footprint, compose Layer-2 stamps, extract the surface
