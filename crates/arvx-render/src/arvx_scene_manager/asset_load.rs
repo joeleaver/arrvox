@@ -1002,3 +1002,79 @@ impl ArvxSceneManager {
         }
     }
 }
+
+#[cfg(test)]
+mod load_roundtrip_tests {
+    use super::*;
+
+    /// Voxelize a small sphere into a `BakeArtifact`, write it as a
+    /// `.arvx`, and return the path + the artifact's voxel count.
+    /// Pure CPU — no GPU needed.
+    fn write_sphere_arvx(dir: &std::path::Path) -> (PathBuf, u32) {
+        let voxel_size = 0.1_f32;
+        let radius = 1.0_f32;
+        let natural = arvx_core::Aabb::new(glam::Vec3::splat(-1.6), glam::Vec3::splat(1.6));
+        let aabb = arvx_core::pad_to_pow2_cubic(&natural, voxel_size);
+        let mut sdf = |ps: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+            ps.iter()
+                .map(|p| (p.length() - radius, 0u16, 0u16, 0u8, 0u32))
+                .collect()
+        };
+        let artifact = arvx_core::voxelize_to_artifact(&mut sdf, &aabb, voxel_size, 0)
+            .expect("sphere should voxelize to a non-empty artifact");
+        assert!(artifact.voxel_count > 0);
+        let path = dir.join("sphere.arvx");
+        arvx_core::asset_file::write_artifact_rkp(
+            &path,
+            &artifact,
+            aabb.min.to_array(),
+            aabb.max.to_array(),
+            voxel_size,
+        )
+        .expect("write_artifact_rkp");
+        (path, artifact.voxel_count)
+    }
+
+    /// Safety net for the asset load path (`load_asset_from_disk`):
+    /// pins voxel count, a non-empty octree, a non-empty leaf_attr
+    /// range, the path-keyed cache, and load determinism across fresh
+    /// managers. Any future read/integrate split or chunked integrate
+    /// must keep this green — it catches a silently-corrupted load
+    /// (wrong counts / empty geometry / order-dependent state) that
+    /// the workspace otherwise has no asset-load coverage for.
+    #[test]
+    fn acquire_asset_roundtrips_and_is_deterministic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (path, _) = write_sphere_arvx(tmp.path());
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut sm = ArvxSceneManager::new(1_000_000);
+        let (handle, info) = sm
+            .acquire_asset(&path_str)
+            .expect("acquire_asset should load the written artifact");
+
+        assert!(info.voxel_count > 0, "loaded asset must report voxels");
+        match &info.spatial {
+            arvx_core::scene_node::SpatialHandle::Octree { len, .. } => {
+                assert!(*len > 0, "octree must be non-empty");
+            }
+            other => panic!("expected an Octree spatial, got {other:?}"),
+        }
+        assert!(info.leaf_attr_slot_count > 0, "leaf_attr range must be non-empty");
+
+        // Re-acquiring the same path hits the cache (same handle).
+        let (handle2, info2) = sm.acquire_asset(&path_str).expect("re-acquire");
+        assert_eq!(handle, handle2, "same path must return the cached handle");
+        assert_eq!(info.voxel_count, info2.voxel_count);
+
+        // A fresh manager loads the same file to the same result —
+        // the load must be deterministic (no order-dependent state).
+        let mut sm2 = ArvxSceneManager::new(1_000_000);
+        let (_h, info3) = sm2.acquire_asset(&path_str).expect("fresh-manager load");
+        assert_eq!(
+            info.voxel_count, info3.voxel_count,
+            "load must be deterministic across managers"
+        );
+        assert_eq!(info.leaf_attr_slot_count, info3.leaf_attr_slot_count);
+    }
+}
