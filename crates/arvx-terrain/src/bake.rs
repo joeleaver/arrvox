@@ -594,6 +594,29 @@ mod tests {
         }
     }
 
+    /// A GENTLE planar slope that crosses the seam, in ABSOLUTE world
+    /// coords (so it's continuous across the tile boundary). Returns the
+    /// true point-to-plane Euclidean distance (1-Lipschitz). dh/dx = 0.10
+    /// is the wide-tread regime where the wide-window plane-fit fix is
+    /// MOST active — exactly the case that would crack a seam if the
+    /// shared ring weren't pinned. Used by the with-fix seam tests.
+    struct SlopeHalf;
+    impl TerrainFn for SlopeHalf {
+        fn sample(&self, tile: TileKey, l: Vec3, _v: f32) -> TerrainSample {
+            let o = tile.origin_world().to_vec3();
+            let (wx, wy, wz) = (o.x + l.x, o.y + l.y, o.z + l.z);
+            let (mx, mz) = (0.10f32, 0.035f32);
+            let surf = 32.0 + mx * wx + mz * wz;
+            let grad = (1.0 + mx * mx + mz * mz).sqrt();
+            TerrainSample {
+                sd: (wy - surf) / grad,
+                primary_mat: 1,
+                secondary_mat: 1,
+                blend: 0.0,
+            }
+        }
+    }
+
     #[test]
     fn bake_all_sky_returns_empty_mesh() {
         let t = Terrain::default();
@@ -989,6 +1012,153 @@ mod tests {
             boundary_a.len(),
             boundary_b.len(),
             "boundary vertex counts must match across the FBM seam"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // SEAM × wide-window plane-fit FIX (the production default-ON path).
+    //
+    // The fix gathers surface verts within r=5 voxels and projects them
+    // onto a local plane. At a tile boundary that window reaches into the
+    // neighbour tile, which this tile didn't mesh that deep — so without
+    // pinning, the SHARED seam ring would project to DIFFERENT positions
+    // in A vs B → a crack. These tests bake two adjacent tiles through
+    // the PRODUCTION path (fix on) and assert the shared seam ring is
+    // still watertight (bit-identical within 1 mm), because the seam ring
+    // is PINNED. The flat case has no ripple (fix ~no-op there); the
+    // SLOPE and FBM cases have the fix ACTIVELY moving near-seam interior
+    // verts, so they are the real test of the pin.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Helper: assert tiles A and B meet watertight on the shared
+    /// `x = 64 m` face. `band` is the seam-plane capture band.
+    fn assert_seam_watertight(
+        baked_a: &BakedTile,
+        baked_b: &BakedTile,
+        band: f32,
+        tol: f32,
+        ctx: &str,
+    ) {
+        let band_centre = 64.0;
+        let boundary_a = collect_boundary_verts(baked_a, band, band_centre);
+        let boundary_b = collect_boundary_verts(baked_b, band, band_centre);
+        assert!(
+            !boundary_a.is_empty() && !boundary_b.is_empty(),
+            "{ctx}: both tiles must produce seam vertices (A={}, B={})",
+            boundary_a.len(),
+            boundary_b.len(),
+        );
+        let max_a_to_b = max_nearest_distance(&boundary_a, &boundary_b);
+        let max_b_to_a = max_nearest_distance(&boundary_b, &boundary_a);
+        assert!(
+            max_a_to_b <= tol && max_b_to_a <= tol,
+            "{ctx}: seam NOT watertight with the plane-fit fix on \
+             (max A→B={max_a_to_b:.5} m, B→A={max_b_to_a:.5} m, tol={tol:.5}, \
+             |A|={}, |B|={}) — the shared ring was not pinned",
+            boundary_a.len(),
+            boundary_b.len(),
+        );
+        assert_eq!(
+            boundary_a.len(),
+            boundary_b.len(),
+            "{ctx}: seam vertex counts must match across the boundary",
+        );
+    }
+
+    /// FLAT tiles, fix default-ON: seam stays watertight. (The fix is a
+    /// near-no-op on a flat surface, but this pins the no-regression.)
+    #[test]
+    fn adjacent_flat_tiles_watertight_with_planefit() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+        let surface = FlatHalf;
+        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &surface, &[], &empty_regions()).expect("bake A");
+        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &surface, &[], &empty_regions()).expect("bake B");
+        assert_seam_watertight(&baked_a, &baked_b, vs * 0.05, 1e-3, "flat+planefit");
+    }
+
+    /// GENTLE-SLOPE tiles, fix default-ON: the fix is MAXIMALLY active
+    /// near the seam (wide-tread ripple removal), yet the pinned shared
+    /// ring keeps the seam watertight. THIS is the test the single-grid
+    /// watertight check missed.
+    #[test]
+    fn adjacent_slope_tiles_watertight_with_planefit() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+        let surface = SlopeHalf;
+        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &surface, &[], &empty_regions()).expect("bake A");
+        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &surface, &[], &empty_regions()).expect("bake B");
+        // Only vertices landing exactly on the shared `x = 64 m` plane are
+        // SHARED across tiles (a tight 1 mm band, like the FBM test).
+        // Near-seam interior vertices (slope-shifted centroids inside one
+        // tile) are NOT shared and are legitimately moved by the fix — a
+        // wide band would wrongly capture those. The shared ring must stay
+        // pinned → bit-identical.
+        assert_seam_watertight(&baked_a, &baked_b, 1e-3, 1e-3, "slope+planefit");
+    }
+
+    /// FBM tiles, fix default-ON: realistic terrain, fix active, seam
+    /// watertight. Mirrors `adjacent_fbm_tiles_meet_at_shared_face` but
+    /// is an explicit with-fix regression guard.
+    #[test]
+    fn adjacent_fbm_tiles_watertight_with_planefit() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+        let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
+        let baked_a = bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake A");
+        let baked_b = bake_tile(TileKey::level0(1, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake B");
+        assert_seam_watertight(&baked_a, &baked_b, 1e-3, 1e-3, "fbm+planefit");
+    }
+
+    /// DIRECT PIN PROOF: on the gentle slope, the shared seam-plane
+    /// vertices are IDENTICAL whether the fix is on or off — i.e. the fix
+    /// did NOT move them (they were pinned). This validates the pin
+    /// mechanism itself (not just that A and B agree, which a buggy fix
+    /// could achieve by moving both sides the same wrong way). Meanwhile
+    /// off-seam interior verts MUST move (proving the fix is actually
+    /// running and de-rippling near the seam).
+    #[test]
+    fn slope_seam_ring_is_pinned_not_moved() {
+        use arvx_core::mesh_extract::set_wide_window_project;
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+        let surface = SlopeHalf;
+
+        // Baseline (fix off) and production (fix on) for the same tile.
+        set_wide_window_project(Some(0.0));
+        let off = bake_tile(TileKey::level0(0, 0, 0), vs, &surface, &[], &empty_regions()).expect("bake off");
+        set_wide_window_project(None);
+        let on = bake_tile(TileKey::level0(0, 0, 0), vs, &surface, &[], &empty_regions()).expect("bake on");
+
+        // Seam-plane vertices (x = 64 m, the tile's +X face): must be
+        // bit-identical on/off — the pin held them.
+        let seam_off = collect_boundary_verts(&off, 1e-3, 64.0);
+        let seam_on = collect_boundary_verts(&on, 1e-3, 64.0);
+        assert!(!seam_off.is_empty(), "expected seam-plane vertices");
+        assert_eq!(
+            seam_off.len(),
+            seam_on.len(),
+            "fix changed the seam-plane vertex COUNT — pin failed"
+        );
+        let max_moved = max_nearest_distance(&seam_on, &seam_off);
+        assert!(
+            max_moved <= 1e-4,
+            "seam-ring vertices MOVED by the fix (max {max_moved:.6} m) — pin failed",
+        );
+
+        // Sanity: the fix IS active — the interior surface moved somewhere
+        // (otherwise the test would pass trivially on a no-op fix).
+        let interior_moved = {
+            // Compare the full LOD-0 vertex set centroids off vs on far
+            // from the seam (x < 50 m): some vertex must have moved.
+            let band_off = collect_boundary_verts(&off, 8.0, 40.0);
+            let band_on = collect_boundary_verts(&on, 8.0, 40.0);
+            max_nearest_distance(&band_on, &band_off)
+        };
+        assert!(
+            interior_moved > 1e-3,
+            "fix appears inactive (interior didn't move, {interior_moved:.6} m) — \
+             test would be vacuous",
         );
     }
 

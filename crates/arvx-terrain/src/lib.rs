@@ -20,6 +20,7 @@ pub mod fbm;
 pub mod persist;
 pub mod physics_policy;
 pub mod region_snapshot;
+pub mod repro;
 pub mod sculpt_diff;
 pub mod sculpt_diff_persist;
 pub mod stamp;

@@ -1163,6 +1163,59 @@ impl Camera {
         }
     }
 
+    /// 3/4 perspective framing a shape of `radius` world units centred at
+    /// `center` (for off-origin terrain windows). Same view direction as
+    /// [`Self::three_quarter`].
+    pub fn three_quarter_framing(width: u32, height: u32, center: Vec3, radius: f32) -> Self {
+        let dir = Vec3::new(0.6, 0.5, 0.75).normalize();
+        let eye = center + dir * (radius * 3.2);
+        let view = glam::Mat4::look_at_rh(eye, center, Vec3::Y);
+        let aspect = width as f32 / height as f32;
+        let proj = glam::Mat4::perspective_rh(45f32.to_radians(), aspect, 0.1, 10000.0);
+        Self {
+            view,
+            proj,
+            width: width as f32,
+            height: height as f32,
+            ortho: false,
+        }
+    }
+
+    /// Side orthographic framing `radius` world units centred at `center`,
+    /// looking down -Z (terracing/ripple reads as horizontal steps in the
+    /// profile). For off-origin terrain windows.
+    pub fn side_ortho_framing(width: u32, height: u32, center: Vec3, radius: f32) -> Self {
+        let eye = center + Vec3::new(0.0, 0.0, radius * 4.0);
+        let view = glam::Mat4::look_at_rh(eye, center, Vec3::Y);
+        let h = radius * 1.15;
+        let aspect = width as f32 / height as f32;
+        let proj = glam::Mat4::orthographic_rh(-h * aspect, h * aspect, -h, h, 0.1, 10000.0);
+        Self {
+            view,
+            proj,
+            width: width as f32,
+            height: height as f32,
+            ortho: true,
+        }
+    }
+
+    /// Side orthographic with INDEPENDENT horizontal / vertical
+    /// half-extents centred at `center`. Lets a profile view magnify Y
+    /// (small `half_y`) so a gentle slope's surface band fills the frame
+    /// and low-amplitude "smooth stairs" become visible. Looks down -Z.
+    pub fn side_ortho_xy(width: u32, height: u32, center: Vec3, half_x: f32, half_y: f32) -> Self {
+        let eye = center + Vec3::new(0.0, 0.0, half_x.max(half_y) * 8.0);
+        let view = glam::Mat4::look_at_rh(eye, center, Vec3::Y);
+        let proj = glam::Mat4::orthographic_rh(-half_x, half_x, -half_y, half_y, 0.1, 100000.0);
+        Self {
+            view,
+            proj,
+            width: width as f32,
+            height: height as f32,
+            ortho: true,
+        }
+    }
+
     /// Project world point → (screen_x, screen_y, depth). Depth is NDC
     /// z (smaller = nearer) used for the z-buffer.
     #[inline]
@@ -1419,12 +1472,510 @@ fn bresenham(
 }
 
 // ════════════════════════════════════════════════════════════════════
+// 5. TERRAIN-BAKE-PATH reproduction (smooth-stairs hunt)
+// ════════════════════════════════════════════════════════════════════
+//
+// Everything above drives the SCULPT/region extract
+// (`extract_mesh_region_from_cells_pooled_haloed`) on a hand-built
+// `CellMap`. The USER'S TERRAIN, however, bakes through a DIFFERENT
+// path: `voxelize_to_artifact` (octree + bricks + halo) →
+// `extract_surface_mesh_density_haloed`. To reproduce the residual
+// "smooth stairs" the user reports on gentle slopes we must mesh through
+// THAT path, on terrain-like (gentle-slope + FBM) heightfields, and
+// measure a LOW-FREQUENCY ripple metric (not just the existing
+// high-frequency `roughness`, which misses wide flat treads).
+
+use crate::mesh_extract::extract_surface_mesh_density_haloed;
+use crate::voxelize_octree::voxelize_to_artifact;
+
+/// Terrain halo the real bake uses (`bake.rs::TILE_HALO_VOXELS`).
+pub const REPRO_TILE_HALO: u32 = 4;
+
+/// A terrain-like heightfield `y = h(x, z)`. The solid is everything at
+/// or below the surface (`sdf = world_y - h(x,z)`, the vertical-gap sign
+/// field the real terrain bake uses). Closures are boxed so a single
+/// type covers gentle slopes and FBM.
+pub struct HeightField {
+    pub name: String,
+    /// Surface height at horizontal `(x, z)`.
+    pub h: Box<dyn Fn(f32, f32) -> f32 + Send + Sync>,
+}
+
+impl HeightField {
+    /// Gentle planar slope `y = mx·x + mz·z`. `mz` is a small off-axis
+    /// tilt so the slope is never grid-aligned (a grid-aligned slope can
+    /// hide ripple behind exact lattice coincidence). `dh/dx ≈ mx`.
+    pub fn gentle_slope(mx: f32, mz: f32) -> Self {
+        HeightField {
+            name: format!("slope_dhdx{}", fmt_vs(mx)),
+            h: Box::new(move |x, z| mx * x + mz * z),
+        }
+    }
+
+    /// Gentle FBM terrain: a few octaves of value-noise, overall gentle
+    /// (amplitude/wavelength chosen so the dominant slope stays ≲ 0.25 —
+    /// like real rolling terrain, NOT cliffs). Matches the spirit of the
+    /// engine's `FbmTerrainFn` but is self-contained for the bench.
+    pub fn fbm() -> Self {
+        HeightField {
+            name: "fbm".into(),
+            h: Box::new(|x, z| fbm_height(x, z)),
+        }
+    }
+}
+
+/// Value-noise FBM height. 3 octaves, GENTLE — chosen to mimic real
+/// rolling terrain (the engine's `FbmTerrainFn` default has scale_m=120,
+/// i.e. a very wide base wavelength). Base wavelength ~16 world units,
+/// amplitude ~1.2; each octave halves wavelength + amplitude. The wide
+/// base keeps the dominant slope gentle (≲ 0.2) so this is a fair
+/// curvature-preservation control for the wide-window fix — a tight
+/// (small-wavelength) FBM would be unrealistically high-curvature and
+/// over-penalise any plane-fit smoothing.
+pub fn fbm_height(x: f32, z: f32) -> f32 {
+    let mut h = 0.0f32;
+    let mut amp = 1.2f32;
+    let mut freq = 1.0f32 / 16.0;
+    for _ in 0..3 {
+        h += amp * value_noise2(x * freq, z * freq);
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    h
+}
+
+/// Smooth 2-D value noise in `[-1, 1]`, lattice + quintic fade +
+/// bilinear of per-lattice-point hashes. Self-contained.
+fn value_noise2(x: f32, z: f32) -> f32 {
+    let xi = x.floor();
+    let zi = z.floor();
+    let xf = x - xi;
+    let zf = z - zi;
+    let fade = |t: f32| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    let u = fade(xf);
+    let v = fade(zf);
+    let g = |ix: f32, iz: f32| -> f32 {
+        // Hash lattice point → [-1, 1].
+        let h = hash01(ix as i32, iz as i32);
+        h * 2.0 - 1.0
+    };
+    let c00 = g(xi, zi);
+    let c10 = g(xi + 1.0, zi);
+    let c01 = g(xi, zi + 1.0);
+    let c11 = g(xi + 1.0, zi + 1.0);
+    let a = c00 + (c10 - c00) * u;
+    let b = c01 + (c11 - c01) * u;
+    a + (b - a) * v
+}
+
+/// Output of a heightfield bake/region mesh + the bake inputs needed to
+/// render it (matches [`Occupancy`]'s renderable fields).
+pub struct HeightMesh {
+    pub verts: Vec<MeshVertex>,
+    pub indices: Vec<u32>,
+    pub grid_origin: Vec3,
+    pub voxel_size: f32,
+    /// The cell-grid origin/size of the SOLID block (for the voxel
+    /// overlay render) — a faithful sub-sample, not the whole tile.
+    pub surface_cells: CellMap,
+}
+
+impl HeightMesh {
+    /// Wrap as an [`Occupancy`] so the existing `render` works unchanged.
+    pub fn as_occupancy(&self) -> Occupancy {
+        // region_min/max only gate the voxel-overlay bbox; derive from
+        // the surface cells.
+        let (mut lo, mut hi) = (IVec3::splat(i32::MAX), IVec3::splat(i32::MIN));
+        for &c in self.surface_cells.keys() {
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
+        if self.surface_cells.is_empty() {
+            lo = IVec3::ZERO;
+            hi = IVec3::ZERO;
+        }
+        Occupancy {
+            cells: self.surface_cells.clone(),
+            grid_origin: self.grid_origin,
+            voxel_size: self.voxel_size,
+            region_min: lo - IVec3::splat(2),
+            region_max: hi + IVec3::splat(3),
+        }
+    }
+}
+
+/// Build a pow2-cubic tile AABB for the heightfield. The tile is
+/// centered on the origin in X/Z and tall enough in Y to bracket the
+/// surface + a solid block below + the halo. `extent_cells` is forced to
+/// a power of two (the bake contract).
+fn heightfield_tile_aabb(half_world: f32, voxel_size: f32) -> Aabb {
+    // Cells across the full 2*half_world span, rounded up to pow2.
+    let cells = ((2.0 * half_world) / voxel_size).ceil().max(1.0) as u32;
+    let pow2 = cells.next_power_of_two();
+    let extent = pow2 as f32 * voxel_size;
+    // Center the cube on origin; min snapped to the voxel grid.
+    let snap = |v: f32| (v / voxel_size).floor() * voxel_size;
+    let min = Vec3::splat(snap(-extent * 0.5));
+    Aabb::new(min, min + Vec3::splat(extent))
+}
+
+/// Collect the SURFACE (boundary) cells of a heightfield into a CellMap
+/// for the voxel overlay render — every solid cell whose `+Y` neighbor
+/// is empty (the top shell). Cheap, faithful, and avoids materializing
+/// the whole solid block.
+fn heightfield_surface_cells(
+    hf: &HeightField,
+    aabb: &Aabb,
+    voxel_size: f32,
+) -> CellMap {
+    let origin = aabb.min;
+    let n = ((aabb.max.x - aabb.min.x) / voxel_size).round() as i32;
+    let mut cells = CellMap::default();
+    let solid = |cx: i32, cy: i32, cz: i32| -> bool {
+        let c = origin
+            + (Vec3::new(cx as f32, cy as f32, cz as f32) + Vec3::splat(0.5)) * voxel_size;
+        c.y - (hf.h)(c.x, c.z) < 0.0
+    };
+    for cz in 0..n {
+        for cx in 0..n {
+            for cy in 0..n {
+                if solid(cx, cy, cz) && !solid(cx, cy + 1, cz) {
+                    cells.insert(IVec3::new(cx, cy, cz), 0);
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// Mesh a heightfield through the **TERRAIN BAKE PATH**:
+/// `voxelize_to_artifact` (octree + bricks + halo) →
+/// `extract_surface_mesh_density_haloed`. This is the path the user's
+/// terrain actually runs.
+pub fn bake_heightfield(hf: &HeightField, half_world: f32, voxel_size: f32) -> HeightMesh {
+    let aabb = heightfield_tile_aabb(half_world, voxel_size);
+    let h = &hf.h;
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+        positions
+            .iter()
+            .map(|p| {
+                // Vertical-gap sign field, the real terrain bake's SDF.
+                let d = p.y - h(p.x, p.z);
+                (d, 1u16, 1u16, 0u8, 0u32)
+            })
+            .collect()
+    };
+    let artifact = voxelize_to_artifact(sdf_fn, &aabb, voxel_size, REPRO_TILE_HALO)
+        .expect("heightfield voxelize_to_artifact");
+    let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
+    let (verts, indices) = extract_surface_mesh_density_haloed(
+        artifact.octree.as_slice(),
+        artifact.octree.depth(),
+        voxel_size,
+        artifact.grid_origin,
+        &brick_pool_flat,
+        &artifact.leaf_attrs,
+        &[],
+        &artifact.halo_cells,
+        REPRO_TILE_HALO,
+        None,
+    );
+    let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
+    HeightMesh {
+        verts,
+        indices,
+        grid_origin: artifact.grid_origin,
+        voxel_size,
+        surface_cells,
+    }
+}
+
+/// Mesh the SAME heightfield occupancy through the **REGION/SCULPT PATH**
+/// (`extract_mesh_region_from_cells_pooled_haloed` via [`mesh_occupancy`])
+/// so the bake-path ripple can be compared against the region-path ripple
+/// on the identical occupancy. We build the full solid CellMap (every
+/// cell at/below the surface) and a region tight around it.
+pub fn region_mesh_heightfield(hf: &HeightField, half_world: f32, voxel_size: f32) -> HeightMesh {
+    let aabb = heightfield_tile_aabb(half_world, voxel_size);
+    let origin = aabb.min;
+    let n = ((aabb.max.x - aabb.min.x) / voxel_size).round() as i32;
+    let mut cells = CellMap::default();
+    let mut lo = IVec3::splat(i32::MAX);
+    let mut hi = IVec3::splat(i32::MIN);
+    let h = &hf.h;
+    for cz in 0..n {
+        for cx in 0..n {
+            for cy in 0..n {
+                let c = origin
+                    + (Vec3::new(cx as f32, cy as f32, cz as f32) + Vec3::splat(0.5)) * voxel_size;
+                if c.y - h(c.x, c.z) < 0.0 {
+                    let k = IVec3::new(cx, cy, cz);
+                    cells.insert(k, 0);
+                    lo = lo.min(k);
+                    hi = hi.max(k);
+                }
+            }
+        }
+    }
+    let occ = Occupancy {
+        cells,
+        grid_origin: origin,
+        voxel_size,
+        region_min: lo - IVec3::splat(2),
+        region_max: hi + IVec3::splat(3),
+    };
+    let (verts, indices) = mesh_occupancy(&occ);
+    let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
+    HeightMesh {
+        verts,
+        indices,
+        grid_origin: origin,
+        voxel_size,
+        surface_cells,
+    }
+}
+
+/// Same as [`bake_heightfield`] but with a per-thread blur override so
+/// the R-sweep / fix experiments can vary `(R, σ, iso)` on the bake path.
+pub fn bake_heightfield_blur(
+    hf: &HeightField,
+    half_world: f32,
+    voxel_size: f32,
+    bp: BlurParams,
+) -> HeightMesh {
+    set_blur_override(Some((bp.r, bp.sigma, bp.iso)));
+    let out = bake_heightfield(hf, half_world, voxel_size);
+    set_blur_override(None);
+    out
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Low-frequency banding metric (smooth-stairs detector)
+// ────────────────────────────────────────────────────────────────────
+
+/// Low-frequency ripple report for a heightfield surface (all lengths /
+/// amplitudes in VOXELS).
+#[derive(Clone, Debug)]
+pub struct RippleReport {
+    /// Number of top-surface samples used.
+    pub n_samples: usize,
+    /// Dominant ripple WAVELENGTH along the slope direction, in voxels.
+    /// `0` if no periodic peak found.
+    pub wavelength_vox: f32,
+    /// Amplitude (≈ half peak-to-peak) of the dominant ripple, in voxels.
+    pub amplitude_vox: f32,
+    /// RMS of the full surface-Y residual (height − best-fit reference),
+    /// in voxels. Captures ALL deviation (any frequency).
+    pub residual_rms_vox: f32,
+    /// Existing high-frequency roughness for reference (1-ring lumpiness).
+    pub roughness_vox: f32,
+}
+
+/// Measure the LOW-FREQUENCY banding ("smooth stairs") on a heightfield
+/// mesh. Procedure:
+///   1. Take TOP-surface vertices (normal +Y dominant).
+///   2. Project each onto the slope direction (the dominant horizontal
+///      gradient of `h`) → 1-D ordinate `s`. For FBM (no single
+///      direction) we use the X axis.
+///   3. Residual = `vertex.y − h_true(x,z)` (height minus the analytic
+///      surface — the true low-frequency reference, NOT a global plane,
+///      so FBM curvature doesn't masquerade as ripple).
+///   4. Resample the residual onto a uniform `s` grid (bin-average),
+///      then AUTOCORRELATE: the first off-zero autocorrelation peak's
+///      lag is the dominant ripple wavelength; its amplitude is the RMS
+///      of the band-limited residual.
+pub fn measure_ripple(hf: &HeightField, mesh: &HeightMesh, slope_dir: Vec3) -> RippleReport {
+    measure_ripple_raw(
+        &mesh.verts,
+        &mesh.indices,
+        mesh.voxel_size,
+        &|x, z| (hf.h)(x, z),
+        slope_dir,
+    )
+}
+
+/// Low-level ripple metric over raw extract output + a true-height
+/// closure. The terrain repro (a different mesh type) reuses this with
+/// the real `FbmTerrainFn` as the height reference. See [`measure_ripple`]
+/// for the procedure documentation.
+pub fn measure_ripple_raw(
+    verts: &[MeshVertex],
+    indices: &[u32],
+    vs: f32,
+    h: &dyn Fn(f32, f32) -> f32,
+    slope_dir: Vec3,
+) -> RippleReport {
+    // Top-surface vertices only.
+    let dir = Vec3::new(slope_dir.x, 0.0, slope_dir.z).normalize_or_zero();
+    let dir = if dir.length_squared() < 1e-6 { Vec3::X } else { dir };
+    let mut samples: Vec<(f32, f32)> = Vec::new(); // (ordinate s, residual y in voxels)
+    for v in verts {
+        let n = unpack_oct(v.normal_oct).normalize_or_zero();
+        if n.y <= 0.30 {
+            continue; // walls / bottom / steep — keep the top face only
+        }
+        let p = Vec3::from(v.local_pos);
+        let s = p.dot(dir) / vs; // ordinate in voxels
+        let resid = (p.y - h(p.x, p.z)) / vs; // residual in voxels
+        samples.push((s, resid));
+    }
+    let n_samples = samples.len();
+    if n_samples < 16 {
+        return RippleReport {
+            n_samples,
+            wavelength_vox: 0.0,
+            amplitude_vox: 0.0,
+            residual_rms_vox: 0.0,
+            roughness_vox: 0.0,
+        };
+    }
+    // Full residual RMS (all frequencies).
+    let mean_r: f32 = samples.iter().map(|&(_, r)| r).sum::<f32>() / n_samples as f32;
+    let residual_rms_vox = (samples
+        .iter()
+        .map(|&(_, r)| (r - mean_r) * (r - mean_r))
+        .sum::<f32>()
+        / n_samples as f32)
+        .sqrt();
+
+    // Resample residual onto a uniform 1-voxel-spaced ordinate grid.
+    let s_min = samples.iter().map(|&(s, _)| s).fold(f32::INFINITY, f32::min);
+    let s_max = samples.iter().map(|&(s, _)| s).fold(f32::NEG_INFINITY, f32::max);
+    let span = (s_max - s_min).max(1.0);
+    // ~2 bins/voxel so we can resolve ~2-voxel ripples (Nyquist).
+    let nb = ((span * 2.0).ceil() as usize).clamp(16, 4096);
+    let mut bin_sum = vec![0.0f32; nb];
+    let mut bin_cnt = vec![0u32; nb];
+    for &(s, r) in &samples {
+        let t = ((s - s_min) / span * (nb as f32 - 1.0)).clamp(0.0, nb as f32 - 1.0);
+        let bi = t as usize;
+        bin_sum[bi] += r;
+        bin_cnt[bi] += 1;
+    }
+    // Linear-fill empty bins from neighbors; de-mean.
+    let mut sig = vec![0.0f32; nb];
+    let mut last = 0.0f32;
+    for i in 0..nb {
+        if bin_cnt[i] > 0 {
+            last = bin_sum[i] / bin_cnt[i] as f32;
+        }
+        sig[i] = last;
+    }
+    let m: f32 = sig.iter().sum::<f32>() / nb as f32;
+    for v in sig.iter_mut() {
+        *v -= m;
+    }
+    // Bin spacing in voxels.
+    let bin_vox = span / (nb as f32 - 1.0);
+
+    // Autocorrelation. The first local MAX after the zero-lag peak's
+    // descent is the dominant ripple period.
+    let mut ac = vec![0.0f32; nb];
+    for lag in 0..nb {
+        let mut acc = 0.0f32;
+        for i in 0..(nb - lag) {
+            acc += sig[i] * sig[i + lag];
+        }
+        ac[lag] = acc / (nb - lag) as f32;
+    }
+    let ac0 = ac[0].max(1e-12);
+    // Find first lag where AC dips below ~0.2*ac0 (out of the central
+    // lobe), then the next local maximum.
+    let mut dipped = false;
+    let mut peak_lag = 0usize;
+    let mut peak_val = 0.0f32;
+    for lag in 1..nb - 1 {
+        let nr = ac[lag] / ac0;
+        if !dipped {
+            if nr < 0.2 {
+                dipped = true;
+            }
+            continue;
+        }
+        if ac[lag] > ac[lag - 1] && ac[lag] >= ac[lag + 1] && ac[lag] > peak_val {
+            peak_val = ac[lag];
+            peak_lag = lag;
+            break;
+        }
+    }
+    let wavelength_vox = peak_lag as f32 * bin_vox;
+    // Amplitude of the band: RMS of the residual restricted to the
+    // ripple frequency. Approximate by the autocorrelation peak value
+    // (≈ variance at that lag) → amplitude ≈ sqrt(2 * peak) for a sine.
+    let amplitude_vox = if peak_lag > 0 {
+        (2.0 * peak_val.max(0.0)).sqrt()
+    } else {
+        0.0
+    };
+    // Reuse the existing 1-ring roughness for the high-freq reference.
+    let roughness_vox = heightmesh_roughness_raw(verts, indices, vs, h);
+
+    RippleReport {
+        n_samples,
+        wavelength_vox,
+        amplitude_vox,
+        residual_rms_vox,
+        roughness_vox,
+    }
+}
+
+/// 1-ring lumpiness (high-frequency roughness) on a heightfield mesh,
+/// in voxels — analog of [`Metrics::roughness`] but against a true-height
+/// closure. Raw form so both the bench [`HeightMesh`] and the terrain
+/// repro mesh can call it.
+pub fn heightmesh_roughness_raw(
+    verts: &[MeshVertex],
+    indices: &[u32],
+    vs: f32,
+    h: &dyn Fn(f32, f32) -> f32,
+) -> f32 {
+    let nv = verts.len();
+    let mut resid = vec![0.0f32; nv];
+    let mut top = vec![false; nv];
+    for (i, v) in verts.iter().enumerate() {
+        let p = Vec3::from(v.local_pos);
+        resid[i] = (p.y - h(p.x, p.z)) / vs;
+        top[i] = unpack_oct(v.normal_oct).normalize_or_zero().y > 0.30;
+    }
+    let mut nbr_sum = vec![0.0f32; nv];
+    let mut nbr_cnt = vec![0u32; nv];
+    let mut add = |a: u32, b: u32| {
+        nbr_sum[a as usize] += resid[b as usize];
+        nbr_cnt[a as usize] += 1;
+    };
+    for tri in indices.chunks_exact(3) {
+        add(tri[0], tri[1]);
+        add(tri[0], tri[2]);
+        add(tri[1], tri[0]);
+        add(tri[1], tri[2]);
+        add(tri[2], tri[0]);
+        add(tri[2], tri[1]);
+    }
+    let mut sq = 0.0f32;
+    let mut cnt = 0u32;
+    for i in 0..nv {
+        if !top[i] || nbr_cnt[i] == 0 {
+            continue;
+        }
+        let local = resid[i] - nbr_sum[i] / nbr_cnt[i] as f32;
+        sq += local * local;
+        cnt += 1;
+    }
+    if cnt > 0 {
+        (sq / cnt as f32).sqrt()
+    } else {
+        0.0
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
 // 3 (cont). Validation tests
 // ════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh_extract::set_wide_window_project;
 
     /// Voxelize → mesh → metrics for one shape×voxel.
     fn run(shape: Shape, vs: f32) -> (Occupancy, Vec<MeshVertex>, Vec<u32>, Metrics) {
@@ -1765,5 +2316,122 @@ mod tests {
             .filter(|px| px[0] != bg[0] || px[1] != bg[1] || px[2] != bg[2])
             .count();
         assert!(non_bg > 500, "render wrote only {non_bg} non-bg pixels");
+    }
+
+    // ── Smooth-stairs reproduction + fix (bake-path heightfields) ──
+
+    /// REPRODUCTION: a GENTLE slope (wide tread) baked through the
+    /// terrain bake path with the fix FORCED OFF shows a low-frequency
+    /// residual ripple ("smooth stairs") in the surface-Y residual, even
+    /// though the high-frequency roughness is modest. This pins the
+    /// bench's ability to reproduce the user's report.
+    #[test]
+    fn gentle_slope_bake_path_has_low_freq_ripple() {
+        let hf = HeightField::gentle_slope(0.10, 0.035);
+        for &vs in &[0.5f32, 1.0] {
+            // Force the production fix OFF to see the raw rippled baseline.
+            set_wide_window_project(Some(0.0));
+            let mesh = bake_heightfield(&hf, 12.0, vs);
+            set_wide_window_project(None);
+            let r = measure_ripple(&hf, &mesh, Vec3::X);
+            // The residual RMS (deviation from the true plane) is a clear,
+            // non-trivial ripple signal on the gentle slope.
+            assert!(
+                r.residual_rms_vox > 0.10,
+                "gentle slope vs={vs}: expected a reproducible ripple \
+                 (residual_rms {:.3} ≤ 0.10 voxel) — bench not reproducing it",
+                r.residual_rms_vox
+            );
+        }
+    }
+
+    /// FIX (production default-ON): the wide-window plane-fit projection
+    /// (R=2 blur unchanged) substantially reduces the gentle-slope ripple
+    /// — both the low-frequency residual RMS and the high-frequency
+    /// roughness drop vs the fix-OFF baseline. The default extract
+    /// (override `None`) already runs the fix, so it must match the
+    /// explicit-on path.
+    #[test]
+    fn wide_window_fix_reduces_gentle_slope_ripple() {
+        let hf = HeightField::gentle_slope(0.10, 0.035);
+        for &vs in &[0.5f32, 1.0] {
+            let base = {
+                set_wide_window_project(Some(0.0)); // off
+                let m = bake_heightfield(&hf, 12.0, vs);
+                set_wide_window_project(None);
+                measure_ripple(&hf, &m, Vec3::X)
+            };
+            let fixed = {
+                set_wide_window_project(None); // production default = ON (r5)
+                let m = bake_heightfield(&hf, 12.0, vs);
+                measure_ripple(&hf, &m, Vec3::X)
+            };
+            assert!(
+                fixed.residual_rms_vox < base.residual_rms_vox * 0.7,
+                "vs={vs}: fix should cut residual_rms ≥30% ({:.3} → {:.3})",
+                base.residual_rms_vox,
+                fixed.residual_rms_vox
+            );
+            assert!(
+                fixed.roughness_vox < base.roughness_vox,
+                "vs={vs}: fix should cut roughness ({:.3} → {:.3})",
+                base.roughness_vox,
+                fixed.roughness_vox
+            );
+        }
+    }
+
+    /// OFF override is bit-stable: two fix-OFF extracts produce the
+    /// identical SURFACE (multiset of vertex positions). The bake's vertex
+    /// *array order* is not deterministic across runs (voxelization uses
+    /// parallel + hashed cell maps), so we compare the position multiset.
+    #[test]
+    fn wide_window_fix_off_is_bit_stable() {
+        let hf = HeightField::gentle_slope(0.10, 0.035);
+        set_wide_window_project(Some(0.0)); // off
+        let a = bake_heightfield(&hf, 12.0, 0.5);
+        let b = bake_heightfield(&hf, 12.0, 0.5);
+        set_wide_window_project(None);
+        assert_eq!(a.verts.len(), b.verts.len());
+        let key = |v: &MeshVertex| {
+            (
+                (v.local_pos[0] / 1e-4).round() as i64,
+                (v.local_pos[1] / 1e-4).round() as i64,
+                (v.local_pos[2] / 1e-4).round() as i64,
+            )
+        };
+        let mut sa: Vec<_> = a.verts.iter().map(key).collect();
+        let mut sb: Vec<_> = b.verts.iter().map(key).collect();
+        sa.sort_unstable();
+        sb.sort_unstable();
+        assert_eq!(sa, sb, "off-path vertex positions must be stable");
+    }
+
+    /// CURVATURE PRESERVED: on a curved heightfield the fix must NOT
+    /// inflate the residual (which would mean it's rounding real
+    /// curvature, not just ripple). At r=5 the FBM residual stays within
+    /// ~25% of the fix-OFF baseline (it does not blow up the way a wide
+    /// UNWEIGHTED box fit would).
+    #[test]
+    fn wide_window_fix_preserves_curvature_on_fbm() {
+        let hf = HeightField::fbm();
+        let vs = 0.5f32;
+        let base = {
+            set_wide_window_project(Some(0.0)); // off
+            let m = bake_heightfield(&hf, 12.0, vs);
+            set_wide_window_project(None);
+            measure_ripple(&hf, &m, Vec3::X)
+        };
+        let fixed = {
+            set_wide_window_project(None); // production default = ON (r5)
+            let m = bake_heightfield(&hf, 12.0, vs);
+            measure_ripple(&hf, &m, Vec3::X)
+        };
+        assert!(
+            fixed.residual_rms_vox < base.residual_rms_vox * 1.25 + 1e-4,
+            "fix inflated FBM residual too much ({:.3} → {:.3}) — rounding curvature",
+            base.residual_rms_vox,
+            fixed.residual_rms_vox
+        );
     }
 }

@@ -19,3 +19,5 @@ crossbeam = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 serde_json = { workspace = true }
+image = { workspace = true }
+rayon = { workspace = true }
