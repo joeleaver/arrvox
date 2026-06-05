@@ -99,9 +99,20 @@ pub(super) fn run_pre_frame(
     //    sim ships scene_mgr's current epoch every frame, so we'll
     //    catch up on the next snapshot if an intermediate one was
     //    dropped by the newest-wins inbox.
-    if frame.geometry_epoch > state.last_uploaded_geometry_epoch {
+    if frame.geometry_epoch > state.last_uploaded_geometry_epoch { 'geo: {
         let geo_epoch_t0 = std::time::Instant::now();
-        let mut sm = state.scene_mgr.lock().expect("scene_mgr poisoned");
+        // Never block the render thread on a sim-side asset splice. A
+        // big-asset splice can hold `scene_mgr` for 100-400ms; WAITING on
+        // it here is exactly the `lock=367ms` stall that produced the
+        // ~573ms frame. Instead `try_lock` and, if the sim holds it, skip
+        // this frame's geometry upload and retry next frame: the epoch
+        // gate stays unsatisfied so we self-heal, the pool dirty ranges +
+        // per-asset mesh flags persist for the retry, and an asset whose
+        // mesh hasn't uploaded yet returns `None` from `mesh_buffer()` —
+        // simply undrawn for a frame or two, never a panic.
+        let Ok(mut sm) = state.scene_mgr.try_lock() else {
+            break 'geo;
+        };
         let t_lock = geo_epoch_t0.elapsed();
         // Diagnostic: decompose the wall-clock latency between sim's
         // `bump_geometry_epoch` and the render worker noticing the new
@@ -261,7 +272,7 @@ pub(super) fn run_pre_frame(
                 }
             }
         }
-    }
+    } } // close `'geo` (try_lock skip-on-contention) + the epoch gate
 
     // 1.5. Phase 3 — paint mutations land in per-instance overlays
     //      (`paint_overlays` on EngineState), shipped each tick as
