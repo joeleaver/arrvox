@@ -384,6 +384,40 @@ impl BrickPool {
         let count = self.next_free_brick as usize * BRICK_CELLS as usize;
         &self.data[..count]
     }
+
+    /// Bulk-splice another brick pool's allocated cells as a fresh
+    /// contiguous brick range at the tail, shifting every real cell (a
+    /// file-local `leaf_attr` slot index) by `slot_offset`. The
+    /// `BRICK_EMPTY` and `BRICK_INTERIOR` sentinels pass through
+    /// unshifted. Returns the starting brick id.
+    ///
+    /// Used by the off-thread asset loader: the worker builds the brick
+    /// pool file-local (cells hold file-local slot indices), then this
+    /// folds in the scene-global `leaf_attr_slot_start` at splice time —
+    /// the same shift the inline loader applied per `set_cell`, now one
+    /// bulk pass. The destination range comes from
+    /// [`allocate_contiguous_bump`], which never reuses freed bricks, so
+    /// it is fresh `BRICK_EMPTY` capacity before the copy.
+    pub fn splice_assimilate_shifted(&mut self, other: &BrickPool, slot_offset: u32) -> u32 {
+        let count = other.allocated_count();
+        let start = self
+            .allocate_contiguous_bump(count)
+            .expect("BrickPool splice_assimilate_shifted overflow");
+        if count == 0 {
+            return start;
+        }
+        let src = other.as_slice();
+        let dst_start = start as usize * BRICK_CELLS as usize;
+        let data = self.data_mut();
+        for (i, &cell) in src.iter().enumerate() {
+            data[dst_start + i] = match cell {
+                BRICK_EMPTY | BRICK_INTERIOR => cell,
+                slot => slot + slot_offset,
+            };
+        }
+        // `allocate_contiguous_bump` already marked the range dirty.
+        start
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +429,42 @@ mod tests {
         assert_eq!(BRICK_DIM.pow(3), BRICK_CELLS);
         assert_eq!(BRICK_LEVELS, BRICK_DIM.ilog2() as u8);
         assert_eq!(BRICK_BYTES, BRICK_CELLS * 4);
+    }
+
+    #[test]
+    fn splice_assimilate_shifted_offsets_real_cells_passes_sentinels() {
+        // Private pool, file-local: brick 0 holds a real slot (5), an
+        // interior sentinel, an empty sentinel; brick 1 holds slot 0.
+        let mut private = BrickPool::new(2);
+        private.allocate_contiguous_bump(2).unwrap();
+        private.set_cell(0, 0, 0, 0, 5);
+        private.set_cell(0, 1, 0, 0, BRICK_INTERIOR);
+        private.set_cell(0, 2, 0, 0, BRICK_EMPTY);
+        private.set_cell(1, 0, 0, 0, 0);
+
+        // Scene pool already has one brick allocated, splice with a
+        // leaf_attr_slot_start of 100.
+        let mut scene = BrickPool::new(1);
+        scene.allocate_contiguous_bump(1).unwrap(); // occupy brick 0
+        let start = scene.splice_assimilate_shifted(&private, 100);
+
+        assert_eq!(start, 1, "spliced bricks land at the tail");
+        assert_eq!(scene.allocated_count(), 3);
+        // Real cells shifted by 100; sentinels untouched.
+        assert_eq!(scene.get_cell(start, 0, 0, 0), 105);
+        assert_eq!(scene.get_cell(start, 1, 0, 0), BRICK_INTERIOR);
+        assert_eq!(scene.get_cell(start, 2, 0, 0), BRICK_EMPTY);
+        assert_eq!(scene.get_cell(start + 1, 0, 0, 0), 100);
+    }
+
+    #[test]
+    fn splice_assimilate_shifted_empty_is_noop() {
+        let mut scene = BrickPool::new(2);
+        scene.allocate_contiguous_bump(1).unwrap();
+        let private = BrickPool::new(1);
+        let start = scene.splice_assimilate_shifted(&private, 50);
+        assert_eq!(start, 1);
+        assert_eq!(scene.allocated_count(), 1);
     }
 
     #[test]

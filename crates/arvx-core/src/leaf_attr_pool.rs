@@ -322,6 +322,33 @@ impl LeafAttrPool {
     pub fn as_slice(&self) -> &[LeafAttr] {
         &self.data[..self.next_free as usize]
     }
+
+    /// Bulk-splice another pool's allocated entries (attrs + colors +
+    /// bones) as a fresh contiguous range at the tail. Returns the start
+    /// slot. The copied slot `k` of `other` lands at `start + k`, so a
+    /// caller that built `other` file-local can fold in the scene-global
+    /// `start` offset afterwards (brick cells, mesh `leaf_attr_id`s,
+    /// octree `internal_attr_index`). Used by the off-thread asset
+    /// loader: the private pool is built on a worker thread, then
+    /// memcpy'd in here in three `copy_from_slice` passes instead of the
+    /// per-slot `get_mut`/`set_color`/`set_bone` loop the inline loader
+    /// ran under the lock.
+    pub fn splice_assimilate(&mut self, other: &LeafAttrPool) -> u32 {
+        let count = other.allocated_count();
+        let start = self
+            .allocate_contiguous_bump(count)
+            .expect("LeafAttrPool splice_assimilate overflow");
+        if count == 0 {
+            return start;
+        }
+        let (s, n) = (start as usize, count as usize);
+        // `allocate_contiguous_bump` already grew capacity to cover
+        // `[start, start + count)` and marked the range dirty.
+        self.data_mut()[s..s + n].copy_from_slice(other.as_slice());
+        self.colors[s..s + n].copy_from_slice(&other.colors[..n]);
+        self.bones[s..s + n].copy_from_slice(&other.bones[..n]);
+        start
+    }
 }
 
 #[cfg(test)]
@@ -466,6 +493,59 @@ mod tests {
         let c: Vec<_> = pool.dirty_colors().iter().collect();
         assert_eq!(c, vec![(slot * COLOR_STRIDE, COLOR_STRIDE)]);
         assert!(pool.dirty_bones().is_empty());
+    }
+
+    #[test]
+    fn splice_assimilate_copies_attrs_colors_bones_at_tail() {
+        // Build a "private" pool file-local, then splice it into a
+        // scene pool that already has some prior allocation, asserting
+        // the spliced slots land at the tail and carry attr/color/bone.
+        let mut private = LeafAttrPool::new(4);
+        private.allocate_range(3).unwrap();
+        *private.get_mut(0) = LeafAttr::new(Vec3::X, 10);
+        *private.get_mut(1) = LeafAttr::new(Vec3::Y, 11);
+        *private.get_mut(2) = LeafAttr::new(Vec3::Z, 12);
+        private.set_color(1, 0xAB);
+        let mut bv = BoneVoxel::default();
+        bv.indices = 0x0000_0007;
+        private.set_bone(2, bv);
+
+        let mut scene = LeafAttrPool::new(8);
+        scene.allocate_contiguous_bump(5).unwrap(); // occupy [0,5)
+        let start = scene.splice_assimilate(&private);
+
+        assert_eq!(start, 5, "splice lands at the tail");
+        assert_eq!(scene.allocated_count(), 8);
+        assert_eq!(scene.get(start).material_primary, 10);
+        assert_eq!(scene.get(start + 1).material_primary, 11);
+        assert_eq!(scene.get(start + 2).material_primary, 12);
+        assert_eq!(scene.color(start + 1), 0xAB);
+        assert_eq!(scene.bone(start + 2).indices, 0x0000_0007);
+    }
+
+    #[test]
+    fn splice_assimilate_empty_is_noop_returns_tail() {
+        let mut scene = LeafAttrPool::new(8);
+        scene.allocate_contiguous_bump(3).unwrap();
+        let private = LeafAttrPool::new(4);
+        let start = scene.splice_assimilate(&private);
+        assert_eq!(start, 3);
+        assert_eq!(scene.allocated_count(), 3);
+    }
+
+    #[test]
+    fn splice_assimilate_grows_scene_pool() {
+        // Private larger than the scene pool's initial capacity → the
+        // bump-alloc inside splice must grow rather than panic.
+        let mut private = LeafAttrPool::new(64);
+        private.allocate_range(40).unwrap();
+        *private.get_mut(39) = LeafAttr::new(Vec3::X, 99);
+        let mut scene = LeafAttrPool::new(8);
+        let start = scene.splice_assimilate(&private);
+        assert_eq!(start, 0);
+        assert_eq!(scene.allocated_count(), 40);
+        assert!(scene.capacity() >= 40);
+        assert_eq!(scene.get(39).material_primary, 99);
     }
 
     #[test]
