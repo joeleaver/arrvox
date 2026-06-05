@@ -513,75 +513,158 @@ impl EngineState {
         }
     }
 
-    /// Integrate a bounded budget of deferred voxel-asset loads per
-    /// tick (see [`EngineState::pending_asset_loads`]). Each
-    /// `acquire_asset` reads + integrates one `.arvx` into the shared
-    /// pools under the `scene_mgr` lock; spreading them across ticks
-    /// keeps the viewport shipping frames during a heavy scene load
-    /// instead of freezing for seconds while every asset integrates.
+    /// Drive the off-thread asset loader: splice any finished builds into
+    /// the scene pools, then feed the worker the next queued load.
+    ///
+    /// The heavy build (read + octree compact/dedup/morton + prefilter +
+    /// mesh) runs on `asset_load_worker` **without** the `scene_mgr`
+    /// lock, so a multi-million-voxel `.arvx` no longer freezes the
+    /// viewport — the only main-thread cost is the bounded splice. Cache
+    /// hits and repeated instances of one asset are wired immediately
+    /// without a build. Task #8.
     pub(crate) fn drain_pending_asset_loads(&mut self) {
-        if self.pending_asset_loads.is_empty() {
-            return;
+        // 1. Splice any completed builds first (frees the worker for the
+        //    next job this same tick).
+        while let Some(res) = self.asset_load_worker.try_recv() {
+            self.integrate_asset_load_result(res);
         }
-        // Per-tick budget: finish the current asset even if it overruns
-        // (one integrate can't be sub-divided), but stop pulling new
-        // ones past the budget so a frame can ship between heavy assets.
-        const BUDGET: std::time::Duration = std::time::Duration::from_millis(6);
-        let start = std::time::Instant::now();
-        while let Some(p) = self.pending_asset_loads.pop_front() {
-            if !self.world.contains(p.entity) {
-                continue; // entity deleted before its deferred load ran
+
+        // 2. Feed the worker from the pending queue. Cache hits and
+        //    duplicate-path waiters are wired immediately even while a
+        //    build is in flight; at most one fresh build is submitted per
+        //    drain (the bounded(1) inbox holds one at a time).
+        while let Some(p) = self.pending_asset_loads.front() {
+            // Copy the front entry's data out so the `front()` borrow ends
+            // here, freeing us to mutate `self` (lock / pop / submit) below.
+            let (entity, path) = (p.entity, p.full_path.clone());
+            // Entity deleted before its deferred load ran.
+            if !self.world.contains(entity) {
+                self.pending_asset_loads.pop_front();
+                continue;
             }
-            let acquired = self
+            // (a) Already resident → refcount + wire now, no build.
+            let cached = self
                 .scene_mgr
                 .lock()
                 .unwrap()
-                .acquire_asset(&p.full_path.to_string_lossy());
-            match acquired {
-                Ok((handle, info)) => {
-                    let spatial = spatial_from_handle(
-                        &info.spatial,
-                        info.voxel_size,
-                        &info.aabb,
-                        info.grid_origin,
-                        info.leaf_attr_slot_start,
-                        info.leaf_attr_slot_count,
-                        Vec::new(),
-                    );
-                    // Snapshot overrides before the mutable Renderable borrow.
-                    let overrides: Vec<(u16, u16)> = self
-                        .world
-                        .get::<&crate::components::Renderable>(p.entity)
-                        .map(|r| r.material_overrides.clone())
-                        .unwrap_or_default();
-                    if let Ok(mut r) =
-                        self.world.get::<&mut crate::components::Renderable>(p.entity)
-                    {
-                        r.spatial = Some(crate::components::RenderGeometry::Octree(spatial));
-                        r.asset_handle = Some(handle);
-                        r.voxel_count = info.voxel_count;
-                    }
-                    // Replay persisted material overrides now that the
-                    // voxels exist (the load-time first-pass replay was a
-                    // no-op against the not-yet-loaded geometry).
-                    for (from, to) in overrides {
-                        self.remap_entity_material(p.entity, from, to);
-                    }
-                    self.geometry_dirty.mark_all();
-                    self.gpu_objects_dirty.mark_all();
-                    self.scene_dirty.mark_entity(p.entity);
-                }
-                Err(e) => {
-                    self.console.warn(format!(
-                        "Deferred asset load failed for {}: {e}",
-                        p.full_path.display(),
-                    ));
-                }
+                .try_acquire_cached(&path.to_string_lossy());
+            if let Some((handle, info)) = cached {
+                self.pending_asset_loads.pop_front();
+                self.wire_loaded_entity(entity, handle, info);
+                continue;
             }
-            if start.elapsed() >= BUDGET {
+            // (b) A build for this path is already in flight (or queued) →
+            //     join the waiter list; the splice will wire this entity.
+            if let Some(waiters) = self.loading_paths.get_mut(&path) {
+                waiters.push(entity);
+                self.pending_asset_loads.pop_front();
+                continue;
+            }
+            // (c) Fresh load — needs the worker idle to submit. If busy,
+            //     leave the entry queued and retry next tick.
+            if !self.asset_load_worker.is_idle() {
                 break;
             }
+            self.pending_asset_loads.pop_front();
+            self.loading_paths.insert(path.clone(), vec![entity]);
+            self.asset_load_worker
+                .submit(super::asset_load_worker::AssetLoadJob { entity, path });
         }
+    }
+
+    /// Splice one finished off-thread build into the scene pools and wire
+    /// every entity that was waiting on its path. The first live waiter
+    /// takes the freshly-integrated handle (refcount 1); additional
+    /// instances refcount the now-cached asset. If every waiter despawned
+    /// mid-build, the integrated asset is released so it doesn't leak.
+    fn integrate_asset_load_result(
+        &mut self,
+        res: super::asset_load_worker::AssetLoadResult,
+    ) {
+        let waiters = self.loading_paths.remove(&res.path).unwrap_or_default();
+        let loaded = match res.result {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                self.console.warn(format!(
+                    "Deferred asset load failed for {}: {e}",
+                    res.path.display(),
+                ));
+                return;
+            }
+        };
+
+        // Splice under the lock; bump the geometry epoch here — geometry
+        // enters the pools now (mirrors `acquire_asset`'s top-of-fn bump).
+        let (handle, info) = {
+            let mut sm = self.scene_mgr.lock().unwrap();
+            sm.bump_geometry_epoch();
+            sm.integrate_loaded_asset(loaded)
+        };
+
+        let live: Vec<hecs::Entity> = waiters
+            .into_iter()
+            .filter(|&e| self.world.contains(e))
+            .collect();
+        if live.is_empty() {
+            // No live entity to attach to — the integrate left refcount=1,
+            // so release it back to 0 to avoid a leaked allocation.
+            self.scene_mgr.lock().unwrap().release_asset(handle);
+            return;
+        }
+        // First waiter takes the fresh handle (refcount already 1).
+        self.wire_loaded_entity(live[0], handle, info);
+        // Extra instances refcount the cached asset (refcount → N).
+        for &entity in &live[1..] {
+            let extra = self
+                .scene_mgr
+                .lock()
+                .unwrap()
+                .try_acquire_cached(&res.path.to_string_lossy());
+            if let Some((h, i)) = extra {
+                self.wire_loaded_entity(entity, h, i);
+            }
+        }
+    }
+
+    /// Attach a loaded asset's geometry to an entity's `Renderable` and
+    /// replay its persisted material overrides. Shared by the cache-hit,
+    /// splice, and extra-instance paths of the async loader.
+    fn wire_loaded_entity(
+        &mut self,
+        entity: hecs::Entity,
+        handle: arvx_render::AssetHandle,
+        info: arvx_render::AssetInfo,
+    ) {
+        use crate::components::{RenderGeometry, Renderable};
+        let spatial = spatial_from_handle(
+            &info.spatial,
+            info.voxel_size,
+            &info.aabb,
+            info.grid_origin,
+            info.leaf_attr_slot_start,
+            info.leaf_attr_slot_count,
+            Vec::new(),
+        );
+        // Snapshot overrides before the mutable Renderable borrow.
+        let overrides: Vec<(u16, u16)> = self
+            .world
+            .get::<&Renderable>(entity)
+            .map(|r| r.material_overrides.clone())
+            .unwrap_or_default();
+        if let Ok(mut r) = self.world.get::<&mut Renderable>(entity) {
+            r.spatial = Some(RenderGeometry::Octree(spatial));
+            r.asset_handle = Some(handle);
+            r.voxel_count = info.voxel_count;
+        }
+        // Replay persisted material overrides now that the voxels exist
+        // (the load-time first-pass replay was a no-op against the
+        // not-yet-loaded geometry).
+        for (from, to) in overrides {
+            self.remap_entity_material(entity, from, to);
+        }
+        self.geometry_dirty.mark_all();
+        self.gpu_objects_dirty.mark_all();
+        self.scene_dirty.mark_entity(entity);
     }
 
     /// Write the current project descriptor to disk, folding in the

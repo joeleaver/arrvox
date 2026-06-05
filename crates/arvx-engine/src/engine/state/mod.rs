@@ -387,6 +387,22 @@ pub(crate) struct EngineState {
     /// of `docs/PERF_DEBT.md`.
     pub(crate) collider_worker: super::collider_worker::ColliderWorker,
 
+    /// Dedicated worker thread that builds `.arvx` assets off the sim
+    /// tick. Sim pops a queued load, submits the path; the worker reads +
+    /// builds a private, file-local `LoadedAsset` (the ~1 s octree /
+    /// prefilter / mesh work) without the `scene_mgr` lock; the sim
+    /// splices the result in a bounded main-thread pass on a later tick.
+    /// Task #8 — kills the per-big-asset integrate freeze on scene load.
+    pub(crate) asset_load_worker: super::asset_load_worker::AssetLoadWorker,
+
+    /// Paths with a build in flight (or queued behind one) → the entities
+    /// waiting on that load. Dedups repeated instances of one `.arvx` to
+    /// a single build: the first instance submits the job, extras join
+    /// the waiter list and refcount the cached asset when the splice
+    /// lands. Empty in steady state.
+    pub(crate) loading_paths:
+        std::collections::HashMap<std::path::PathBuf, Vec<hecs::Entity>>,
+
     /// Per-entity sparse paint overlays. Each entry holds the leaves
     /// painted on that *specific* instance — decoupled from the
     /// asset's shared `LeafAttrPool`. Shipping these decouples paint

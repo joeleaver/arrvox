@@ -12,6 +12,7 @@ use crate::snapshot::StateUpdate;
 
 pub(crate) mod state;
 
+mod asset_load_worker;
 mod collider_worker;
 mod cmd_edit;
 mod cmd_runtime;
