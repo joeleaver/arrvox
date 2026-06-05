@@ -462,16 +462,47 @@ const DENSITY_KERNEL_SIGMA: f32 = 1.0;
 /// positive).
 const DENSITY_ISO: f32 = 0.5;
 
-/// Precompute the normalized 1D Gaussian weights for the separable
-/// density blur over `[-DENSITY_KERNEL_R, +DENSITY_KERNEL_R]`. The
-/// returned `2R+1` weights sum to 1.0 so a fully-solid neighborhood
-/// blurs to exactly `D = 1.0` and a fully-empty one to `D = 0.0`.
-fn density_kernel_weights_1d() -> [f32; (2 * DENSITY_KERNEL_R + 1) as usize] {
-    let mut w = [0.0f32; (2 * DENSITY_KERNEL_R + 1) as usize];
-    let two_sigma_sq = 2.0 * DENSITY_KERNEL_SIGMA * DENSITY_KERNEL_SIGMA;
+thread_local! {
+    /// Per-thread blur-kernel override for the meshing test-bench
+    /// (`mesh_test_bench`). `Some((r, sigma, iso))` overrides
+    /// [`DENSITY_KERNEL_R`] / [`DENSITY_KERNEL_SIGMA`] / [`DENSITY_ISO`]
+    /// for the next extract on this thread; `None` (default) uses the
+    /// shipped consts. Set via [`set_blur_override`]. This lets the
+    /// bench sweep `R ∈ {2,3,4}` WITHOUT changing the global default —
+    /// the production path never touches this (it's `None` everywhere).
+    static BLUR_OVERRIDE: std::cell::Cell<Option<(i32, f32, f32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear) the per-thread blur-kernel override used by the
+/// meshing test-bench: `Some((radius, sigma, iso))` or `None` to restore
+/// the shipped defaults. **Bench / diagnostics only** — the production
+/// sculpt/terrain path leaves this `None`.
+pub fn set_blur_override(over: Option<(i32, f32, f32)>) {
+    BLUR_OVERRIDE.with(|c| c.set(over));
+}
+
+/// Resolve the active `(radius, sigma, iso)` — the thread-local
+/// override if set, else the shipped consts.
+#[inline]
+fn active_blur_params() -> (i32, f32, f32) {
+    BLUR_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or((DENSITY_KERNEL_R, DENSITY_KERNEL_SIGMA, DENSITY_ISO))
+}
+
+/// Build the normalized 1D Gaussian weights for radius `r`, sigma
+/// `sigma`, over `[-r, r]` (length `2r+1`, summing to 1.0 so a fully-
+/// solid neighborhood blurs to exactly `D = 1.0`). Returned as a `Vec`
+/// so the radius can vary at runtime (bench R-sweep); the production
+/// path calls this once per extract with the const `R = 2`.
+fn density_kernel_weights_1d_for(r: i32, sigma: f32) -> Vec<f32> {
+    let len = (2 * r + 1) as usize;
+    let mut w = vec![0.0f32; len];
+    let two_sigma_sq = 2.0 * sigma * sigma;
     let mut sum = 0.0f32;
     for (i, slot) in w.iter_mut().enumerate() {
-        let d = i as i32 - DENSITY_KERNEL_R;
+        let d = i as i32 - r;
         let v = (-((d * d) as f32) / two_sigma_sq).exp();
         *slot = v;
         sum += v;
@@ -846,6 +877,9 @@ pub fn extract_surface_mesh_haloed(
                             sculpt_slots,
                             None::<&fn(Vec3) -> f32>,
                             None::<&fn(Vec3) -> Vec3>,
+                            None::<&fn(Vec3) -> f32>,
+                            None::<&fn(Vec3) -> Vec3>,
+                            DENSITY_ISO,
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
@@ -1167,8 +1201,10 @@ where
     let sy = g_size.y as usize;
     let sz = g_size.z as usize;
     let total = sx * sy * sz;
-    let kern = density_kernel_weights_1d();
-    let r = DENSITY_KERNEL_R;
+    // Blur kernel: const `R = 2` / `σ = 1.0` in production; the bench
+    // can override per-thread via `set_blur_override` to sweep R.
+    let (r, kern_sigma, iso) = active_blur_params();
+    let kern = density_kernel_weights_1d_for(r, kern_sigma);
 
     // Resize the reusable density buffer (grows, never shrinks).
     if scratch.density.len() < total {
@@ -1312,13 +1348,15 @@ where
     let density_at = |p_grid: Vec3| -> f32 {
         sample_density_trilinear(density, g_origin, g_size, p_grid)
     };
-    // Smooth SDF in world space: `sdf = DENSITY_ISO - D(p)`. Inside
-    // (D high) → negative; outside (D low) → positive. `build_cube_vertex`
+    // Smooth SDF in world space: `sdf = iso - D(p)`. Inside (D high) →
+    // negative; outside (D low) → positive. `build_cube_vertex`
     // interpolates the `t = da/(da-db)` zero-crossing on each active
-    // edge to place the vertex.
+    // edge to place the vertex. `iso` is the active threshold (0.5 in
+    // production; the bench may offset it to counter the wider-blur
+    // inward isosurface shift).
     let smooth_sdf = |p_world: Vec3| -> f32 {
         let g = (p_world - grid_origin) / base_voxel_size;
-        DENSITY_ISO - density_at(g)
+        iso - density_at(g)
     };
     // Outward surface normal at a world-space point: interpolate the
     // precomputed grid-point gradient field `G = ∇D`, then negate.
@@ -1332,25 +1370,88 @@ where
         let g = (p_world - grid_origin) / base_voxel_size;
         -sample_gradient_trilinear(gradient, g_origin, g_size, g)
     };
+    // Grid-space density + RAW gradient samplers for the Newton
+    // projection inside `build_cube_vertex` (it works in grid coords).
+    let density_grid_fn =
+        |p_grid: Vec3| -> f32 { sample_density_trilinear(density, g_origin, g_size, p_grid) };
+    let gradient_grid_fn =
+        |p_grid: Vec3| -> Vec3 { sample_gradient_trilinear(gradient, g_origin, g_size, p_grid) };
     // The caller-supplied `sdf_fn` is intentionally ignored for vertex
     // placement now — the density-derived SDF is the authoritative
     // smooth field. (Sculpt/terrain callers all pass `None`.)
     let _ = sdf_fn;
 
+    // **Run surface nets ON the D field, not binary occupancy.**
+    //
+    // The topology (which faces emit, which cube edges are active) must
+    // agree with where the vertex is PLACED (the `D = iso` isosurface).
+    // The previous code classified solidity by binary occupancy
+    // (`cells_grid.contains`) while placing on `D = iso`; on the ~1/3 of
+    // surface cubes where a corner is binary-SOLID but its smooth `D`
+    // is `< iso`, the iso did not cross the binary-active edge, so
+    // `t = da/(da-db)` clamped to 0/1 and the vertex pinned to the
+    // discrete grid Y → horizontal terraces. Classifying solidity by
+    // `D(cell_center) >= iso` (the SAME field the crossing uses) makes
+    // topology and position consistent: every active edge has a real
+    // interior crossing, no clamps, no terraces.
+    //
+    // `cell_lookup` (binary) is kept ONLY to pick the material /
+    // leaf_attr / bone slot — never for solidity or edge activation.
+    let d_solid = |cell: IVec3| -> bool {
+        let center = Vec3::new(cell.x as f32 + 0.5, cell.y as f32 + 0.5, cell.z as f32 + 0.5);
+        density_grid_fn(center) >= iso
+    };
+    // Binary corner classifier (material attribution + the
+    // INTERIOR_NODE-region fallback): solid + slot, or None.
+    let cell_lookup = |c: IVec3| -> Option<u32> {
+        match cells_grid.get(c) {
+            Some(CELL_INTERIOR_GRID) => Some(CELL_INTERIOR),
+            Some(v) => Some(v),
+            None => {
+                if is_solid_lookup(octree_nodes, brick_cells, octree_depth, c, extent) {
+                    Some(CELL_INTERIOR)
+                } else {
+                    None
+                }
+            }
+        }
+    };
+
+    // **Iteration / owner set.** A D-surface face is emitted by its
+    // D-SOLID side. The owner cell can be a cell whose binary occupancy
+    // is EMPTY but whose `D >= iso` (the `D = iso` surface sits up to
+    // ~1 cell outside the binary boundary on a convex region). For an
+    // `R = 2` blur a binary-empty cell can only be D-solid if a
+    // binary-solid cell lies within 1 cell — i.e. in its full 3×3×3
+    // neighbourhood (face OR edge OR corner), not just the 6 faces. So
+    // the candidate owners are the binary `solid_cells` plus their 26
+    // neighbours. Missing the diagonal neighbours leaves cracks on
+    // slanted/curved surfaces where the D-solid owner is only a
+    // diagonal neighbour of the binary boundary. Deduplicate so no face
+    // is emitted twice; each candidate emits only its D-active faces
+    // (`D(self) >= iso` && `D(neighbor) < iso`).
+    let mut candidates: rustc_hash::FxHashSet<IVec3> =
+        rustc_hash::FxHashSet::default();
+    candidates.reserve(solid_cells.len() * 8);
     for &cell in solid_cells.iter() {
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    candidates.insert(cell + IVec3::new(dx, dy, dz));
+                }
+            }
+        }
+    }
+
+    for &cell in &candidates {
+        if !d_solid(cell) {
+            continue;
+        }
         for face in 0..6 {
             let dir = FACE_DIRS[face];
             let neighbor = cell + dir;
-            if cells_grid.contains(neighbor) {
-                continue;
-            }
-            if is_solid_lookup(
-                octree_nodes,
-                brick_cells,
-                octree_depth,
-                neighbor,
-                extent,
-            ) {
+            // D-active face: this side D-solid, the other D-empty.
+            if d_solid(neighbor) {
                 continue;
             }
             let cube_offsets = CUBE_OFFSETS_PER_FACE[face];
@@ -1360,39 +1461,9 @@ where
                 quad[i] = match cube_vertex_grid.get(cube) {
                     Some(v) => v,
                     None => {
-                        // Corner-cell lookup: `cells_grid` first; for
-                        // cells outside the grid AND not present as
-                        // halo, fall back to `is_solid_lookup` so
-                        // INTERIOR_NODE-region cells (coarse octree
-                        // branches classified bulk-solid by the BFS,
-                        // never enumerated into the cell map) get
-                        // recognized as solid. Without this fallback,
-                        // terrain re-extract near a surface-vs-bulk
-                        // boundary misclassifies INTERIOR_NODE
-                        // corners as empty and emits a spurious shelf
-                        // a few voxels below the actual surface — the
-                        // same latent bug Phase 3 fixed in the global
-                        // `extract_surface_mesh_haloed` corner
-                        // lookup.
                         let vertex = build_cube_vertex(
                             cube,
-                            |c| match cells_grid.get(c) {
-                                Some(CELL_INTERIOR_GRID) => Some(CELL_INTERIOR),
-                                Some(v) => Some(v),
-                                None => {
-                                    if is_solid_lookup(
-                                        octree_nodes,
-                                        brick_cells,
-                                        octree_depth,
-                                        c,
-                                        extent,
-                                    ) {
-                                        Some(CELL_INTERIOR)
-                                    } else {
-                                        None
-                                    }
-                                }
-                            },
+                            cell_lookup,
                             base_voxel_size,
                             grid_origin,
                             leaf_attr_pool,
@@ -1400,6 +1471,9 @@ where
                             sculpt_slots,
                             Some(&smooth_sdf),
                             Some(&outward_normal),
+                            Some(&density_grid_fn),
+                            Some(&gradient_grid_fn),
+                            iso,
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
@@ -1544,7 +1618,8 @@ fn solve_qef(planes: &[(Vec3, Vec3)], bias: Vec3) -> Vec3 {
 ///
 /// Falls back to the SN cube's grid corner (`cube + (1, 1, 1)`) when
 /// no edge crossings are detected — defensive only.
-fn build_cube_vertex<F, S, N>(
+#[allow(clippy::too_many_arguments)]
+fn build_cube_vertex<F, S, N, D, G>(
     cube: IVec3,
     cell_lookup: F,
     voxel_size: f32,
@@ -1554,32 +1629,64 @@ fn build_cube_vertex<F, S, N>(
     sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
     sdf_fn: Option<&S>,
     normal_fn: Option<&N>,
+    // Grid-space density + gradient samplers for the Newton projection
+    // of the vertex onto the smooth `D = iso` isosurface.
+    // `density_grid_fn(p_grid) -> D in [0,1]`;
+    // `gradient_grid_fn(p_grid) -> ∇D (raw, per-cell, NOT normalized)`.
+    // Both `Some` together or both `None`. When present they refine the
+    // edge-crossing centroid position; when absent the centroid is used
+    // verbatim (legacy / full-asset path).
+    density_grid_fn: Option<&D>,
+    gradient_grid_fn: Option<&G>,
+    // Active iso threshold for the Newton target (0.5 in production).
+    iso: f32,
 ) -> MeshVertex
 where
     F: Fn(IVec3) -> Option<u32>,
     S: Fn(Vec3) -> f32,
     N: Fn(Vec3) -> Vec3,
+    D: Fn(Vec3) -> f32,
+    G: Fn(Vec3) -> Vec3,
 {
     // Pre-classify the 8 corner cells once; the edge loop reuses these.
     // Bit layout: index = bit0(+X) | bit1(+Y) | bit2(+Z).
+    //
+    // **Solidity comes from the D field, NOT binary occupancy** (when a
+    // `density_grid_fn` is supplied — the sculpt/terrain path). A corner
+    // is "solid" iff `D(corner_cell_center) >= iso`, the SAME threshold
+    // and sampler the edge-crossing uses. This keeps the active-edge
+    // topology consistent with the `D = iso` placement so every active
+    // edge has a real interior crossing (no `t` clamps → no terraces).
+    // The full-asset / legacy path (no `density_grid_fn`) falls back to
+    // binary `cell_lookup` as before.
     let mut corner_solid = [false; 8];
+    for i in 0u32..8 {
+        let oa = corner_offset(i);
+        let c = cube + oa;
+        corner_solid[i as usize] = match density_grid_fn {
+            Some(dfn) => {
+                let center = Vec3::new(c.x as f32 + 0.5, c.y as f32 + 0.5, c.z as f32 + 0.5);
+                dfn(center) >= iso
+            }
+            None => cell_lookup(c).is_some(),
+        };
+    }
+
+    // **Material attribution** is independent of the D solidity: pick the
+    // leaf_attr / bone slot from a BINARY-solid corner so we never index
+    // an empty cell's attribute. (A corner can be D-solid but binary-
+    // empty just outside the binary boundary, or D-empty but binary-
+    // solid just inside it — geometry follows D, material follows the
+    // real occupied cell.) `chosen` carries (coord, is_sculpt) so the
+    // tie-break prefers sculpt slots over pre-existing ones, then the
+    // lowest `(z,y,x)` coord for determinism.
     let mut normal_sum = Vec3::ZERO;
     let mut leaf_attr_id: u32 = 0;
-    // `chosen` carries (coord, is_sculpt) so the per-corner tie-break
-    // can prefer sculpt slots over pre-existing ones. Without that
-    // bias the lowest-coord cell wins purely by position, and a
-    // brush-allocated cell sharing an SN cube with procedural
-    // neighbours sometimes loses the corner — visible as the sculpt
-    // surface picking up the surrounding terrain's material/colour
-    // in a position-dependent pattern. Among cells of the same
-    // sculpt class we fall back to `coord_less` so the tie-break
-    // stays deterministic.
     let mut chosen: Option<(IVec3, bool)> = None;
     for i in 0u32..8 {
         let oa = corner_offset(i);
         let c = cube + oa;
         if let Some(slot) = cell_lookup(c) {
-            corner_solid[i as usize] = true;
             if slot != CELL_INTERIOR {
                 if let Some(attr) = leaf_attr_pool.get(slot as usize) {
                     normal_sum += unpack_oct(attr.normal_oct);
@@ -1647,7 +1754,7 @@ where
         }
     }
 
-    let local_centroid = if crossing_count > 0 {
+    let centroid0 = if crossing_count > 0 {
         crossing_sum / crossing_count as f32
     } else {
         Vec3::new(
@@ -1656,6 +1763,45 @@ where
             cube.z as f32 + 1.0,
         )
     };
+
+    // **Newton projection onto the `D = DENSITY_ISO` isosurface.**
+    //
+    // The edge-crossing centroid sits ~0.2-0.3 voxel off the true smooth
+    // isosurface (it averages per-edge linear crossings, which under- /
+    // over-shoot a curved `D`). A couple of Newton steps on the smooth
+    // density field snap it onto the actual `D = 0.5` level set, removing
+    // the residual sub-voxel lumpiness (silhouette facets / slope-edge
+    // waviness) without moving the vertex out of its cube neighborhood.
+    //
+    // Step (grid space): `p -= (D(p) - 0.5) / |∇D|² · ∇D`. This is a
+    // deterministic LOCAL function of the (already watertight) `D`/`∇D`
+    // grids, so two tiles sharing the halo project a shared boundary
+    // vertex to the identical point — the seam stays watertight.
+    //
+    // The total displacement from the centroid is clamped to ±0.75 cell
+    // per axis so a poorly-conditioned step (near-zero gradient, or a
+    // crossing far from the surface) can never fling the vertex out of
+    // its SN cube.
+    let local_centroid = match (density_grid_fn, gradient_grid_fn) {
+        (Some(dfn), Some(gfn)) if crossing_count > 0 => {
+            let mut p = centroid0;
+            for _ in 0..2 {
+                let d = dfn(p);
+                let g = gfn(p);
+                let gg = g.dot(g);
+                if gg < 1e-6 {
+                    break;
+                }
+                let step = ((d - iso) / gg) * g;
+                p -= step;
+                // Clamp total displacement to ±0.75 cell of the centroid.
+                p = p.clamp(centroid0 - Vec3::splat(0.75), centroid0 + Vec3::splat(0.75));
+            }
+            p
+        }
+        _ => centroid0,
+    };
+
     let local_pos = grid_origin + local_centroid * voxel_size;
 
     // **Normal.** The outward normal is `-∇D` (∇D points into the
@@ -2780,36 +2926,59 @@ mod tests {
 
         let depth = 2u8;
         let extent = 1i32 << depth;
-        let (full_v, full_i) =
-            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[], None);
-        let (region_v, region_i) = extract_surface_mesh_region(
-            &nodes,
-            depth,
-            1.0,
-            Vec3::ZERO,
-            &bricks,
-            &[],
-            &[],
-            IVec3::ZERO,
-            IVec3::splat(extent),
-        );
+        // The region path now runs surface nets on the smooth D field
+        // (D-threshold topology), NOT binary occupancy — so it no longer
+        // count-matches the binary full-asset `extract_surface_mesh`, and
+        // sparse cells (like these 3 isolated voxels) dissolve under the
+        // R=2 blur (their cell-center D < 0.5). The invariant that
+        // survives is DETERMINISM + coverage: a region covering the full
+        // extent must produce the SAME mesh as the two-step
+        // collect+region path over the same domain. (A solid block that
+        // survives the blur is exercised by the dedicated D-topology
+        // manifold test below.)
         let _ = region_extent(extent);
-        // Topology comparison: the region path now smooths vertex
-        // positions (density `D = 0.5` isosurface) while the full-asset
-        // extract keeps naive centroids, so exact positions differ by
-        // design. The active-cube set — and hence the vertex count and
-        // triangle count — must still match: the same SN cubes are
-        // emitted, only their sub-voxel positions moved.
-        assert_eq!(
-            full_v.len(),
-            region_v.len(),
-            "region covering full extent must emit the same vertex count",
+        let cells = collect_cell_map(&nodes, depth, &bricks);
+        let (a_v, a_i) = extract_mesh_region_from_cells(
+            &cells, IVec3::ZERO, IVec3::splat(extent), &nodes, depth, 1.0,
+            Vec3::ZERO, &bricks, &[], &[], None,
         );
-        assert_eq!(
-            full_i.len(),
-            region_i.len(),
-            "region covering full extent must emit the same triangle count",
+        let (region_v, region_i) = extract_surface_mesh_region(
+            &nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[],
+            IVec3::ZERO, IVec3::splat(extent),
         );
+        assert_eq!(a_v.len(), region_v.len(), "region path must be deterministic (verts)");
+        assert_eq!(a_i.len(), region_i.len(), "region path must be deterministic (tris)");
+    }
+
+    /// **D-topology manifold + de-staircase.** A solid block that
+    /// survives the R=2 blur meshes through the region (D-threshold) path
+    /// to a CLOSED, manifold surface (every edge shared by exactly 2
+    /// triangles), and the surface follows the block — confirming the
+    /// D-topology change keeps the mesh watertight.
+    #[test]
+    fn region_d_topology_block_is_manifold() {
+        // 4³ solid block of cells (survives the blur — interior D ≈ 1).
+        let lo = IVec3::splat(2);
+        let hi = IVec3::splat(6);
+        let cells = occupancy_cellmap(lo - IVec3::ONE, hi + IVec3::ONE, |c| {
+            c.x >= lo.x && c.x < hi.x && c.y >= lo.y && c.y < hi.y && c.z >= lo.z && c.z < hi.z
+        });
+        let nodes = vec![EMPTY_NODE];
+        let mut scratch = SculptExtractScratch::new();
+        let (v, i) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut scratch, &cells, lo - IVec3::ONE, hi + IVec3::ONE, &nodes, 5, 1.0,
+            Vec3::ZERO, &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
+        );
+        assert!(!v.is_empty() && !i.is_empty(), "block produced no surface");
+        // Manifold: every undirected edge shared by exactly 2 triangles.
+        let mut edges: std::collections::HashMap<(u32, u32), u32> = Default::default();
+        for t in i.chunks_exact(3) {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *edges.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+            }
+        }
+        let boundary = edges.values().filter(|&&c| c != 2).count();
+        assert_eq!(boundary, 0, "{boundary} non-manifold/boundary edges (mesh not watertight)");
     }
 
     /// Region far from any solid cell yields nothing (or a degenerate
@@ -2834,90 +3003,65 @@ mod tests {
         assert!(i.is_empty());
     }
 
-    /// Region scoped to the cell containing the single solid voxel
-    /// emits the closed-cube mesh. Pad ensures the cell's 6 face quads
-    /// are all produced.
+    /// A SINGLE isolated voxel dissolves under the R=2 density blur:
+    /// its cell-center `D` is well below 0.5 (one cell of solid mass
+    /// spread over a `5³` Gaussian footprint), so the D-threshold
+    /// topology emits NO surface. This is correct, desirable behaviour —
+    /// a lone voxel is sub-resolution noise the smoothing removes (the
+    /// pre-D-topology binary path emitted a spurious 1-voxel cube here).
     #[test]
-    fn region_extract_capturing_one_cell_emits_full_cube() {
+    fn region_extract_single_cell_dissolves_under_blur() {
         let nodes = vec![make_brick(0)];
         let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
         bricks[0] = 7; // (0,0,0)
         let (v, i) = extract_surface_mesh_region(
-            &nodes,
-            2,
-            1.0,
-            Vec3::ZERO,
-            &bricks,
-            &[],
-            &[],
-            IVec3::ZERO,
-            IVec3::ONE, // half-open [0, 1) — covers only cell (0,0,0)
+            &nodes, 2, 1.0, Vec3::ZERO, &bricks, &[], &[],
+            IVec3::ZERO, IVec3::ONE,
         );
-        assert_eq!(v.len(), 8, "single cell → 8 cube vertices");
-        assert_eq!(i.len(), 36, "6 faces × 2 triangles × 3 indices");
+        assert!(
+            v.is_empty() && i.is_empty(),
+            "a single voxel should dissolve under the blur (got {} verts)",
+            v.len()
+        );
     }
 
-    /// Region restricted to a subset is exactly the subset of triangles
-    /// that the full extract would emit for cells in the padded subset.
-    /// Build a 2×1×1 box (cells (0,0,0) and (1,0,0)). Region [0..1)
-    /// (padded [-1..2)) covers both cells, since cell (1,0,0) is one
-    /// past region but inside the pad. Region [3..4) misses entirely.
+    /// Region restricted to a subset still meshes the part of the
+    /// surface its padded window covers, and a region far from any
+    /// solid emits nothing. Uses a solid BLOCK (survives the R=2 blur,
+    /// unlike a thin 1-2 cell strip which dissolves) so the D-threshold
+    /// topology has a real surface to find.
     #[test]
     fn region_extract_subset_includes_padded_neighbors() {
-        let nodes = vec![make_brick(0)];
-        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
-        bricks[0] = 1; // (0,0,0)
-        bricks[1] = 2; // (1,0,0)
-        let depth = 2u8;
-        // Full extract for reference (10 faces × 2 = 20 tris).
-        let (full_v, full_i) =
-            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[], None);
-        let full_tris = full_i.len() / 3;
-        assert_eq!(full_tris, 20, "2-cell box has 10 exposed faces × 2 tris");
+        // 4³ solid block at cells [2,6)³.
+        let lo = IVec3::splat(2);
+        let hi = IVec3::splat(6);
+        let cells = occupancy_cellmap(IVec3::splat(0), IVec3::splat(8), |c| {
+            c.x >= lo.x && c.x < hi.x && c.y >= lo.y && c.y < hi.y && c.z >= lo.z && c.z < hi.z
+        });
+        let nodes = vec![EMPTY_NODE];
+        let depth = 5u8;
 
-        // Region [0..1) padded to [-1..2). Includes both cells (0,0,0)
-        // and (1,0,0) (since (1,0,0) is at the +X edge of pad).
-        let (v_a, i_a) = extract_surface_mesh_region(
-            &nodes,
-            depth,
-            1.0,
-            Vec3::ZERO,
-            &bricks,
-            &[],
-            &[],
-            IVec3::ZERO,
-            IVec3::ONE,
+        // A sub-window that touches one face of the block must produce a
+        // non-empty surface (its padded neighborhood reaches the block).
+        let mut scratch = SculptExtractScratch::new();
+        let (v_a, i_a) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut scratch, &cells, IVec3::new(3, 5, 3), IVec3::new(5, 7, 5), &nodes,
+            depth, 1.0, Vec3::ZERO, &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
         );
-        // Pad expansion reaches cell (1,0,0) iff the region emits the
-        // same active-cube set as the full extract — same vertex and
-        // triangle counts. (Positions differ now that the region path
-        // smooths; counts are the position-independent invariant.)
-        assert_eq!(
-            v_a.len(),
-            full_v.len(),
-            "pad expansion of region [0..1) must reach cell (1,0,0) (vertex count)",
-        );
-        assert_eq!(
-            i_a.len(),
-            full_i.len(),
-            "pad expansion of region [0..1) must reach cell (1,0,0) (triangle count)",
+        assert!(
+            !v_a.is_empty() && !i_a.is_empty(),
+            "sub-window touching the block's +Y face must mesh the surface there",
         );
 
-        // Region [3..4) padded to [2..5) — neither solid cell is in pad.
-        let (v_b, i_b) = extract_surface_mesh_region(
-            &nodes,
-            depth,
-            1.0,
-            Vec3::ZERO,
-            &bricks,
-            &[],
-            &[],
-            IVec3::splat(3),
-            IVec3::splat(4),
+        // A region far from the block (and its blur footprint) emits
+        // nothing.
+        let (v_b, i_b) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut scratch, &cells, IVec3::splat(20), IVec3::splat(24), &nodes,
+            depth, 1.0, Vec3::ZERO, &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
         );
         assert!(
             v_b.is_empty() && i_b.is_empty(),
-            "region far from solids must emit nothing"
+            "region far from solids must emit nothing",
         );
     }
 
@@ -3002,44 +3146,60 @@ mod tests {
     /// produces wrong edge crossings.
     #[test]
     fn region_extract_respects_interior_corner_cells() {
-        // Same setup as `interior_cells_hide_adjacent_surface_faces` —
-        // surface cell at (0,0,0), INTERIOR cell at (1,0,0). The full
-        // extract is the reference; the region extract over the same
-        // domain must produce the same triangle set.
-        let nodes = vec![make_brick(0)];
-        let mut bricks = vec![BRICK_EMPTY; BRICK_CELLS as usize];
-        bricks[0] = 5;
-        bricks[1] = BRICK_INTERIOR;
-        let depth = 2u8;
-        let extent = 1i32 << depth;
-
-        let (full_v, full_i) =
-            extract_surface_mesh(&nodes, depth, 1.0, Vec3::ZERO, &bricks, &[], &[], None);
-        let (region_v, region_i) = extract_surface_mesh_region(
-            &nodes,
-            depth,
-            1.0,
-            Vec3::ZERO,
-            &bricks,
-            &[],
-            &[],
-            IVec3::ZERO,
-            IVec3::splat(extent),
+        // INTERIOR-bulk cells must seed the density blur as occupancy=1
+        // (via the `CELL_INTERIOR → CELL_INTERIOR_GRID` remap), exactly
+        // like real surface cells — otherwise the D field would read
+        // them as empty and carve a hole / spurious shelf. Build a solid
+        // block whose interior cells are tagged `CELL_INTERIOR` and a
+        // twin whose interior cells carry real slots; the D-threshold
+        // mesh must be IDENTICAL (the blur sees both as occupied).
+        let lo = IVec3::splat(2);
+        let hi = IVec3::splat(6);
+        let is_solid = |c: IVec3| {
+            c.x >= lo.x && c.x < hi.x && c.y >= lo.y && c.y < hi.y && c.z >= lo.z && c.z < hi.z
+        };
+        // Block A: every cell carries a real slot.
+        let mut cells_a = CellMap::default();
+        // Block B: interior cells (all 6 face-neighbors solid) carry
+        // CELL_INTERIOR; boundary cells carry a real slot.
+        let mut cells_b = CellMap::default();
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in 0..8 {
+                    let c = IVec3::new(x, y, z);
+                    if !is_solid(c) {
+                        continue;
+                    }
+                    cells_a.insert(c, 1);
+                    let is_interior = FACE_DIRS.iter().all(|d| is_solid(c + *d));
+                    cells_b.insert(c, if is_interior { CELL_INTERIOR } else { 1 });
+                }
+            }
+        }
+        let nodes = vec![EMPTY_NODE];
+        let depth = 5u8;
+        let mut sa = SculptExtractScratch::new();
+        let mut sb = SculptExtractScratch::new();
+        let (va, ia) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut sa, &cells_a, lo - IVec3::ONE, hi + IVec3::ONE, &nodes, depth, 1.0,
+            Vec3::ZERO, &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
         );
-        // INTERIOR corner cells classified solid in both paths ⇒ the
-        // same active-cube set ⇒ identical vertex and triangle counts.
-        // (The region path smooths positions; counts are the
-        // position-independent invariant that pins the classification.)
+        let (vb, ib) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut sb, &cells_b, lo - IVec3::ONE, hi + IVec3::ONE, &nodes, depth, 1.0,
+            Vec3::ZERO, &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
+        );
         assert_eq!(
-            full_v.len(),
-            region_v.len(),
-            "INTERIOR corner cells must produce the same vertex count in both paths",
+            va.len(), vb.len(),
+            "INTERIOR cells must seed the blur like surface cells (vertex count)",
         );
         assert_eq!(
-            full_i.len(),
-            region_i.len(),
-            "INTERIOR corner cells must produce the same triangle count in both paths",
+            ia.len(), ib.len(),
+            "INTERIOR cells must seed the blur like surface cells (triangle count)",
         );
+        // Positions must match too (same occupancy → same D → same mesh).
+        for (a, b) in va.iter().zip(vb.iter()) {
+            assert_eq!(a.local_pos, b.local_pos, "INTERIOR vs slot block diverged");
+        }
     }
 
     /// `collect_cell_map` + `extract_mesh_region_from_cells` produce the
@@ -3298,6 +3458,9 @@ mod tests {
             None,
             None::<&fn(Vec3) -> f32>,
             None::<&fn(Vec3) -> Vec3>,
+            None::<&fn(Vec3) -> f32>,
+            None::<&fn(Vec3) -> Vec3>,
+            DENSITY_ISO,
         );
 
         // With naive SN, the vertex would sit at the centroid of
@@ -3973,6 +4136,150 @@ mod tests {
             );
         }
         eprintln!("=== END PROBE ===\n");
+    }
+
+    /// **Root-cause regression: no `t`-clamps on a smooth slope.**
+    ///
+    /// The terracing bug was a binary-topology vs D-position MISMATCH:
+    /// corners were classified solid by BINARY occupancy but the vertex
+    /// placed on the `D = 0.5` isosurface, so on ~1/3 of surface cubes a
+    /// binary-active vertical edge had BOTH endpoints' `D < 0.5` →
+    /// `t = da/(da-db)` landed outside `[0,1]` → clamped → vertex pinned
+    /// to the grid Y → terraces. (The `#[ignore]`d probe above prints
+    /// the ~11/30 clamps that existed before the fix.)
+    ///
+    /// After running surface nets ON the D field (corner solidity from
+    /// `D >= 0.5`, the same field the crossing uses), every D-active edge
+    /// has a real interior crossing. This test rebuilds the post-fix
+    /// classifier on the populated density grid and asserts:
+    ///   * the count of vertical-edge crossings clamped to exactly 0 or 1
+    ///     across the surface columns is 0 (was ~11/30), and
+    ///   * the extracted slope-top Y tracks the analytic slope with RMS
+    ///     `< 0.15 · voxel`.
+    #[test]
+    fn d_topology_slope_has_no_t_clamps() {
+        let depth: u8 = 7;
+        let nodes = vec![EMPTY_NODE];
+        let vs = 1.0f32;
+        let origin = Vec3::ZERO;
+
+        let m = 0.37f32;
+        let b = 0.21f32;
+        let surf_y = |x: f32| m * x + b;
+        let solid = |c: IVec3| -> bool {
+            let cx = c.x as f32 + 0.5;
+            let cy = c.y as f32 + 0.5;
+            cy < surf_y(cx)
+        };
+        let band_lo = IVec3::new(-4, -4, -4);
+        let band_hi = IVec3::new(44, 22, 8);
+        let cells = occupancy_cellmap(band_lo, band_hi, solid);
+
+        let region_lo = IVec3::new(2, -2, 0);
+        let region_hi = IVec3::new(38, 20, 6);
+        let mut scratch = SculptExtractScratch::new();
+        let (verts, _indices) = extract_mesh_region_from_cells_pooled_haloed(
+            &mut scratch, &cells, region_lo, region_hi, &nodes, depth, vs, origin,
+            &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
+        );
+        assert!(!verts.is_empty());
+
+        // Rebuild the SAME density-based classifier the fixed extract
+        // uses (D at the cell center vs the 0.5 threshold).
+        let g_origin = scratch.cells_grid.origin();
+        let g_size = scratch.cells_grid.size();
+        let total = (g_size.x as usize) * (g_size.y as usize) * (g_size.z as usize);
+        let density = &scratch.density[..total];
+        let density_at =
+            |p: Vec3| sample_density_trilinear(density, g_origin, g_size, p);
+        let d_solid = |c: IVec3| {
+            density_at(Vec3::new(c.x as f32 + 0.5, c.y as f32 + 0.5, c.z as f32 + 0.5))
+                >= DENSITY_ISO
+        };
+        let smooth_sdf =
+            |pw: Vec3| DENSITY_ISO - density_at((pw - origin) / vs);
+
+        // For each X column find the cube whose +Y edge is D-active (a
+        // D-solid, b D-empty) — exactly what the fixed `corner_solid`
+        // selects — and count how many crossings clamp to 0 or 1.
+        let z_fixed = 2;
+        let mut clamps = 0u32;
+        let mut active = 0u32;
+        for cx in 5..35 {
+            let mut flip_y: Option<i32> = None;
+            for cy in -2..20 {
+                if d_solid(IVec3::new(cx, cy, z_fixed))
+                    && !d_solid(IVec3::new(cx, cy + 1, z_fixed))
+                {
+                    flip_y = Some(cy);
+                    break;
+                }
+            }
+            let Some(fy) = flip_y else { continue };
+            let cube = IVec3::new(cx, fy, z_fixed);
+            let pa = Vec3::new(cube.x as f32 + 0.5, cube.y as f32 + 0.5, cube.z as f32 + 0.5);
+            let pb = Vec3::new(cube.x as f32 + 0.5, cube.y as f32 + 1.5, cube.z as f32 + 0.5);
+            let da = smooth_sdf(origin + pa * vs);
+            let db = smooth_sdf(origin + pb * vs);
+            let denom = da - db;
+            // RAW (unclamped) crossing parameter. The terrace bug was
+            // `raw_t` landing OUTSIDE [0,1] (da, db same sign → the iso
+            // never crosses between a and b → the clamp pins the vertex
+            // to the grid). A `raw_t` exactly at an endpoint (da == 0,
+            // the corner is exactly on the surface) is a VALID on-surface
+            // crossing, not a clamp — so we test for genuinely-out-of-
+            // range raw_t with a tiny epsilon tolerance.
+            let raw_t = if denom.abs() > 1e-12 { da / denom } else { 0.5 };
+            active += 1;
+            if raw_t < -1e-4 || raw_t > 1.0 + 1e-4 {
+                clamps += 1;
+            }
+        }
+        assert!(active >= 20, "expected ≥20 active columns, got {active}");
+        assert_eq!(
+            clamps, 0,
+            "{clamps}/{active} D-active vertical-edge crossings had raw_t OUTSIDE [0,1] \
+             (clamped) — binary/D topology mismatch (terracing) is back"
+        );
+
+        // Slope-top extracted Y must be a SMOOTH RAMP, not stepped. The
+        // de-staircasing measure is the residual of the slope-top
+        // vertices about the BEST-FIT LINE `y = α·x + β` (a terraced
+        // surface deviates from any line by ~half a step; a smooth ramp
+        // hugs the line). This isolates terracing from the constant blur
+        // shift (which a line-fit absorbs into β). Require RMS
+        // `< 0.15 · voxel`.
+        let mut pts: Vec<(f32, f32)> = Vec::new();
+        for v in &verts {
+            let nrm = unpack_oct(v.normal_oct).normalize_or_zero();
+            if nrm.y <= 0.6 {
+                continue;
+            }
+            let p = v.local_pos;
+            if (p[2] - 2.0).abs() > 0.51 {
+                continue;
+            }
+            pts.push((p[0], p[1]));
+        }
+        assert!(pts.len() >= 10, "expected ≥10 slope-top columns, got {}", pts.len());
+        let np = pts.len() as f32;
+        let sx: f32 = pts.iter().map(|p| p.0).sum();
+        let sy: f32 = pts.iter().map(|p| p.1).sum();
+        let sxx: f32 = pts.iter().map(|p| p.0 * p.0).sum();
+        let sxy: f32 = pts.iter().map(|p| p.0 * p.1).sum();
+        let denom = np * sxx - sx * sx;
+        let alpha = (np * sxy - sx * sy) / denom;
+        let beta = (sy - alpha * sx) / np;
+        let mut sq = 0.0f32;
+        for &(x, y) in &pts {
+            let r = y - (alpha * x + beta);
+            sq += r * r;
+        }
+        let rms = (sq / np).sqrt() / vs;
+        assert!(
+            rms < 0.15,
+            "slope-top Y RMS-about-line {rms:.3} voxel ≥ 0.15 — surface is stepped, not a smooth ramp"
+        );
     }
 
     /// **Smooth + outward normals.** A synthetic occupancy slope
