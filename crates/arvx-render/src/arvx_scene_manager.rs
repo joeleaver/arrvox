@@ -33,6 +33,7 @@ mod types;
 mod voxelize;
 
 // Public re-exports — keep `arvx_render::arvx_scene_manager::Foo` stable.
+pub use asset_load::LoadedAsset;
 pub use manager::{ms_since_process_ns, ArvxSceneManager, WalkSnapshot};
 pub use sculpt::SculptApplyResult;
 pub use terrain_halo_refresh::{

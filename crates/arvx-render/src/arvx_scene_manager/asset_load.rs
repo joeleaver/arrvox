@@ -9,13 +9,53 @@
 
 use std::path::PathBuf;
 
-use arvx_core::{LeafAttr, SparseOctree};
+use arvx_core::{BrickPool, LeafAttr, LeafAttrPool, SparseOctree};
 
 use super::manager::ArvxSceneManager;
 use super::types::{
     AssetEntry, AssetHandle, AssetInfo, ReloadResult, SkinningAssetData,
 };
 use crate::mesh_pass::extract_surface_mesh;
+
+/// A fully-built, **file-local** asset produced by
+/// [`ArvxSceneManager::build_loaded_asset`]. Every index it carries —
+/// brick cells, octree brick-node ids, prefilter `internal_attr_index`,
+/// and mesh-vertex `leaf_attr_id`s — is relative to this asset's own
+/// private pools starting at 0. [`ArvxSceneManager::splice_loaded_asset`]
+/// folds in the scene-global offsets when it copies the private pools
+/// into the shared scene pools.
+///
+/// Because the build touches no shared state, it runs entirely on a
+/// worker thread (the engine's asset-load worker), keeping the ~1 s
+/// octree-compact / dedup / morton / prefilter / mesh work off the main
+/// thread; only the bounded splice runs under the `scene_mgr` lock.
+///
+/// Fields are module-private: the type is *named* across the crate
+/// boundary (the engine holds it in a channel) but only `build_*` /
+/// `splice_*` ever read its insides.
+pub struct LoadedAsset {
+    path: PathBuf,
+    /// File-local: brick-node ids and `internal_attr_index` are 0-based.
+    tree: SparseOctree,
+    /// Private leaf_attr pool (attrs + colors + bones); file slot `i` at index `i`.
+    leaf_attr_pool: LeafAttrPool,
+    /// Private brick pool; cells hold file-local leaf_attr slot indices.
+    brick_pool: BrickPool,
+    file_brick_count: u32,
+    voxel_size: f32,
+    aabb: arvx_core::Aabb,
+    /// Surface-cell count (→ `AssetEntry.voxel_count`).
+    actual_cell_count: u32,
+    mesh_vertices: Vec<crate::mesh_pass::MeshVertex>,
+    mesh_indices: Vec<u32>,
+    meshlet_clusters: Vec<crate::mesh_pass::MeshletCluster>,
+    mesh_lod0_index_count: u32,
+    dag_groups: Vec<arvx_core::mesh_lod::DagGroup>,
+    dag_consumed: Vec<u32>,
+    dag_produced: Vec<u32>,
+    skinning: Option<SkinningAssetData>,
+    cluster_spatial_index: super::cluster_spatial_index::ClusterSpatialIndex,
+}
 
 impl ArvxSceneManager {
     fn resolve_rkp_path(path: &str) -> Result<PathBuf, String> {
@@ -66,6 +106,21 @@ impl ArvxSceneManager {
         let info = entry.info();
         let handle = self.asset_cache.insert(entry);
         Ok((handle, info))
+    }
+
+    /// Acquire an asset **only if it is already cached** — the path-keyed
+    /// refcount-bump fast path of [`Self::acquire_asset`], without the
+    /// synchronous disk load on a miss. Returns `None` when the asset is
+    /// not yet resident, so the caller (the async scene-load drain) can
+    /// defer the heavy build to the off-thread loader. Bumps the geometry
+    /// epoch only on a hit, mirroring `acquire_asset`'s cache-hit path.
+    pub fn try_acquire_cached(&mut self, path: &str) -> Option<(AssetHandle, AssetInfo)> {
+        let canonical = Self::resolve_rkp_path(path).ok()?;
+        let handle = self.asset_cache.lookup_path(&canonical)?;
+        self.bump_geometry_epoch();
+        let entry = self.asset_cache.get_mut(handle)?;
+        entry.refcount += 1;
+        Some((handle, entry.info()))
     }
 
     /// Force a reload of a cached asset from disk. Used after re-import
@@ -153,12 +208,23 @@ impl ArvxSceneManager {
         self.bump_geometry_epoch();
     }
 
-    /// Disk read + pool allocation for one .arvx file. Called exactly once
-    /// per unique path — repeated acquisitions share the returned entry
-    /// via the cache.
-    fn load_asset_from_disk(&mut self, arvx_path: &std::path::Path) -> Result<AssetEntry, String> {
+    /// Disk read + **private, file-local** asset build for one .arvx
+    /// file. Takes no `&self` — it touches no shared scene state, so it
+    /// runs on the engine's asset-load worker thread. The expensive
+    /// integrate work (octree compact / dedup / morton, prefilter, mesh
+    /// deserialize / v4 extract, cluster spatial index) all happens here
+    /// against private pools; [`Self::splice_loaded_asset`] does the
+    /// bounded main-thread splice. See [`LoadedAsset`].
+    pub fn build_loaded_asset(asset_path: &std::path::Path) -> Result<LoadedAsset, String> {
         use arvx_core::voxel::VoxelSample;
         let t0 = std::time::Instant::now();
+
+        // Resolve to the canonical `.arvx` path so `LoadedAsset.path`
+        // matches the cache key `acquire_asset` / `try_acquire_cached`
+        // use — otherwise the async splice would insert under a
+        // non-canonical path and the cache lookup would miss + re-build.
+        let arvx_path = Self::resolve_rkp_path(&asset_path.to_string_lossy())?;
+        let arvx_path = arvx_path.as_path();
 
         let mut file = std::fs::File::open(arvx_path)
             .map_err(|e| format!("open {}: {e}", arvx_path.display()))?;
@@ -333,8 +399,12 @@ impl ArvxSceneManager {
         // ratio ≈1.0× on mesh imports — HashMap overhead costs more than
         // the trivial savings). Each file slot maps directly to
         // `leaf_attr_slot_start + file_slot`.
+        // Private, file-local leaf_attr pool — slot `i` holds file slot
+        // `i`. `splice_loaded_asset` folds in the scene-global
+        // `leaf_attr_slot_start` later via `LeafAttrPool::splice_assimilate`.
         let leaf_attr_slot_count = voxel_count;
-        let leaf_attr_slot_start = self.leaf_attr_pool
+        let mut leaf_attr_pool = LeafAttrPool::new(leaf_attr_slot_count.max(1));
+        leaf_attr_pool
             .allocate_contiguous_bump(leaf_attr_slot_count)
             .expect("leaf_attr_pool.allocate_contiguous_bump failed");
 
@@ -343,36 +413,27 @@ impl ArvxSceneManager {
             if let Some(n) = normal_oct {
                 attr.normal_oct = n;
             }
-            let slot = leaf_attr_slot_start + i as u32;
-            *self.leaf_attr_pool.get_mut(slot) = attr;
+            let slot = i as u32;
+            *leaf_attr_pool.get_mut(slot) = attr;
             if color != 0 {
-                self.leaf_attr_pool.set_color(slot, color);
+                leaf_attr_pool.set_color(slot, color);
             }
-            // File-local bone slot i → scene-global leaf_attr slot. The
-            // `file_bones` slice is empty for unskinned assets, in which
-            // case the pool's zero-default BoneVoxel stands.
+            // `file_bones` is empty for unskinned assets, in which case
+            // the pool's zero-default BoneVoxel stands.
             if let Some(&bv) = file_bones.get(i) {
-                self.leaf_attr_pool.set_bone(slot, bv);
+                leaf_attr_pool.set_bone(slot, bv);
             }
         }
 
-        // v4: copy file brick pool into the scene brick pool. Each file
-        // cell holds a file-local slot index; we shift both brick-ids
-        // (in the octree nodes) and slot indices (in the cells) by our
-        // contiguous allocation offsets.
+        // Private, file-local brick pool. Cells keep file-local slot
+        // indices and the octree's BRICK node ids stay file-local too;
+        // `splice_loaded_asset` shifts both by the scene allocation
+        // offsets when it copies the pool in. v4 requires a bricks section.
         let file_brick_count = (file_brick_cells.len() / arvx_core::brick_pool::BRICK_CELLS as usize) as u32;
-        let scene_brick_offset = self.brick_pool
+        let mut brick_pool = BrickPool::new(file_brick_count.max(1));
+        brick_pool
             .allocate_contiguous_bump(file_brick_count)
             .expect("brick_pool.allocate_contiguous_bump failed");
-
-        // Remap BRICK node ids in the flat nodes array.
-        let nodes = tree.as_slice_mut();
-        for n in nodes.iter_mut() {
-            if arvx_core::sparse_octree::is_brick(*n) {
-                let file_id = arvx_core::sparse_octree::brick_id(*n);
-                *n = arvx_core::sparse_octree::make_brick(scene_brick_offset + file_id);
-            }
-        }
 
         // Actual surface-cell count across this asset. `header.voxel_count`
         // only counts unique LeafAttr slots (one per unique normal +
@@ -386,7 +447,6 @@ impl ArvxSceneManager {
         let mut actual_cell_count: u32 = 0;
         let brick_cells = arvx_core::brick_pool::BRICK_CELLS as usize;
         for file_id in 0..file_brick_count {
-            let scene_id = scene_brick_offset + file_id;
             let src = &file_brick_cells[
                 file_id as usize * brick_cells..(file_id as usize + 1) * brick_cells
             ];
@@ -394,26 +454,23 @@ impl ArvxSceneManager {
                 if cell == arvx_core::brick_pool::BRICK_EMPTY {
                     continue;
                 }
-                // BRICK_INTERIOR is a scene-global sentinel (0xFFFFFFFD),
-                // not a file-local slot index — pass it through without
-                // the leaf_attr_slot_start offset, which would overflow
-                // and corrupt the slot into a bogus leaf_attr_id. Also
-                // skip it from the user-facing voxel count: interior
-                // sentinels mark "inside the solid" and never render /
-                // paint as voxels.
+                // BRICK_INTERIOR is a global sentinel (0xFFFFFFFD), not a
+                // slot index — pass it through unshifted (the splice's
+                // `splice_assimilate_shifted` does the same) and skip it
+                // from the user-facing voxel count: interior sentinels
+                // mark "inside the solid" and never render / paint.
                 let remapped = if cell == arvx_core::brick_pool::BRICK_INTERIOR {
                     arvx_core::brick_pool::BRICK_INTERIOR
                 } else {
-                    // Real leaf: cell is a file-local slot index; shift
-                    // by our leaf_attr allocation offset to get the
-                    // scene-global leaf_attr_id.
+                    // Real leaf: keep the file-local slot index; the
+                    // splice folds in `leaf_attr_slot_start`.
                     actual_cell_count += 1;
-                    leaf_attr_slot_start + cell
+                    cell
                 };
                 let x = (i as u32) % arvx_core::brick_pool::BRICK_DIM;
                 let y = ((i as u32) / arvx_core::brick_pool::BRICK_DIM) % arvx_core::brick_pool::BRICK_DIM;
                 let z = (i as u32) / (arvx_core::brick_pool::BRICK_DIM * arvx_core::brick_pool::BRICK_DIM);
-                self.brick_pool.set_cell(scene_id, x, y, z, remapped);
+                brick_pool.set_cell(file_id, x, y, z, remapped);
             }
         }
         // Shallow trees (depth ≤ BRICK_LEVELS) skip the brick path and
@@ -458,11 +515,12 @@ impl ArvxSceneManager {
         // existing deallocate_range releases everything on asset drop.
         arvx_core::prefilter::prefilter_octree_internals(
             &mut tree,
-            &mut self.leaf_attr_pool,
-            &self.brick_pool,
+            &mut leaf_attr_pool,
+            &brick_pool,
         );
-        let final_leaf_attr_slot_count =
-            self.leaf_attr_pool.allocated_count() - leaf_attr_slot_start;
+        // Private pool started at slot 0, so `allocated_count` is the full
+        // file-local leaf_attr count including the prefilter tail.
+        let prefilter_added = leaf_attr_pool.allocated_count() - leaf_attr_slot_count;
 
         // v5+ pre-built mesh deserialization. The .arvx ships
         // `(MeshVertex[], u32[], MeshletCluster[])` so the editor
@@ -528,14 +586,15 @@ impl ArvxSceneManager {
                 header.octree_depth as u8,
                 header.base_voxel_size,
                 asset_grid_origin,
-                self.brick_pool.as_slice(),
-                self.leaf_attr_pool.as_slice(),
-                // Fallback path runs against scene-merged pools, so
-                // by the time we get here the bone slice has been
-                // populated via `set_bone(slot, bv)` above. Skinned
-                // v4 assets get their bone weights baked into the
-                // newly extracted vertices on the spot.
-                self.leaf_attr_pool.bones_as_slice(),
+                brick_pool.as_slice(),
+                leaf_attr_pool.as_slice(),
+                // Fallback runs against the PRIVATE file-local pools, so
+                // the extracted vertices carry file-local `leaf_attr_id`s
+                // (shifted to scene-global in `splice_loaded_asset`, the
+                // same as the v5 baked-mesh path). Skinned v4 assets get
+                // their bone weights baked in via the bone slice, which
+                // `set_bone` populated above.
+                leaf_attr_pool.bones_as_slice(),
                 // Fresh asset load: no sculpt history.
                 None,
             );
@@ -640,17 +699,12 @@ impl ArvxSceneManager {
             }
         }
 
-        // Relocate vertex `leaf_attr_id`s from file-local (what
-        // arvx-import baked into v5) to scene-global. The legacy v4
-        // path already produced scene-global IDs because it ran
-        // `extract_surface_mesh` against the scene-merged pools.
-        // **Order matters:** the bone-merge above must run BEFORE
-        // this — `file_bones` is indexed by file-local slot id.
-        if have_baked_mesh && leaf_attr_slot_start > 0 && !mesh_vertices.is_empty() {
-            for v in &mut mesh_vertices {
-                v.leaf_attr_id += leaf_attr_slot_start;
-            }
-        }
+        // Vertex `leaf_attr_id`s stay **file-local** here — both the v5
+        // baked-mesh path and the v4 extractor (now run against the
+        // private file-local pools) produce file-local ids.
+        // `splice_loaded_asset` shifts them to scene-global. The bone-
+        // merge above must run BEFORE any shift — `file_bones` is indexed
+        // by file-local slot id.
 
         // Phase 6.6: cluster AABB expansion for skinned assets is
         // intentionally disabled. The original plan (union the
@@ -692,21 +746,10 @@ impl ArvxSceneManager {
         // original flat VBO/IBO (see `rebuild_dirty_clusters`), so
         // load keeps the build_cluster_dag output verbatim.
 
-        // Compute brick face-links for this asset. The tree's brick ids
-        // have already been remapped to global ids above, so the rows
-        // produced are scene-global and ready to merge. When the file
-        // had zero bricks there's nothing to compute.
-        if file_brick_count > 0 {
-            let max_brick = scene_brick_offset + file_brick_count - 1;
-            let face_links = arvx_core::brick_face_links::compute_brick_face_links(&tree, max_brick);
-            self.merge_face_links(&face_links);
-        }
-
-        // Allocate the octree with its now-populated internal_attr_index
-        // intact. `allocate(&tree)` preserves both buffers; the legacy
-        // `allocate_raw(nodes, …)` would have dropped the prefilter ids
-        // by round-tripping through `SparseOctree::from_raw`.
-        let handle = self.octree.allocate(&tree);
+        // Brick-id remap, face-links, and `octree.allocate` are all
+        // scene-global and happen in `splice_loaded_asset`. The tree
+        // here still carries file-local brick ids and prefilter
+        // `internal_attr_index` entries.
 
         eprintln!(
             "[ArvxSceneManager] loaded {}: {} voxels ({} unique attrs), {} bricks, octree {} → compact {} → dedup {} ({:.1}× total), +{} prefilter attrs, mesh {} verts / lod0 {} tris / dag {} tris / {} clusters max-lod {}",
@@ -718,7 +761,7 @@ impl ArvxSceneManager {
             compact_count,
             dedup_count,
             if dedup_count > 0 { raw_count as f64 / dedup_count as f64 } else { 0.0 },
-            final_leaf_attr_slot_count - leaf_attr_slot_count,
+            prefilter_added,
             mesh_vertices.len(),
             mesh_lod0_index_count / 3,
             mesh_indices.len() / 3,
@@ -811,41 +854,159 @@ impl ArvxSceneManager {
         let mut cluster_spatial_index =
             super::cluster_spatial_index::ClusterSpatialIndex::new();
         {
-            let extent_f = (1u32 << handle.depth) as f32 * voxel_size;
+            // `octree_depth` equals the depth the scene `OctreeHandle`
+            // will carry after `octree.allocate`, so the grid origin is
+            // identical to the scene-handle convention used elsewhere.
+            let extent_f = (1u32 << octree_depth) as f32 * voxel_size;
             let aabb_center = (aabb.min + aabb.max) * 0.5;
             let grid_origin = aabb_center - glam::Vec3::splat(extent_f * 0.5);
             cluster_spatial_index.rebuild(&meshlet_clusters, grid_origin, voxel_size);
         }
 
-        // The slab allocator considers the whole bake-time index buffer
-        // as "in use" (every range is owned by a `MeshletCluster`'s
-        // `(index_offset, index_count)`). New patch / filter
-        // allocations append past `next_free` or reuse interior slots
-        // we free during sculpt. Dirty range is `[0, len * 4)` so the
-        // first upload pushes the freshly-loaded IBO to the GPU.
+        eprintln!(
+            "[asset-build] {} read+decompress={:.0}ms build={:.0}ms voxels={}",
+            arvx_path.display(),
+            t_read_ms,
+            t0.elapsed().as_secs_f32() * 1000.0 - t_read_ms,
+            actual_cell_count,
+        );
+
+        Ok(LoadedAsset {
+            path: arvx_path.to_path_buf(),
+            tree,
+            leaf_attr_pool,
+            brick_pool,
+            file_brick_count,
+            voxel_size,
+            aabb,
+            actual_cell_count,
+            mesh_vertices,
+            mesh_indices,
+            meshlet_clusters,
+            mesh_lod0_index_count,
+            dag_groups,
+            dag_consumed,
+            dag_produced,
+            skinning,
+            cluster_spatial_index,
+        })
+    }
+
+    /// Splice a [`LoadedAsset`] (built by [`Self::build_loaded_asset`])
+    /// into the shared scene pools. This is the **only** part of the load
+    /// that touches scene state, so it runs on the main thread under the
+    /// `scene_mgr` lock. The work is bounded: three pool memcpys, a few
+    /// file-local → scene-global offset passes (brick-node ids, prefilter
+    /// `internal_attr_index`, mesh-vertex `leaf_attr_id`s), the face-link
+    /// merge, and `octree.allocate`. Does **not** bump the geometry
+    /// epoch nor insert into the asset cache — the synchronous callers
+    /// (`acquire_asset` / `reload_asset`) bump at the top and own the
+    /// cache slot; the async path goes through [`Self::integrate_loaded_asset`].
+    fn splice_loaded_asset(&mut self, loaded: LoadedAsset) -> AssetEntry {
+        let t_splice = std::time::Instant::now();
+        let LoadedAsset {
+            path,
+            mut tree,
+            leaf_attr_pool,
+            brick_pool,
+            file_brick_count,
+            voxel_size,
+            aabb,
+            actual_cell_count,
+            mut mesh_vertices,
+            mesh_indices,
+            meshlet_clusters,
+            mesh_lod0_index_count,
+            dag_groups,
+            dag_consumed,
+            dag_produced,
+            skinning,
+            cluster_spatial_index,
+        } = loaded;
+
+        // Splice the private leaf_attr pool (attrs + colors + bones) in
+        // as one contiguous tail range. `final_leaf_attr_slot_count`
+        // includes the prefilter tail the build appended.
+        let final_leaf_attr_slot_count = leaf_attr_pool.allocated_count();
+        let leaf_attr_slot_start = self.leaf_attr_pool.splice_assimilate(&leaf_attr_pool);
+
+        // Splice the private brick pool, shifting every real cell (a
+        // file-local leaf_attr slot) by `leaf_attr_slot_start`; the
+        // BRICK_EMPTY / BRICK_INTERIOR sentinels pass through unshifted.
+        let scene_brick_offset = self
+            .brick_pool
+            .splice_assimilate_shifted(&brick_pool, leaf_attr_slot_start);
+
+        // Shift the tree's file-local BRICK node ids to scene-global.
+        {
+            let nodes = tree.as_slice_mut();
+            for n in nodes.iter_mut() {
+                if arvx_core::sparse_octree::is_brick(*n) {
+                    let file_id = arvx_core::sparse_octree::brick_id(*n);
+                    *n = arvx_core::sparse_octree::make_brick(scene_brick_offset + file_id);
+                }
+            }
+        }
+
+        // Shift the prefilter `internal_attr_index` ids to scene-global,
+        // skipping the INTERNAL_ATTR_NONE sentinel (the same skip-and-add
+        // discipline the prefilter's own in-range assertion uses).
+        if leaf_attr_slot_start > 0 {
+            let mut attrs: Vec<u32> = tree.internal_attr_slice().to_vec();
+            for a in attrs.iter_mut() {
+                if *a != arvx_core::sparse_octree::INTERNAL_ATTR_NONE {
+                    *a += leaf_attr_slot_start;
+                }
+            }
+            tree.set_internal_attr_index(attrs);
+        }
+
+        // Shift mesh-vertex `leaf_attr_id`s to scene-global. Both the v5
+        // baked path and the v4 extractor (run against the private
+        // file-local pools in the build) produced file-local ids.
+        if leaf_attr_slot_start > 0 {
+            for v in &mut mesh_vertices {
+                v.leaf_attr_id += leaf_attr_slot_start;
+            }
+        }
+
+        // Brick face-links — the tree's brick ids are now scene-global,
+        // so the rows are ready to merge.
+        if file_brick_count > 0 {
+            let max_brick = scene_brick_offset + file_brick_count - 1;
+            let face_links =
+                arvx_core::brick_face_links::compute_brick_face_links(&tree, max_brick);
+            self.merge_face_links(&face_links);
+        }
+
+        // Allocate the octree, preserving its populated internal_attr_index.
+        let handle = self.octree.allocate(&tree);
+
+        // Slab-allocator dirty ranges — full re-mark so the first upload
+        // pushes the freshly-spliced IBO/VBO to the GPU.
         let mesh_indices_next_free = mesh_indices.len() as u32;
         let mut mesh_indices_dirty = arvx_core::DirtyRanges::new();
-        let total_bytes = (mesh_indices.len() as u32)
-            .saturating_mul(super::types::MESH_INDEX_STRIDE);
+        let total_bytes =
+            (mesh_indices.len() as u32).saturating_mul(super::types::MESH_INDEX_STRIDE);
         if total_bytes > 0 {
             mesh_indices_dirty.mark_full(total_bytes);
         }
         let mut mesh_vertices_dirty = arvx_core::DirtyRanges::new();
-        let vbo_total_bytes = (mesh_vertices.len()
-            * std::mem::size_of::<crate::mesh_pass::MeshVertex>()) as u32;
+        let vbo_total_bytes =
+            (mesh_vertices.len() * std::mem::size_of::<crate::mesh_pass::MeshVertex>()) as u32;
         if vbo_total_bytes > 0 {
             mesh_vertices_dirty.mark_full(vbo_total_bytes);
         }
 
         eprintln!(
-            "[asset-load-timing] {} read+decompress={:.0}ms integrate={:.0}ms voxels={}",
-            arvx_path.display(),
-            t_read_ms,
-            t0.elapsed().as_secs_f32() * 1000.0 - t_read_ms,
-            voxel_count,
+            "[asset-splice] {} splice={:.1}ms voxels={}",
+            path.display(),
+            t_splice.elapsed().as_secs_f32() * 1000.0,
+            actual_cell_count,
         );
-        Ok(AssetEntry {
-            path: arvx_path.to_path_buf(),
+
+        AssetEntry {
+            path,
             refcount: 1,
             spatial_handle: handle,
             voxel_size,
@@ -876,12 +1037,43 @@ impl ArvxSceneManager {
             sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             // Disk-loaded non-terrain assets have no halo by
-            // construction; the slice stays empty. Terrain tiles
-            // populate this through `integrate_baked_tile`. Phase 4.4
-            // (.arvxtile load) will revisit this for tiles loaded
-            // from disk.
+            // construction; the slice stays empty. Terrain tiles populate
+            // this through `integrate_baked_tile`.
             halo_cells: Vec::new(),
-        })
+        }
+    }
+
+    /// Disk read + pool integrate for one .arvx file — the synchronous
+    /// composition of [`Self::build_loaded_asset`] (off-thread-capable)
+    /// and [`Self::splice_loaded_asset`] (main-thread). Used by the
+    /// non-deferred callers (`acquire_asset` cache-miss, `reload_asset`);
+    /// the engine's scene-load path runs the two halves across threads.
+    fn load_asset_from_disk(&mut self, arvx_path: &std::path::Path) -> Result<AssetEntry, String> {
+        let loaded = Self::build_loaded_asset(arvx_path)?;
+        Ok(self.splice_loaded_asset(loaded))
+    }
+
+    /// Integrate a [`LoadedAsset`] built off-thread by
+    /// [`Self::build_loaded_asset`]: splice it into the shared pools and
+    /// insert it into the asset cache, returning the handle + info the
+    /// same way [`Self::acquire_asset`]'s cache-miss path does. This is
+    /// the main-thread half of the async scene-load path; the caller
+    /// (the engine's `drain_pending_asset_loads`) holds the `scene_mgr`
+    /// lock and bumps the geometry epoch around the call, mirroring
+    /// `acquire_asset`'s top-of-fn bump.
+    ///
+    /// Repeated instances of the same `.arvx` should reuse the cache via
+    /// [`Self::acquire_asset`] (a cheap path-keyed refcount bump) — this
+    /// method always allocates fresh pool ranges, so calling it twice for
+    /// one path would double-integrate the geometry.
+    pub fn integrate_loaded_asset(
+        &mut self,
+        loaded: LoadedAsset,
+    ) -> (AssetHandle, AssetInfo) {
+        let entry = self.splice_loaded_asset(loaded);
+        let info = entry.info();
+        let handle = self.asset_cache.insert(entry);
+        (handle, info)
     }
 
     /// Peek at an asset's skinning metadata. Returns `None` when the
@@ -1076,5 +1268,154 @@ mod load_roundtrip_tests {
             "load must be deterministic across managers"
         );
         assert_eq!(info.leaf_attr_slot_count, info3.leaf_attr_slot_count);
+    }
+
+    /// The async entry point — `build_loaded_asset` (off-thread, no
+    /// `&self`) then `integrate_loaded_asset` (main-thread splice) — must
+    /// produce a result byte-identical to the synchronous `acquire_asset`.
+    /// This is the core equivalence guard for the off-thread loader split:
+    /// if the build/splice offset shifts ever diverge from the inline
+    /// path, the spliced octree / mesh bytes here stop matching.
+    #[test]
+    fn build_then_integrate_matches_acquire_asset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (path, _) = write_sphere_arvx(tmp.path());
+        let path_str = path.to_string_lossy().to_string();
+
+        // Synchronous path.
+        let mut sm_sync = ArvxSceneManager::new(1_000_000);
+        let (h_sync, info_sync) = sm_sync.acquire_asset(&path_str).expect("sync acquire");
+
+        // Async path: build (no &self) then integrate.
+        let mut sm_async = ArvxSceneManager::new(1_000_000);
+        let loaded = ArvxSceneManager::build_loaded_asset(&path).expect("build");
+        let (h_async, info_async) = sm_async.integrate_loaded_asset(loaded);
+
+        assert_eq!(info_sync.voxel_count, info_async.voxel_count);
+        assert_eq!(info_sync.leaf_attr_slot_start, info_async.leaf_attr_slot_start);
+        assert_eq!(info_sync.leaf_attr_slot_count, info_async.leaf_attr_slot_count);
+        match (&info_sync.spatial, &info_async.spatial) {
+            (
+                arvx_core::scene_node::SpatialHandle::Octree { len: l1, .. },
+                arvx_core::scene_node::SpatialHandle::Octree { len: l2, .. },
+            ) => assert_eq!(l1, l2, "octree length must match"),
+            _ => panic!("expected Octree spatials"),
+        }
+
+        // Mesh bytes identical.
+        let (v1, i1, lod1) = sm_sync.asset_mesh(h_sync).unwrap();
+        let (v2, i2, lod2) = sm_async.asset_mesh(h_async).unwrap();
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(v1),
+            bytemuck::cast_slice::<_, u8>(v2),
+            "mesh vertices must be byte-identical"
+        );
+        assert_eq!(i1, i2, "mesh indices must match");
+        assert_eq!(lod1, lod2, "lod0 index count must match");
+
+        // Spliced octree (nodes + prefilter internal_attr) identical.
+        let e1 = sm_sync.asset_cache.get(h_sync).unwrap();
+        let e2 = sm_async.asset_cache.get(h_async).unwrap();
+        assert_eq!(e1.cpu_octree.as_slice(), e2.cpu_octree.as_slice());
+        assert_eq!(
+            e1.cpu_octree.internal_attr_slice(),
+            e2.cpu_octree.internal_attr_slice()
+        );
+    }
+
+    /// Loading a second asset into a populated manager must shift every
+    /// file-local index (brick cells, prefilter `internal_attr_index`,
+    /// mesh vertex `leaf_attr_id`) by the asset's scene-global
+    /// `leaf_attr_slot_start`, while leaving the `BRICK_EMPTY` /
+    /// `BRICK_INTERIOR` / `INTERNAL_ATTR_NONE` sentinels untouched.
+    #[test]
+    fn second_asset_shifts_indices_into_its_scene_range() {
+        // Two distinct paths so the second is a real load, not a cache hit.
+        let tmp_a = tempfile::tempdir().expect("tempdir a");
+        let tmp_b = tempfile::tempdir().expect("tempdir b");
+        let (path_a, _) = write_sphere_arvx(tmp_a.path());
+        let (path_b, _) = write_sphere_arvx(tmp_b.path());
+
+        let mut sm = ArvxSceneManager::new(1_000_000);
+        let (_h1, _i1) = sm.acquire_asset(&path_a.to_string_lossy()).expect("first");
+        let (h2, info2) = sm.acquire_asset(&path_b.to_string_lossy()).expect("second");
+
+        let start = info2.leaf_attr_slot_start;
+        let end = start + info2.leaf_attr_slot_count;
+        assert!(start > 0, "second asset must offset into the shared pool");
+
+        // Mesh vertices shifted into [start, end).
+        let (verts, _i, _l) = sm.asset_mesh(h2).unwrap();
+        for v in verts {
+            assert!(
+                v.leaf_attr_id >= start && v.leaf_attr_id < end,
+                "vertex leaf_attr_id {} outside [{start}, {end})",
+                v.leaf_attr_id,
+            );
+        }
+
+        let entry = sm.asset_cache.get(h2).unwrap();
+
+        // Prefilter internal_attr ids: NONE-sentinel or in [start, end).
+        for &a in entry.cpu_octree.internal_attr_slice() {
+            if a != arvx_core::sparse_octree::INTERNAL_ATTR_NONE {
+                assert!(
+                    a >= start && a < end,
+                    "internal_attr {a} outside [{start}, {end})",
+                );
+            }
+        }
+
+        // Brick cells: sentinels untouched, real slots shifted >= start.
+        let (brick_start, brick_count) = (entry.brick_start, entry.brick_count);
+        for bid in brick_start..(brick_start + brick_count) {
+            for &cell in sm.brick_pool.brick_cells(bid) {
+                if cell != arvx_core::brick_pool::BRICK_EMPTY
+                    && cell != arvx_core::brick_pool::BRICK_INTERIOR
+                {
+                    assert!(
+                        cell >= start && cell < end,
+                        "brick cell {cell} outside [{start}, {end})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// `build_loaded_asset` runs off-thread (it is `&self`-free, enforced
+    /// by it being an associated fn) and must be deterministic — two
+    /// builds of the same file are byte-identical — and leave every index
+    /// FILE-LOCAL (no scene offset applied until the splice).
+    #[test]
+    fn build_loaded_asset_is_deterministic_and_file_local() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (path, _) = write_sphere_arvx(tmp.path());
+
+        let a = ArvxSceneManager::build_loaded_asset(&path).expect("build a");
+        let b = ArvxSceneManager::build_loaded_asset(&path).expect("build b");
+
+        assert_eq!(a.tree.as_slice(), b.tree.as_slice(), "octree nodes differ");
+        assert_eq!(
+            a.tree.internal_attr_slice(),
+            b.tree.internal_attr_slice(),
+            "prefilter internal_attr differs"
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&a.mesh_vertices),
+            bytemuck::cast_slice::<_, u8>(&b.mesh_vertices),
+            "mesh vertices differ"
+        );
+        assert_eq!(a.mesh_indices, b.mesh_indices, "mesh indices differ");
+
+        // File-local invariant: vertex leaf_attr_ids are < the asset's
+        // own leaf_attr count (no scene offset applied in the build).
+        let local_count = a.leaf_attr_pool.allocated_count();
+        for v in &a.mesh_vertices {
+            assert!(
+                v.leaf_attr_id < local_count,
+                "build output must be file-local: {} >= {local_count}",
+                v.leaf_attr_id,
+            );
+        }
     }
 }

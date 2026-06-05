@@ -135,7 +135,7 @@ pub mod paint;
 
 pub use octree_gpu::OctreeGpu;
 pub use arvx_scene_manager::{
-    AssetHandle, AssetInfo, ArvxSceneManager, HaloRefresh, ReloadResult,
+    AssetHandle, AssetInfo, ArvxSceneManager, HaloRefresh, LoadedAsset, ReloadResult,
     SkinningAssetData, FACE_NX, FACE_NY, FACE_NZ, FACE_PX, FACE_PY, FACE_PZ,
 };
 pub use viewport_renderer::ViewportRenderer;
