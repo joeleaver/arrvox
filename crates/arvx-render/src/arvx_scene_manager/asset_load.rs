@@ -1076,6 +1076,26 @@ impl ArvxSceneManager {
         (handle, info)
     }
 
+    /// Reserve pool capacity for an upcoming batch of asset integrates so
+    /// their splices don't trigger doubling-reallocs of the (by then
+    /// large) shared pools mid-stream — the cause of the spiky per-asset
+    /// splice times during scene-load streaming (a small asset spliced
+    /// after several big ones can cross a power-of-2 and copy the whole
+    /// accumulated pool). `extra_voxels` / `extra_bricks` are summed
+    /// estimates across the pending loads.
+    ///
+    /// Best-effort and only-grows: under-reservation just falls back to
+    /// the doubling behaviour for the overflow; over-reservation wastes
+    /// some capacity. Called once at scene-load time, before any outstanding
+    /// pool snapshot, so the grow is a plain alloc+zero with no
+    /// copy-on-write.
+    pub fn reserve_pools(&mut self, extra_voxels: u32, extra_bricks: u32) {
+        let leaf_target = self.leaf_attr_pool.allocated_count().saturating_add(extra_voxels);
+        self.leaf_attr_pool.grow(leaf_target);
+        let brick_target = self.brick_pool.allocated_count().saturating_add(extra_bricks);
+        self.brick_pool.grow(brick_target);
+    }
+
     /// Peek at an asset's skinning metadata. Returns `None` when the
     /// asset was imported without bone weights.
     pub fn skinning_data(&self, handle: AssetHandle) -> Option<&SkinningAssetData> {

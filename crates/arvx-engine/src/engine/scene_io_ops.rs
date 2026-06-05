@@ -506,11 +506,43 @@ impl EngineState {
                     }
                 }
 
+                // Pre-reserve the shared pools for the whole batch of
+                // deferred voxel loads now queued, so their splices don't
+                // each pay a doubling-realloc of the accumulating pools
+                // mid-stream. Cheap header prescan (no section decompress)
+                // sums the voxel counts; one up-front grow at load time
+                // replaces the per-asset realloc spikes.
+                self.reserve_pools_for_pending_loads();
+
                 self.scene_dirty.mark_all();
                 self.gpu_objects_dirty.mark_all();
             }
             Err(e) => self.console.error(format!("Load scene failed: {e}")),
         }
+    }
+
+    /// Header-prescan the queued `.arvx` voxel loads and reserve pool
+    /// capacity once, sized to their summed `voxel_count`. Estimates
+    /// bricks at ~0.25× voxels (the densest observed surface ratio, so we
+    /// don't under-reserve typical assets) and leaf_attr at ~1.17× voxels
+    /// (covering the prefilter tail). Best-effort: unreadable headers are
+    /// skipped; the reserve only-grows.
+    fn reserve_pools_for_pending_loads(&mut self) {
+        let mut total_voxels: u64 = 0;
+        for p in &self.pending_asset_loads {
+            if let Ok(file) = std::fs::File::open(&p.full_path) {
+                let mut reader = std::io::BufReader::new(file);
+                if let Ok(header) = arvx_core::asset_file::read_rkp_header(&mut reader) {
+                    total_voxels += header.voxel_count as u64;
+                }
+            }
+        }
+        if total_voxels == 0 {
+            return;
+        }
+        let leaf = (total_voxels + total_voxels / 6).min(u32::MAX as u64) as u32;
+        let bricks = (total_voxels / 4).min(u32::MAX as u64) as u32;
+        self.scene_mgr.lock().unwrap().reserve_pools(leaf, bricks);
     }
 
     /// Drive the off-thread asset loader: splice any finished builds into
