@@ -244,6 +244,24 @@ pub fn save_tile(
     voxel_size_m: f32,
 ) -> Result<PathBuf, String> {
     let path = tile_path(scene_dir, key);
+    write_tile_to_path(&path, artifact, voxel_size_m)?;
+    Ok(path)
+}
+
+/// Write a baked tile to an exact `.arvxtile` path (the per-key path is
+/// resolved by the caller). Used by [`save_tile`] and by the streamer's
+/// write-through cache, which persists each tile the worker bakes so a
+/// later load reads it from disk instead of re-running `TerrainFn`.
+/// Creates the parent `tiles/` directory if missing.
+pub fn write_tile_to_path(
+    path: &Path,
+    artifact: &BakeArtifact,
+    voxel_size_m: f32,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
     let extent_m = artifact.octree.extent() as f32 * voxel_size_m;
     let aabb_min: [f32; 3] = artifact.grid_origin.into();
     let aabb_max: [f32; 3] = [
@@ -251,8 +269,8 @@ pub fn save_tile(
         artifact.grid_origin.y + extent_m,
         artifact.grid_origin.z + extent_m,
     ];
-    write_artifact_rkp(&path, artifact, aabb_min, aabb_max, voxel_size_m)?;
-    Ok(path)
+    write_artifact_rkp(path, artifact, aabb_min, aabb_max, voxel_size_m)?;
+    Ok(())
 }
 
 #[cfg(test)]

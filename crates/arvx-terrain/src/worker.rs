@@ -252,13 +252,18 @@ fn worker_loop(
                 if p.exists() {
                     match read_baked_tile(p) {
                         Ok((artifact, mesh, vs)) => {
-                            return Some(BakedTile {
-                                key,
-                                artifact,
-                                mesh,
-                                voxel_size_m: vs,
-                                bake_time_ms: 0.0,
-                            });
+                            // Loaded from cache — not freshly baked, so no
+                            // write-through.
+                            return (
+                                Some(BakedTile {
+                                    key,
+                                    artifact,
+                                    mesh,
+                                    voxel_size_m: vs,
+                                    bake_time_ms: 0.0,
+                                }),
+                                false,
+                            );
                         }
                         Err(e) => {
                             eprintln!(
@@ -270,31 +275,54 @@ fn worker_loop(
                     }
                 }
             }
-            crate::bake::bake_tile_with_skirts(
-                key,
-                voxel_size_m,
-                &*terrain_fn,
-                stamps.as_slice(),
-                regions.as_ref(),
-                skirt_depth_m,
-                world_floor_y,
+            (
+                crate::bake::bake_tile_with_skirts(
+                    key,
+                    voxel_size_m,
+                    &*terrain_fn,
+                    stamps.as_slice(),
+                    regions.as_ref(),
+                    skirt_depth_m,
+                    world_floor_y,
+                ),
+                true,
             )
         }));
         drop(terrain_fn);
         drop(stamps);
         drop(regions);
 
-        let baked = match result {
-            Ok(maybe) => maybe,
+        let (baked, baked_fresh) = match result {
+            Ok(t) => t,
             Err(payload) => {
                 let msg = panic_payload_str(&payload);
                 eprintln!(
                     "[arvx-terrain-bake] tile ({}, {}, {}, lvl {}) panic in bake_tile: {msg}",
                     key.x, key.y, key.z, key.level
                 );
-                None
+                (None, false)
             }
         };
+
+        // Write-through cache: persist freshly-baked tiles to their
+        // `.arvxtile`. `disk_path` is only `Some` when the streamer
+        // judged the on-disk cache valid (signature matches the live
+        // terrain), so every written tile stays consistent with the
+        // cache signature — exploring an area bakes its tiles once, then
+        // every later load reads them from disk instead of re-running
+        // TerrainFn. Runs on the worker thread, off the render path.
+        if baked_fresh {
+            if let (Some(p), Some(bt)) = (&disk_path, &baked) {
+                if let Err(e) =
+                    crate::persist::write_tile_to_path(p, &bt.artifact, bt.voxel_size_m)
+                {
+                    eprintln!(
+                        "[arvx-terrain-bake] write-through {} failed: {e}",
+                        p.display(),
+                    );
+                }
+            }
+        }
 
         // Bump completed BEFORE send so `in_flight()` reads
         // monotonically — sim-side try_recv that wins the race still
