@@ -12,7 +12,7 @@ use crate::region_snapshot::TerrainRegionSnapshot;
 use crate::stamp::{combine_heights, Stamp};
 use crate::terrain_fn::TerrainFn;
 use crate::tile_key::TileKey;
-use arvx_core::asset_file::build_mesh_sections_blob_haloed;
+use arvx_core::asset_file::build_mesh_sections_blob_density_haloed;
 use arvx_core::voxelize_octree::voxelize_to_artifact;
 use arvx_core::Aabb;
 use glam::Vec3;
@@ -216,7 +216,14 @@ pub fn bake_tile_with_skirts(
     // it as `brick_id * BRICK_CELLS + flat`.
     let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
 
-    let mut mesh = build_mesh_sections_blob_haloed(
+    // Mesh the tile through the blurred-occupancy → D-topology + ∇D
+    // path (the same one the sculpt re-extract uses). The blur
+    // de-staircases directly from occupancy, so the surface is smooth
+    // without any post-hoc heightfield Y-projection. Watertight across
+    // tile seams: the blurred density is a pure local function of
+    // occupancy within ±(R+1) ≤ TILE_HALO_VOXELS, so adjacent tiles
+    // sharing the halo compute bit-identical seam vertices.
+    let mut mesh = build_mesh_sections_blob_density_haloed(
         artifact.octree.as_slice(),
         artifact.octree.depth(),
         voxel_size_m,
@@ -227,49 +234,6 @@ pub fn bake_tile_with_skirts(
         &artifact.halo_cells,
         TILE_HALO_VOXELS,
     );
-
-    // Project surface vertices onto the true heightfield. The
-    // surface-nets extractor places vertices at grid-quantized
-    // positions (staircase); this snaps each vertex's Y to the
-    // actual terrain height at its XZ, eliminating terracing.
-    // Boundary vertices (within halo margin of tile faces) are
-    // skipped to preserve watertight seams between adjacent tiles.
-    if !mesh.vertices.is_empty() {
-        let verts: &mut [arvx_core::mesh_extract::MeshVertex] =
-            bytemuck::cast_slice_mut(&mut mesh.vertices);
-        let height_threshold = voxel_size_m * 1.5;
-        for v in verts.iter_mut() {
-            let wx = v.local_pos[0];
-            let wy = v.local_pos[1];
-            let wz = v.local_pos[2];
-            let world_pos = Vec3::new(wx, wy, wz);
-            let local = world_pos - tile_origin_world;
-            let s = terrain_fn.sample(key, local, voxel_size_m);
-            let mut h = wy - s.sd;
-            if !stamps.is_empty() {
-                for stamp in stamps {
-                    if let Some(sample) = stamp.sample_height(wx, wz) {
-                        let combined = combine_heights(
-                            h,
-                            sample.target_h,
-                            stamp.combine_op,
-                            stamp.position.y,
-                        );
-                        h = h + (combined - h) * sample.weight;
-                    }
-                }
-            }
-            if let Some(floor_h) = envelope_floor {
-                if h < floor_h {
-                    h = floor_h;
-                }
-            }
-            if (wy - h).abs() > height_threshold {
-                continue;
-            }
-            v.local_pos[1] = h;
-        }
-    }
 
     // V2 LOD pyramid: append lateral skirts so LOD-band cracks aren't
     // see-through. Edge-stitched quads with sculpt-aware per-face depth
@@ -666,6 +630,199 @@ mod tests {
         assert!(baked.index_count() >= 3, "must produce at least one tri");
         // Index count is a multiple of 3 (triangle list).
         assert_eq!(baked.index_count() % 3, 0);
+    }
+
+    /// A non-grid-aligned heightfield: a tilted slope + a sine ripple +
+    /// a steep radial mound, all inside one tile. The canonical
+    /// de-staircasing probe — grid-aligned binary surface nets terrace
+    /// hard on the slope/mound sides; the density-blur bake path must
+    /// produce a smooth surface from occupancy alone.
+    struct HeightField;
+    impl HeightField {
+        /// Surface height `h(x, z)` in tile-local metres.
+        fn height(x: f32, z: f32) -> f32 {
+            // Centre the features in the 64 m tile.
+            let cx = x - 32.0;
+            let cz = z - 32.0;
+            // Tilted base plane (~22° in X, gentle in Z).
+            let plane = 24.0 + 0.42 * cx + 0.18 * cz;
+            // Sine ripple, ~2-3 voxel amplitude, smooth on the voxel
+            // scale.
+            let ripple = 2.0 * (0.18 * cx).sin() + 1.4 * (0.22 * cz).sin();
+            // A steep radial mound near tile centre (peak ~10 m, narrow).
+            let r2 = cx * cx + cz * cz;
+            let mound = 10.0 * (-r2 / (8.0 * 8.0)).exp();
+            plane + ripple + mound
+        }
+    }
+    impl TerrainFn for HeightField {
+        fn sample(&self, _t: TileKey, l: Vec3, _v: f32) -> TerrainSample {
+            TerrainSample {
+                sd: l.y - Self::height(l.x, l.z),
+                primary_mat: 1,
+                secondary_mat: 1,
+                blend: 0.0,
+            }
+        }
+    }
+
+    /// **Geometric roughness** (in voxels): RMS over up-facing interior
+    /// surface vertices of `y(v) − mean(y of its 1-ring neighbours)`,
+    /// measured against the analytic heightfield to isolate
+    /// high-frequency facet noise from any smooth systematic blur shift.
+    /// The terraced binary mesh has high local Y variance (treads/risers
+    /// alternate); the smooth density mesh has low variance. This is the
+    /// bench's `roughness` figure adapted to the real bake.
+    fn slope_top_roughness_voxels(
+        mesh: &arvx_core::asset_file::MeshSectionsBlob,
+        vs: f32,
+    ) -> f32 {
+        let margin = 4.0 * vs;
+        let v_stride = 32usize;
+        let i_stride = 4usize;
+        let lod0_n = mesh.lod0_index_count as usize;
+        let n_v = mesh.vertices.len() / v_stride;
+        let read = |id: usize| -> (Vec3, Vec3) {
+            let vb = id * v_stride;
+            let p = Vec3::new(
+                f32::from_le_bytes(mesh.vertices[vb..vb + 4].try_into().unwrap()),
+                f32::from_le_bytes(mesh.vertices[vb + 4..vb + 8].try_into().unwrap()),
+                f32::from_le_bytes(mesh.vertices[vb + 8..vb + 12].try_into().unwrap()),
+            );
+            let noct = u32::from_le_bytes(mesh.vertices[vb + 12..vb + 16].try_into().unwrap());
+            (p, arvx_core::leaf_attr::unpack_oct(noct).normalize_or_zero())
+        };
+        // Residual = mesh Y minus the analytic surface, per vertex.
+        let mut resid = vec![0.0f32; n_v];
+        let mut keep = vec![false; n_v];
+        for id in 0..n_v {
+            let (p, n) = read(id);
+            if n.y > 0.3
+                && p.x > margin
+                && p.x < 64.0 - margin
+                && p.z > margin
+                && p.z < 64.0 - margin
+            {
+                resid[id] = (p.y - HeightField::height(p.x, p.z)) / vs;
+                keep[id] = true;
+            }
+        }
+        let mut nbr_sum = vec![0.0f32; n_v];
+        let mut nbr_cnt = vec![0u32; n_v];
+        let mut add = |a: usize, b: usize| {
+            nbr_sum[a] += resid[b];
+            nbr_cnt[a] += 1;
+        };
+        for i in (0..lod0_n).step_by(3) {
+            if i + 2 >= lod0_n {
+                break;
+            }
+            let t: [usize; 3] = std::array::from_fn(|k| {
+                u32::from_le_bytes(
+                    mesh.indices[(i + k) * i_stride..(i + k) * i_stride + 4]
+                        .try_into()
+                        .unwrap(),
+                ) as usize
+            });
+            add(t[0], t[1]);
+            add(t[0], t[2]);
+            add(t[1], t[0]);
+            add(t[1], t[2]);
+            add(t[2], t[0]);
+            add(t[2], t[1]);
+        }
+        let mut sq = 0.0f32;
+        let mut n = 0u32;
+        for id in 0..n_v {
+            if !keep[id] || nbr_cnt[id] == 0 {
+                continue;
+            }
+            let local = resid[id] - nbr_sum[id] / nbr_cnt[id] as f32;
+            sq += local * local;
+            n += 1;
+        }
+        if n > 0 {
+            (sq / n as f32).sqrt()
+        } else {
+            0.0
+        }
+    }
+
+    /// **The de-staircase verification.** Bake a heightfield tile (a
+    /// tilted slope + sine ripple + a steep radial mound) the way the
+    /// terrain streamer does (`bake_tile` → density-blur path), and
+    /// assert the surface is GEOMETRICALLY smooth: the slope-top
+    /// geometric roughness — RMS of each vertex's Y minus its 1-ring
+    /// neighbour mean, in voxels (the mesh bench's `roughness` /
+    /// "t-clamp" signal: a grid-snapped staircase vertex sits far from
+    /// its neighbours' mean) — is small in ABSOLUTE terms.
+    ///
+    /// As a control, mesh the SAME occupancy artifact through the OLD
+    /// binary surface-nets path and show it is markedly rougher — pinning
+    /// that the surface genuinely staircases under binary nets (so the
+    /// test isn't vacuous) and that the density path is what removes it.
+    ///
+    /// The terracing lives in the GEOMETRY, not the normals: the per-leaf
+    /// prefiltered SDF normals stay smooth even on a terraced binary
+    /// mesh, so a normal-continuity metric would miss the staircase. This
+    /// is a geometric metric.
+    #[test]
+    fn baked_terrain_tile_is_smooth() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0); // 0.25 m at depth 8.
+        let key = TileKey::level0(0, 0, 0);
+
+        // Density-blur bake (the path the streamer uses now).
+        let baked =
+            bake_tile(key, vs, &HeightField, &[], &empty_regions()).expect("density bake");
+        assert!(
+            baked.vertex_count() > 1000,
+            "heightfield tile should produce a dense surface; got {}",
+            baked.vertex_count()
+        );
+
+        let smooth_rough = slope_top_roughness_voxels(&baked.mesh, vs);
+
+        // Binary bake of the IDENTICAL occupancy artifact (the OLD path).
+        let bricks_flat: Vec<u32> =
+            baked.artifact.brick_cells.iter().flatten().copied().collect();
+        let binary_blob = arvx_core::asset_file::build_mesh_sections_blob_haloed(
+            baked.artifact.octree.as_slice(),
+            baked.artifact.octree.depth(),
+            vs,
+            baked.artifact.grid_origin,
+            &bricks_flat,
+            &baked.artifact.leaf_attrs,
+            &[],
+            &baked.artifact.halo_cells,
+            TILE_HALO_VOXELS,
+        );
+        let binary_rough = slope_top_roughness_voxels(&binary_blob, vs);
+
+        eprintln!(
+            "[smooth bake] density rough={smooth_rough:.3}vx  binary rough={binary_rough:.3}vx \
+             (ratio {:.1}×)",
+            binary_rough / smooth_rough.max(1e-6),
+        );
+
+        // Density-blur path: smooth. Low absolute geometric roughness —
+        // the surface follows the smooth field, not the discrete grid.
+        assert!(
+            smooth_rough < 0.06,
+            "density bake slope-top roughness should be < 0.06 voxel \
+             (smooth, no terracing); got {smooth_rough:.3} vx (binary path \
+             was {binary_rough:.3})",
+        );
+
+        // Control: the OLD binary path staircases on this surface and is
+        // markedly rougher. Pins both that the surface genuinely terraces
+        // under binary nets and that the density path removes it (so the
+        // test isn't vacuous).
+        assert!(
+            binary_rough > smooth_rough * 2.0,
+            "binary path must be markedly rougher than the density path \
+             (binary {binary_rough:.3} vs density {smooth_rough:.3})",
+        );
     }
 
     /// FBM at origin produces a non-trivial surface. This is the closest

@@ -327,25 +327,63 @@ pub fn write_artifact_rkp(
     // the asset's global leaf_attr offset before any GPU upload.
     // Same one-time cost the arvx-import path pays — moves DAG
     // build out of the editor's load critical path.
-    // Preserve halo data the artifact carries (terrain Phase 3+):
-    // when `halo_cells` is non-empty, build the mesh sections with
-    // the halo-aware extractor so the saved file's seam geometry
-    // matches what's in RAM. Non-terrain bakes pass an empty slice
-    // → identical to the non-halo path.
-    let halo_width: u32 = if artifact.halo_cells.is_empty() { 0 } else { 2 };
-    let mesh_blob = build_mesh_sections_blob_haloed(
-        artifact.octree.as_slice(),
-        artifact.octree.depth(),
-        voxel_size,
-        artifact.grid_origin,
-        &bricks_flat,
-        &artifact.leaf_attrs,
-        // Procedural bakes never carry skinning data — generator
-        // outputs are static geometry.
-        &[],
-        &artifact.halo_cells,
-        halo_width,
-    );
+    //
+    // **Terrain vs procedural mesh path.** A non-empty `halo_cells`
+    // marks a TERRAIN tile bake (procedural object bakes call
+    // `voxelize_to_artifact` with `halo = 0` → no halo cells). Terrain
+    // meshes through the density-blur path so the persisted mesh
+    // matches the in-RAM `bake_tile` output bit-for-bit (smooth, no
+    // staircase). Procedural / imported bakes stay on the BINARY path
+    // — the blur rounds sub-2-voxel sharp edges, which hard-surface
+    // assets must keep. The halo width is derived from the actual halo
+    // cells' reach so the seam neighborhood is correct.
+    let halo_width: u32 = artifact
+        .halo_cells
+        .iter()
+        .map(|(c, _)| {
+            // Distance past the nominal `[0, extent)` cube on the
+            // furthest axis — the halo band width.
+            let extent = 1i32 << artifact.octree.depth();
+            let over = |v: i32| -> i32 {
+                if v < 0 {
+                    -v
+                } else if v >= extent {
+                    v - extent + 1
+                } else {
+                    0
+                }
+            };
+            over(c.x).max(over(c.y)).max(over(c.z))
+        })
+        .max()
+        .unwrap_or(0) as u32;
+    let mesh_blob = if artifact.halo_cells.is_empty() {
+        build_mesh_sections_blob_haloed(
+            artifact.octree.as_slice(),
+            artifact.octree.depth(),
+            voxel_size,
+            artifact.grid_origin,
+            &bricks_flat,
+            &artifact.leaf_attrs,
+            // Procedural bakes never carry skinning data — generator
+            // outputs are static geometry.
+            &[],
+            &artifact.halo_cells,
+            halo_width,
+        )
+    } else {
+        build_mesh_sections_blob_density_haloed(
+            artifact.octree.as_slice(),
+            artifact.octree.depth(),
+            voxel_size,
+            artifact.grid_origin,
+            &bricks_flat,
+            &artifact.leaf_attrs,
+            &[],
+            &artifact.halo_cells,
+            halo_width,
+        )
+    };
     let mesh_sections = if !mesh_blob.vertices.is_empty() {
         Some(mesh_blob.as_in())
     } else {
@@ -486,6 +524,88 @@ pub fn build_mesh_sections_blob_haloed(
         halo,
         None, // bake-time extract: no sculpt history yet.
     );
+    if vertices.is_empty() || indices_unclustered.is_empty() {
+        return MeshSectionsBlob::default();
+    }
+    mesh_sections_from_extract(vertices, indices_unclustered)
+}
+
+/// **Terrain-only** density-blur variant of
+/// [`build_mesh_sections_blob_haloed`]. Meshes the tile through the
+/// SAME blurred-occupancy → `D = 0.5`-topology + `∇D`-normal path the
+/// sculpt re-extract uses
+/// ([`crate::mesh_extract::extract_mesh_region_from_cells_pooled_haloed`]),
+/// so baked terrain is smooth from occupancy alone — no post-hoc
+/// heightfield Y-projection needed.
+///
+/// **Why a separate entry (not a flag on the binary path).** Imports
+/// may be hard-surface; the `R = 2` blur rounds sub-2-voxel sharp edges
+/// (a documented fundamental limit), so the binary
+/// [`crate::mesh_extract::extract_surface_mesh_haloed`] stays the
+/// import/asset-load default. ONLY the terrain bake opts into blur via
+/// this function.
+///
+/// **Watertight seams.** The blurred density `D[c]` is a pure local
+/// function of occupancy in `c ± DENSITY_KERNEL_R`; with the terrain
+/// halo (`TILE_HALO_VOXELS = 4`) `≥` the kernel reach (`R + 1 = 3`), two
+/// adjacent tiles share the full boundary neighborhood and compute
+/// bit-identical seam vertices. The halo cells are folded into the
+/// extract's `cells_grid` for 8-corner data exactly like the sculpt
+/// path; they are never added to the iterating owner set, so no quad is
+/// double-emitted from the wrong side. See
+/// [`crate::mesh_extract::extract_surface_mesh_haloed`] for the seam
+/// protocol.
+///
+/// `halo_cells` carry the tile's neighbor-cell occupancy (sampled by
+/// `voxelize_to_artifact` with `halo > 0`). `halo` is the halo width in
+/// finest-grid voxels (the terrain bake passes `TILE_HALO_VOXELS`).
+/// With `halo = 0` and no halo cells the mesh is still smooth (the blur
+/// reads the tile's own occupancy), it just has no cross-tile boundary
+/// data — the terrain bake always passes both.
+#[allow(clippy::too_many_arguments)]
+pub fn build_mesh_sections_blob_density_haloed(
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: glam::Vec3,
+    brick_pool: &[u32],
+    leaf_attrs: &[crate::leaf_attr::LeafAttr],
+    bone_voxels: &[crate::companion::BoneVoxel],
+    halo_cells: &[(glam::IVec3, u32)],
+    halo: u32,
+) -> MeshSectionsBlob {
+    if octree_nodes.is_empty() || leaf_attrs.is_empty() {
+        return MeshSectionsBlob::default();
+    }
+    let (vertices, indices_unclustered) =
+        crate::mesh_extract::extract_surface_mesh_density_haloed(
+            octree_nodes,
+            octree_depth,
+            base_voxel_size,
+            grid_origin,
+            brick_pool,
+            leaf_attrs,
+            bone_voxels,
+            halo_cells,
+            halo,
+            // Bake-time extract: no sculpt history yet.
+            None,
+        );
+    if vertices.is_empty() || indices_unclustered.is_empty() {
+        return MeshSectionsBlob::default();
+    }
+    mesh_sections_from_extract(vertices, indices_unclustered)
+}
+
+/// Shared cluster-DAG build + blob assembly for the
+/// `build_mesh_sections_blob*` family. Takes the raw extract output
+/// (unclustered vertices + indices) and runs the Karis-Nanite
+/// cluster-DAG build, returning the v6 section byte buffers. Empty
+/// input → [`MeshSectionsBlob::default`].
+fn mesh_sections_from_extract(
+    vertices: Vec<crate::mesh_extract::MeshVertex>,
+    indices_unclustered: Vec<u32>,
+) -> MeshSectionsBlob {
     if vertices.is_empty() || indices_unclustered.is_empty() {
         return MeshSectionsBlob::default();
     }

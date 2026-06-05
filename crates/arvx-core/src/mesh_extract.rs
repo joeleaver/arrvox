@@ -757,6 +757,93 @@ pub fn extract_surface_mesh_haloed(
     halo: u32,
     sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
 ) -> (Vec<MeshVertex>, Vec<u32>) {
+    extract_surface_mesh_haloed_impl(
+        octree_nodes,
+        octree_depth,
+        base_voxel_size,
+        grid_origin,
+        brick_cells,
+        leaf_attr_pool,
+        bone_voxel_pool,
+        halo_cells,
+        halo,
+        sculpt_slots,
+        false,
+    )
+}
+
+/// **Terrain-only** density-blur variant of
+/// [`extract_surface_mesh_haloed`]. Identical watertight halo-seam
+/// iteration + material/leaf_attr/bone attribution, but the surface is
+/// meshed from the BLURRED occupancy (`D = 0.5`-topology + `∇D` normal)
+/// instead of binary surface nets — so baked terrain de-staircases
+/// directly from occupancy, no post-hoc heightfield Y-projection.
+///
+/// This shares the proven seam protocol with the binary path: the inner
+/// halo ring `[-1, N+1)` iterates (boundary cells emit from BOTH the
+/// owning interior side and the neighbour's halo side → identical
+/// overdraw), and the blurred density `D[c]` is a pure local function of
+/// occupancy in `c ± DENSITY_KERNEL_R` (`R + 1` reach including the ∇D
+/// step). With the terrain halo `≥` that reach (`TILE_HALO_VOXELS = 4`),
+/// adjacent tiles compute bit-identical seam vertices.
+///
+/// IMPORTANT: gated to the terrain bake only. Imports keep the binary
+/// path ([`extract_surface_mesh_haloed`]) because the blur rounds
+/// sub-2-voxel sharp edges (a documented fundamental limit).
+#[allow(clippy::too_many_arguments)]
+pub fn extract_surface_mesh_density_haloed(
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: Vec3,
+    brick_cells: &[u32],
+    leaf_attr_pool: &[LeafAttr],
+    bone_voxel_pool: &[BoneVoxel],
+    halo_cells: &[(IVec3, u32)],
+    halo: u32,
+    sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
+) -> (Vec<MeshVertex>, Vec<u32>) {
+    extract_surface_mesh_haloed_impl(
+        octree_nodes,
+        octree_depth,
+        base_voxel_size,
+        grid_origin,
+        brick_cells,
+        leaf_attr_pool,
+        bone_voxel_pool,
+        halo_cells,
+        halo,
+        sculpt_slots,
+        true,
+    )
+}
+
+/// Dense blurred-density + gradient grids for the terrain density-blur
+/// extract path, laid out like [`CellGrid`] (`origin` lo-corner, `size`
+/// extent, flat `x + sx*(y + sy*z)` indexing).
+struct DensityGrids {
+    origin: IVec3,
+    size: IVec3,
+    /// Blurred occupancy `D ∈ [0, 1]`, one per grid point.
+    density: Vec<f32>,
+    /// Central-difference `∇D` of the smooth field, one per grid point.
+    gradient: Vec<[f32; 3]>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_surface_mesh_haloed_impl(
+    octree_nodes: &[u32],
+    octree_depth: u8,
+    base_voxel_size: f32,
+    grid_origin: Vec3,
+    brick_cells: &[u32],
+    leaf_attr_pool: &[LeafAttr],
+    bone_voxel_pool: &[BoneVoxel],
+    halo_cells: &[(IVec3, u32)],
+    halo: u32,
+    sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
+    density_blur: bool,
+) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     if octree_nodes.is_empty() {
@@ -789,12 +876,180 @@ pub fn extract_surface_mesh_haloed(
         return (vertices, indices);
     }
 
+    let extent = 1i32 << octree_depth;
+
+    // ── Optional smooth-density precompute (terrain bake only) ──
+    //
+    // When `density_blur` is set, blur the binary occupancy into a dense
+    // `[0, 1]` field `D` over the cells' bounding box (+ kernel-reach
+    // pad), then mesh on the `D = iso` isosurface with `∇D` normals.
+    // This de-staircases directly from occupancy. The seam stays
+    // watertight: `D[c]` depends only on occupancy in `c ± R` and the
+    // grid here is built from the SAME `cells` map (interior + halo)
+    // both tiles share, so two tiles compute bit-identical boundary
+    // density (and vertices). The dense grid is laid out exactly like
+    // [`CellGrid`]: `origin` lo-corner, `size` extent, flat
+    // `x + sx*(y + sy*z)` indexing.
+    let (r_blur, sigma_blur, iso) = if density_blur {
+        active_blur_params()
+    } else {
+        (DENSITY_KERNEL_R, DENSITY_KERNEL_SIGMA, DENSITY_ISO)
+    };
+    let density_grids: Option<DensityGrids> = if density_blur {
+        // Bounding box of every cell in the map (interior + halo).
+        let mut bb_min = IVec3::splat(i32::MAX);
+        let mut bb_max = IVec3::splat(i32::MIN);
+        for &c in cells.keys() {
+            bb_min = bb_min.min(c);
+            bb_max = bb_max.max(c);
+        }
+        // Pad by the full kernel reach (`R` for the blur + 1 for the ∇D
+        // central difference + 1 cell of slack for the cube-corner /
+        // trilinear sampling reach). Boundary-extension (clamped
+        // sampling) handles any read past the pad, so a couple cells is
+        // plenty and matches the sculpt grid's `± (R + 2)` reach.
+        let pad = r_blur + 2;
+        let g_origin = bb_min - IVec3::splat(pad);
+        let g_size = (bb_max - bb_min) + IVec3::splat(2 * pad + 1);
+        let sx = g_size.x as usize;
+        let sy = g_size.y as usize;
+        let sz = g_size.z as usize;
+        let total = sx * sy * sz;
+        let mut density = vec![0.0f32; total];
+        // Seed binary occupancy: solid iff the cell is in the map OR an
+        // INTERIOR_NODE-region cell (resolved on demand via the octree).
+        for z in 0..sz {
+            for y in 0..sy {
+                for x in 0..sx {
+                    let c = g_origin + IVec3::new(x as i32, y as i32, z as i32);
+                    let solid = cells.contains_key(&c)
+                        || is_solid_lookup(octree_nodes, brick_cells, octree_depth, c, extent);
+                    density[x + sx * (y + sy * z)] = if solid { 1.0 } else { 0.0 };
+                }
+            }
+        }
+        // Separable Gaussian blur (X, Y, Z). Clamp out-of-grid taps to
+        // the nearest in-bounds cell (boundary extension) so a solid
+        // block near the grid edge stays `D = 1`.
+        let kern = density_kernel_weights_1d_for(r_blur, sigma_blur);
+        let mut row: Vec<f32> = vec![0.0; sx.max(sy).max(sz)];
+        for z in 0..sz {
+            for y in 0..sy {
+                let base = sx * (y + sy * z);
+                row[..sx].copy_from_slice(&density[base..base + sx]);
+                for x in 0..sx {
+                    let mut acc = 0.0f32;
+                    for k in -r_blur..=r_blur {
+                        let xi = (x as i32 + k).clamp(0, sx as i32 - 1) as usize;
+                        acc += kern[(k + r_blur) as usize] * row[xi];
+                    }
+                    density[base + x] = acc;
+                }
+            }
+        }
+        for z in 0..sz {
+            for x in 0..sx {
+                for y in 0..sy {
+                    row[y] = density[x + sx * (y + sy * z)];
+                }
+                for y in 0..sy {
+                    let mut acc = 0.0f32;
+                    for k in -r_blur..=r_blur {
+                        let yi = (y as i32 + k).clamp(0, sy as i32 - 1) as usize;
+                        acc += kern[(k + r_blur) as usize] * row[yi];
+                    }
+                    density[x + sx * (y + sy * z)] = acc;
+                }
+            }
+        }
+        for y in 0..sy {
+            for x in 0..sx {
+                for z in 0..sz {
+                    row[z] = density[x + sx * (y + sy * z)];
+                }
+                for z in 0..sz {
+                    let mut acc = 0.0f32;
+                    for k in -r_blur..=r_blur {
+                        let zi = (z as i32 + k).clamp(0, sz as i32 - 1) as usize;
+                        acc += kern[(k + r_blur) as usize] * row[zi];
+                    }
+                    density[x + sx * (y + sy * z)] = acc;
+                }
+            }
+        }
+        // Central-difference the smooth `D` for the grid-point gradient.
+        let mut gradient = vec![[0.0f32; 3]; total];
+        let sxi = sx as i32;
+        let syi = sy as i32;
+        let szi = sz as i32;
+        let at = |x: i32, y: i32, z: i32| -> f32 {
+            let xc = x.clamp(0, sxi - 1) as usize;
+            let yc = y.clamp(0, syi - 1) as usize;
+            let zc = z.clamp(0, szi - 1) as usize;
+            density[xc + sx * (yc + sy * zc)]
+        };
+        for z in 0..szi {
+            for y in 0..syi {
+                for x in 0..sxi {
+                    let gx = (at(x + 1, y, z) - at(x - 1, y, z)) * 0.5;
+                    let gy = (at(x, y + 1, z) - at(x, y - 1, z)) * 0.5;
+                    let gz = (at(x, y, z + 1) - at(x, y, z - 1)) * 0.5;
+                    gradient[(x as usize) + sx * ((y as usize) + sy * (z as usize))] =
+                        [gx, gy, gz];
+                }
+            }
+        }
+        Some(DensityGrids {
+            origin: g_origin,
+            size: g_size,
+            density,
+            gradient,
+        })
+    } else {
+        None
+    };
+
+    // Closures over the density grids (when present). `d_solid` tests a
+    // cell's center against the iso threshold (the SAME field the
+    // crossing uses), and the sampler closures feed `build_cube_vertex`'s
+    // Newton projection + ∇D normal.
+    let d_grids = density_grids.as_ref();
+    let d_solid = |cell: IVec3| -> bool {
+        match d_grids {
+            Some(g) => {
+                let center =
+                    Vec3::new(cell.x as f32 + 0.5, cell.y as f32 + 0.5, cell.z as f32 + 0.5);
+                sample_density_trilinear(&g.density, g.origin, g.size, center) >= iso
+            }
+            None => false,
+        }
+    };
+    let density_grid_fn = |p_grid: Vec3| -> f32 {
+        match d_grids {
+            Some(g) => sample_density_trilinear(&g.density, g.origin, g.size, p_grid),
+            None => 0.0,
+        }
+    };
+    let gradient_grid_fn = |p_grid: Vec3| -> Vec3 {
+        match d_grids {
+            Some(g) => sample_gradient_trilinear(&g.gradient, g.origin, g.size, p_grid),
+            None => Vec3::ZERO,
+        }
+    };
+    let smooth_sdf = |p_world: Vec3| -> f32 {
+        let g = (p_world - grid_origin) / base_voxel_size;
+        iso - density_grid_fn(g)
+    };
+    let outward_normal = |p_world: Vec3| -> Vec3 {
+        let g = (p_world - grid_origin) / base_voxel_size;
+        -gradient_grid_fn(g)
+    };
+
     // Pass 2: iterate every cell-pair across the 6 face directions.
     // For each (solid → void) edge, the 4 SN cubes around that edge
     // form a quad. Iterating cells in `cells` (rather than scanning
     // every grid edge) keeps us proportional to surface area.
     let mut cube_vertex: CellMap = CellMap::default();
-    let extent = 1i32 << octree_depth;
     let halo_active = halo > 0;
     // With `halo > 0`, iterate every cell in the inner halo ring
     // (`coord in [-1, N+1)`) in addition to the interior. The outer
@@ -809,35 +1064,96 @@ pub fn extract_surface_mesh_haloed(
     let iter_lo = if halo_active { -1 } else { 0 };
     let iter_hi = if halo_active { extent + 1 } else { extent };
 
-    for &cell in cells.keys() {
-        if halo_active {
-            if cell.x < iter_lo
-                || cell.x >= iter_hi
-                || cell.y < iter_lo
-                || cell.y >= iter_hi
-                || cell.z < iter_lo
-                || cell.z >= iter_hi
-            {
-                continue;
+    // Binary corner classifier (material attribution + the
+    // INTERIOR_NODE-region fallback): `Some(slot)` for solid, `None`
+    // for empty. Shared by both the binary and D-blur paths — material
+    // always follows the real occupied cell, even when geometry follows
+    // the D field.
+    let cell_lookup = |c: IVec3| -> Option<u32> {
+        match cells.get(&c) {
+            Some(&v) => Some(v),
+            None => {
+                if is_solid_lookup(octree_nodes, brick_cells, octree_depth, c, extent) {
+                    Some(CELL_INTERIOR)
+                } else {
+                    None
+                }
             }
+        }
+    };
+
+    // **Owner candidate set.**
+    //
+    // * Binary path: owners are exactly the cells in `cells` that fall
+    //   in the inner halo ring `[-1, N+1)`. Each emits its (solid→void)
+    //   faces.
+    // * D-blur path: the `D = iso` surface can sit up to ~1 cell outside
+    //   the binary boundary, so a D-solid owner may be a binary-EMPTY
+    //   cell adjacent to a binary-solid one. We therefore also consider
+    //   the 26 neighbours of each `cells` cell (still clamped to the
+    //   inner halo ring), and emit a face only where `D(self) >= iso &&
+    //   D(neighbor) < iso`. The ring clamp is what preserves the
+    //   watertight seam: both tiles share the inner-ring cells (own +
+    //   halo) and the same D grid, so they emit identical boundary
+    //   cubes — no asymmetric leak into the outer halo.
+    let in_ring = |c: IVec3| -> bool {
+        !halo_active
+            || (c.x >= iter_lo
+                && c.x < iter_hi
+                && c.y >= iter_lo
+                && c.y < iter_hi
+                && c.z >= iter_lo
+                && c.z < iter_hi)
+    };
+    let mut owners: Vec<IVec3> = Vec::new();
+    if density_blur {
+        let mut seen: rustc_hash::FxHashSet<IVec3> = rustc_hash::FxHashSet::default();
+        seen.reserve(cells.len() * 8);
+        for &cell in cells.keys() {
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let c = cell + IVec3::new(dx, dy, dz);
+                        if in_ring(c) && seen.insert(c) {
+                            owners.push(c);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        owners.reserve(cells.len());
+        for &cell in cells.keys() {
+            if in_ring(cell) {
+                owners.push(cell);
+            }
+        }
+    }
+
+    for &cell in &owners {
+        // D-blur path skips non-D-solid owners (the candidate expansion
+        // includes binary-empty cells that may or may not be D-solid).
+        if density_blur && !d_solid(cell) {
+            continue;
         }
         for face in 0..6 {
             let dir = FACE_DIRS[face];
             let neighbor = cell + dir;
-            if cells.contains_key(&neighbor) {
-                continue;
-            }
-            // Neighbor isn't in the cell map — could still be inside an
-            // INTERIOR_NODE region (which we deliberately didn't expand
-            // into the map). Hit the octree to disambiguate.
-            if is_solid_lookup(
-                octree_nodes,
-                brick_cells,
-                octree_depth,
-                neighbor,
-                extent,
-            ) {
-                continue;
+            if density_blur {
+                // D-active face: this side D-solid, the other D-empty.
+                if d_solid(neighbor) {
+                    continue;
+                }
+            } else {
+                if cells.contains_key(&neighbor) {
+                    continue;
+                }
+                // Neighbor isn't in the cell map — could still be inside
+                // an INTERIOR_NODE region (which we deliberately didn't
+                // expand into the map). Hit the octree to disambiguate.
+                if is_solid_lookup(octree_nodes, brick_cells, octree_depth, neighbor, extent) {
+                    continue;
+                }
             }
             // Active edge: emit a quad of 4 SN-cube vertices, wound
             // CCW around the outward normal (`dir`, pointing from solid
@@ -863,35 +1179,37 @@ pub fn extract_surface_mesh_haloed(
                         // region — would misclassify them as empty
                         // and emit a spurious vertex with no match in
                         // the neighbouring tile.
-                        let vertex = build_cube_vertex(
-                            cube,
-                            |c| match cells.get(&c) {
-                                Some(&v) => Some(v),
-                                None => {
-                                    if is_solid_lookup(
-                                        octree_nodes,
-                                        brick_cells,
-                                        octree_depth,
-                                        c,
-                                        extent,
-                                    ) {
-                                        Some(CELL_INTERIOR)
-                                    } else {
-                                        None
-                                    }
-                                }
-                            },
-                            base_voxel_size,
-                            grid_origin,
-                            leaf_attr_pool,
-                            bone_voxel_pool,
-                            sculpt_slots,
-                            None::<&fn(Vec3) -> f32>,
-                            None::<&fn(Vec3) -> Vec3>,
-                            None::<&fn(Vec3) -> f32>,
-                            None::<&fn(Vec3) -> Vec3>,
-                            DENSITY_ISO,
-                        );
+                        let vertex = if density_blur {
+                            build_cube_vertex(
+                                cube,
+                                cell_lookup,
+                                base_voxel_size,
+                                grid_origin,
+                                leaf_attr_pool,
+                                bone_voxel_pool,
+                                sculpt_slots,
+                                Some(&smooth_sdf),
+                                Some(&outward_normal),
+                                Some(&density_grid_fn),
+                                Some(&gradient_grid_fn),
+                                iso,
+                            )
+                        } else {
+                            build_cube_vertex(
+                                cube,
+                                cell_lookup,
+                                base_voxel_size,
+                                grid_origin,
+                                leaf_attr_pool,
+                                bone_voxel_pool,
+                                sculpt_slots,
+                                None::<&fn(Vec3) -> f32>,
+                                None::<&fn(Vec3) -> Vec3>,
+                                None::<&fn(Vec3) -> f32>,
+                                None::<&fn(Vec3) -> Vec3>,
+                                DENSITY_ISO,
+                            )
+                        };
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
                         cube_vertex.insert(cube, vid);
