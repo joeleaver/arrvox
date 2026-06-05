@@ -236,6 +236,9 @@ impl EngineState {
                 && self.material_is_glass[material_id as usize];
             if is_glass_brush {
                 self.asset_has_glass_cache.remove(&asset_root_offset);
+                // Shared pool now holds a possibly-non-palette glass
+                // material — palette verdict no longer authoritative.
+                self.assets_painted_glass.insert(asset_root_offset);
             }
         }
 
@@ -560,7 +563,10 @@ impl EngineState {
                     // verdict rescans.
                     if let Ok(r) = self.world.get::<&crate::components::Renderable>(entity) {
                         if let Some(spatial) = r.spatial.as_ref().and_then(|g| g.as_octree()) {
-                            self.asset_has_glass_cache.remove(&spatial.root_offset);
+                            let root = spatial.root_offset;
+                            drop(r);
+                            self.asset_has_glass_cache.remove(&root);
+                            self.assets_painted_glass.insert(root);
                         }
                     }
                 }

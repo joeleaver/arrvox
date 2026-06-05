@@ -293,6 +293,15 @@ impl EngineState {
             // to a glass one). Invalidate the cache entry so the next
             // has_glass check rescans this asset.
             self.asset_has_glass_cache.remove(&spatial.root_offset);
+            // If we remapped TO a glass material, the shared pool may now
+            // hold a glass material outside the asset's bake-time palette,
+            // so has_glass must fall back to the per-leaf walk for this
+            // asset rather than trusting the (now-stale) palette.
+            let to_is_glass = (to_material as usize) < self.material_is_glass.len()
+                && self.material_is_glass[to_material as usize];
+            if to_is_glass {
+                self.assets_painted_glass.insert(spatial.root_offset);
+            }
         }
         count
     }

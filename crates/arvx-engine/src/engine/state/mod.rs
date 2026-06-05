@@ -446,6 +446,15 @@ pub(crate) struct EngineState {
     /// we walk its leaves once with `material_is_glass` and store
     /// the result. Cleared whenever `material_is_glass` rebuilds.
     pub(crate) asset_has_glass_cache: std::collections::HashMap<u32, bool>,
+    /// Roots whose shared leaf-attr pool has been painted with a glass
+    /// material that may NOT be in the asset's bake-time palette (sculpt
+    /// glass brush, `remap_entity_material` to glass). For these the
+    /// O(16) palette check is no longer authoritative, so `has_glass`
+    /// falls back to the per-leaf walk. Empty for freshly-loaded assets,
+    /// so scene-load streaming answers `has_glass` from the palette
+    /// without a 2.3M-leaf scan. Only ever grows within a session
+    /// (a stale entry for a reused root just costs a wasted glass pass).
+    pub(crate) assets_painted_glass: std::collections::HashSet<u32>,
 
     // Input + Camera
     pub(crate) input_system: arvx_runtime::input::InputSystem,

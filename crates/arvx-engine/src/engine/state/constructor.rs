@@ -111,6 +111,7 @@ impl EngineState {
             material_is_glass: Vec::new(),
             material_glass_lib_epoch: 0,
             asset_has_glass_cache: std::collections::HashMap::new(),
+            assets_painted_glass: std::collections::HashSet::new(),
             render_worker,
             scene_mgr,
             geometry_epoch_handle,

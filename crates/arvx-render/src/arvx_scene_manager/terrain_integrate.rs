@@ -345,6 +345,9 @@ impl ArvxSceneManager {
             sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             halo_cells,
+            // Terrain tiles carry no `.arvx` palette; they're opaque, so a
+            // zeroed palette yields the correct `has_glass = false`.
+            material_palette: [0u16; 16],
         };
 
         let info = entry.info();

@@ -55,6 +55,11 @@ pub struct LoadedAsset {
     dag_produced: Vec<u32>,
     skinning: Option<SkinningAssetData>,
     cluster_spatial_index: super::cluster_spatial_index::ClusterSpatialIndex,
+    /// The ≤16 material IDs this asset's bake-time leaves use (from the
+    /// `.arvx` header). Authoritative for the asset's glass-ness as long
+    /// as the shared pool hasn't been painted — lets the engine answer
+    /// `has_glass` in O(16) instead of walking every leaf.
+    material_palette: [u16; 16],
 }
 
 impl ArvxSceneManager {
@@ -889,6 +894,7 @@ impl ArvxSceneManager {
             dag_produced,
             skinning,
             cluster_spatial_index,
+            material_palette: header.material_ids,
         })
     }
 
@@ -922,6 +928,7 @@ impl ArvxSceneManager {
             dag_produced,
             skinning,
             cluster_spatial_index,
+            material_palette,
         } = loaded;
 
         // Splice the private leaf_attr pool (attrs + colors + bones) in
@@ -1040,6 +1047,7 @@ impl ArvxSceneManager {
             // construction; the slice stays empty. Terrain tiles populate
             // this through `integrate_baked_tile`.
             halo_cells: Vec::new(),
+            material_palette,
         }
     }
 
@@ -1100,6 +1108,35 @@ impl ArvxSceneManager {
     /// asset was imported without bone weights.
     pub fn skinning_data(&self, handle: AssetHandle) -> Option<&SkinningAssetData> {
         self.asset_cache.get(handle)?.skinning.as_ref()
+    }
+
+    /// Does any material in this asset's bake-time palette render as
+    /// glass? The `.arvx` header lists the ≤16 material IDs the asset's
+    /// leaves actually use, so this is an O(16) answer for an **unpainted**
+    /// asset — no leaf walk. `material_is_glass` is the engine's per-slot
+    /// glass table (indexed by material id).
+    ///
+    /// **Conservative, never-under-reports:** unused palette slots are
+    /// zero-padded, so if material id 0 is itself configured as glass
+    /// every asset reports glass — a wasted glass pass, never a missed
+    /// one (glass leaves are never rendered opaque). Material 0 is the
+    /// default-opaque convention, so in practice the verdict is exact.
+    ///
+    /// NOT authoritative once the shared pool has been painted with a
+    /// non-palette glass material — the caller must keep the per-leaf
+    /// scan for assets it knows have been painted to glass.
+    pub fn asset_palette_has_glass(
+        &self,
+        handle: AssetHandle,
+        material_is_glass: &[bool],
+    ) -> bool {
+        let Some(entry) = self.asset_cache.get(handle) else {
+            return false;
+        };
+        entry.material_palette.iter().any(|&id| {
+            let id = id as usize;
+            id < material_is_glass.len() && material_is_glass[id]
+        })
     }
 
     /// Surface-mesh `(vertices, indices, lod0_index_count)` for
@@ -1437,5 +1474,30 @@ mod load_roundtrip_tests {
                 v.leaf_attr_id,
             );
         }
+    }
+
+    /// `asset_palette_has_glass` answers from the stored header palette,
+    /// indexed into the engine's per-slot glass table — no leaf walk.
+    /// The sphere uses material 0, so the verdict tracks whether material
+    /// 0 is marked glass.
+    #[test]
+    fn asset_palette_has_glass_reads_the_header_palette() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (path, _) = write_sphere_arvx(tmp.path());
+        let mut sm = ArvxSceneManager::new(1_000_000);
+        let (handle, _) = sm.acquire_asset(&path.to_string_lossy()).expect("acquire");
+
+        // Material 0 opaque → no glass.
+        let opaque = vec![false; 4];
+        assert!(!sm.asset_palette_has_glass(handle, &opaque));
+
+        // Material 0 marked glass → palette reports glass.
+        let mut glass = vec![false; 4];
+        glass[0] = true;
+        assert!(sm.asset_palette_has_glass(handle, &glass));
+
+        // Unknown handle → false (never panics / over-reports).
+        let bogus = AssetHandle::from_raw(9999);
+        assert!(!sm.asset_palette_has_glass(bogus, &glass));
     }
 }

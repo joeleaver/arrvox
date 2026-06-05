@@ -2033,6 +2033,7 @@ mod tests {
             sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
+            material_palette: [0u16; 16],
             mesh_dirty: false,
             clusters_dirty: false,
             cluster_spatial_index,

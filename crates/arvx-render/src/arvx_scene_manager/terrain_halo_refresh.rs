@@ -1216,6 +1216,7 @@ mod tests {
             clusters_dirty: false,
             cluster_spatial_index:
                 crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
+            material_palette: [0u16; 16],
         };
         let handle = sm.asset_cache.insert(entry);
 
