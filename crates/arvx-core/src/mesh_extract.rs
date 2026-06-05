@@ -445,6 +445,17 @@ const CELL_INTERIOR_GRID: u32 = u32::MAX - 1;
 ///     `TILE_HALO_VOXELS = 4`. With that, both tiles share the full
 ///     neighborhood and compute bit-identical seam vertices — watertight,
 ///     and the halo is never the limiting factor on smoothness.
+/// R = 2. The de-staircasing root-cause fix is the D-FIELD TOPOLOGY
+/// (surface nets classified by `D ≥ iso`, not binary occupancy), which
+/// removes the terracing at any R with NO bias. R is then a pure
+/// smoothing-strength knob. R = 2 is the accurate default: it keeps
+/// geometry within the bench's tested error bounds (low curvature-
+/// proportional bias, convex peaks stay crisp). R = 3 (σ ≈ 1.5) smooths
+/// high-frequency edit-jitter markedly more (bench irregular-mound
+/// interior edge-normal max 49° → 25°) but FAILS the geometry/normal
+/// accuracy bounds — it trades shape accuracy for smoothness, an
+/// aesthetic call. Reach is `R + 1 = 3 ≤ TILE_HALO_VOXELS = 4`, so it
+/// stays watertight (halo also leaves headroom for an opt-in R = 3).
 const DENSITY_KERNEL_R: i32 = 2;
 
 /// Standard deviation (in cells) of the separable Gaussian density
