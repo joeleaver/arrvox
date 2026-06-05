@@ -307,6 +307,54 @@ enum WorkerJob {
     Generator(GeneratorRequest),
 }
 
+/// Diagnostic probe used only on the ProceduralVoxelize collapse path.
+/// Evaluates the flattened SDF on a dense grid spanning `aabb` and
+/// returns `(neg, pos, zero, dmin, dmax)` — the sign distribution and
+/// distance range. If both `neg` and `pos` are non-zero a surface
+/// genuinely exists in the AABB, so a collapse-to-empty means the
+/// octree classify *missed* it (a GPU-result problem) rather than the
+/// SDF being empty (an upstream input problem).
+fn probe_sdf_grid(
+    evaluator: &mut GpuEvaluator,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    instructions: &[arvx_procedural::flatten::ProcInstruction],
+    aabb: &arvx_core::Aabb,
+) -> (u32, u32, u32, f32, f32) {
+    const N: u32 = 8;
+    let span = aabb.max - aabb.min;
+    let denom = (N - 1) as f32;
+    let mut pts: Vec<glam::Vec3> = Vec::with_capacity((N * N * N) as usize);
+    for z in 0..N {
+        for y in 0..N {
+            for x in 0..N {
+                let t = glam::Vec3::new(
+                    x as f32 / denom,
+                    y as f32 / denom,
+                    z as f32 / denom,
+                );
+                pts.push(aabb.min + span * t);
+            }
+        }
+    }
+    let results = evaluator.evaluate(device, queue, &pts, instructions);
+    let (mut neg, mut pos, mut zero) = (0u32, 0u32, 0u32);
+    let (mut dmin, mut dmax) = (f32::INFINITY, f32::NEG_INFINITY);
+    for s in results {
+        let d = s.into_tuple().0;
+        if d < 0.0 {
+            neg += 1;
+        } else if d > 0.0 {
+            pos += 1;
+        } else {
+            zero += 1;
+        }
+        dmin = dmin.min(d);
+        dmax = dmax.max(d);
+    }
+    (neg, pos, zero, dmin, dmax)
+}
+
 /// Run one bake job to completion. Accepts both procedural-tree input
 /// and pre-voxelized artifact input. Integrates under the `scene_mgr`
 /// lock and returns a `BakeResult` describing the outcome.
@@ -406,21 +454,77 @@ fn run_bake(
     let artifact = match req.input {
         BakeInput::Procedural(_) => unreachable!("handled above"),
         BakeInput::ProceduralVoxelize(instructions) => {
-            // GPU-evaluate the SDF at every cell the octree
-            // classifier asks about. `voxelize_to_artifact` is
-            // pool-private (fresh `LeafAttrPool` / `BrickPool`), so
-            // we don't need the scene_mgr lock yet — that's only
-            // taken below for the integrate step. Returns `None` on
-            // an empty tree or zero-voxel result, which propagates
-            // to `BakeOutcome::Failed`.
-            let mut closure = |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
-                evaluator
-                    .evaluate(device, queue, positions, &instructions)
-                    .into_iter()
-                    .map(|s| s.into_tuple())
-                    .collect()
-            };
-            arvx_core::voxelize_to_artifact(&mut closure, &req.aabb, req.voxel_size, 0)
+            // Pre-dispatch guard. A degenerate AABB or an empty opcode
+            // stream can only ever voxelize to nothing — but a doomed
+            // bake still pays a full GPU classify dispatch + blocking
+            // `device.poll` that contends with frame presentation on
+            // the (currently shared) queue. Fail fast with the reason
+            // instead of submitting work the GPU can't usefully do.
+            let extent = req.aabb.max - req.aabb.min;
+            let degenerate =
+                instructions.is_empty() || !extent.is_finite() || extent.min_element() <= 0.0;
+            if degenerate {
+                eprintln!(
+                    "[bake_worker] ProceduralVoxelize SKIPPED (degenerate input) \
+                     entity={:?} gen={} instructions={} aabb_min={:?} aabb_max={:?} \
+                     extent={:?} voxel_size={} root_scale={:?}",
+                    req.entity, req.generation, instructions.len(),
+                    req.aabb.min.to_array(), req.aabb.max.to_array(),
+                    extent.to_array(), req.voxel_size, req.root_scale.to_array(),
+                );
+                None
+            } else {
+                // GPU-evaluate the SDF at every cell the octree
+                // classifier asks about. `voxelize_to_artifact` is
+                // pool-private (fresh `LeafAttrPool` / `BrickPool`), so
+                // we don't need the scene_mgr lock yet — that's only
+                // taken below for the integrate step. Returns `None` on
+                // an empty tree or zero-voxel result, which propagates
+                // to `BakeOutcome::Failed`.
+                let artifact = {
+                    let mut closure =
+                        |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+                            evaluator
+                                .evaluate(device, queue, positions, &instructions)
+                                .into_iter()
+                                .map(|s| s.into_tuple())
+                                .collect()
+                        };
+                    arvx_core::voxelize_to_artifact(&mut closure, &req.aabb, req.voxel_size, 0)
+                };
+                if artifact.is_none() {
+                    // Non-degenerate input, yet the octree classifier
+                    // saw a uniform-sign SDF and emitted nothing. This
+                    // is the nondeterministic "voxels=0 ~1/3 of loads"
+                    // collapse. Re-probe the SDF on a dense grid across
+                    // the AABB to tell the two root causes apart:
+                    //   * sign varies here → a surface genuinely exists
+                    //     in this AABB, so the classify *missed* it →
+                    //     GPU-result corruption (the shared-queue race
+                    //     is the prime suspect), NOT bad input.
+                    //   * sign uniform here too → the flattened SDF is
+                    //     genuinely empty over its own bounds → an
+                    //     upstream flatten / bounds / transform bug.
+                    let (neg, pos, zero, dmin, dmax) =
+                        probe_sdf_grid(evaluator, device, queue, &instructions, &req.aabb);
+                    let verdict = if neg > 0 && pos > 0 {
+                        "SURFACE-PRESENT (classify missed it → GPU-result race?)"
+                    } else {
+                        "GENUINELY-EMPTY (upstream flatten/bounds/transform bug?)"
+                    };
+                    eprintln!(
+                        "[bake_worker] ProceduralVoxelize COLLAPSED to empty — {verdict} \
+                         entity={:?} gen={} instructions={} aabb_min={:?} aabb_max={:?} \
+                         extent={:?} voxel_size={} root_scale={:?} \
+                         probe8x8x8[neg={} pos={} zero={} dmin={:.4} dmax={:.4}]",
+                        req.entity, req.generation, instructions.len(),
+                        req.aabb.min.to_array(), req.aabb.max.to_array(),
+                        extent.to_array(), req.voxel_size, req.root_scale.to_array(),
+                        neg, pos, zero, dmin, dmax,
+                    );
+                }
+                artifact
+            }
         }
         BakeInput::Artifact(a) => Some(a),
     };

@@ -40,7 +40,9 @@ pub use baked_tile::BakedTile;
 pub use biome_region::BiomeRegion;
 pub use bounds::TerrainBounds;
 pub use fbm::FbmTerrainFn;
-pub use persist::{save_tile, tile_path, TILES_SUBDIR};
+pub use persist::{
+    read_signature, save_tile, signature_path, tile_path, write_signature, TILES_SUBDIR,
+};
 pub use physics_policy::{
     AlwaysResident, ColliderResidencyPolicy, EditRebuildPolicy, NoPredictive, OnIntegrate,
     OnStrokeRelease, PredictiveMaterializationPolicy, RadiusResident, RebuildContext,

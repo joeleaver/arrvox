@@ -472,27 +472,25 @@ impl super::state::EngineState {
     /// progress is better than no progress.
     pub(crate) fn flush_dirty_terrain_tiles(&mut self, scene_dir: &std::path::Path) {
         let Some(runtime) = self.terrain.as_mut() else { return };
-        if runtime.dirty_tiles.is_empty() {
-            return;
-        }
-        let dirty: Vec<arvx_terrain::TileKey> =
-            runtime.dirty_tiles.iter().copied().collect();
+        // Persist EVERY resident tile (not just sculpted/dirty ones) so a
+        // reload restores them from disk instead of re-baking the whole
+        // procedural terrain from `TerrainFn` (the load-time freeze).
+        // Validity is guarded by the bake signature written at the end:
+        // a later terrain edit changes the signature, so the streamer
+        // ignores these cached tiles (re-bakes) until the next save.
+        let resident: Vec<arvx_terrain::TileKey> =
+            runtime.tile_keys.keys().copied().collect();
         let mut succeeded: Vec<arvx_terrain::TileKey> = Vec::new();
         let mut failed: usize = 0;
-        for key in &dirty {
+        for key in &resident {
             // Resolve the asset handle. The tile may have been
             // evicted between the last edit and the save — log and
             // skip (V1 limitation; the .arvxtile would need to come
             // from a not-yet-implemented "edit log" or in-memory
             // shadow to survive eviction).
             let Some(&(_entity, handle)) = runtime.tile_keys.get(key) else {
-                self.console.warn(format!(
-                    "Skipping save for evicted dirty tile (lvl {}, {}, {}, {}). \
-                     Phase 4.3 V1 limitation: edits to evicted tiles aren't \
-                     persisted.",
-                    key.level, key.x, key.y, key.z,
-                ));
-                failed += 1;
+                // `resident` came straight from `tile_keys`, so this is
+                // unreachable in practice — defensive skip.
                 continue;
             };
 
@@ -552,8 +550,17 @@ impl super::state::EngineState {
                 }
             }
         }
-        for k in &succeeded {
-            runtime.dirty_tiles.remove(k);
+        runtime.dirty_tiles.clear();
+        // Stamp the cache with the current terrain signature so the
+        // loader can tell whether these tiles still match the live
+        // terrain (else it re-bakes rather than loading stale geometry).
+        if let Ok(t) = self.world.get::<&arvx_terrain::Terrain>(runtime.terrain_entity) {
+            let sig = t.bake_signature();
+            drop(t);
+            if let Err(e) = arvx_terrain::write_signature(scene_dir, sig) {
+                self.console
+                    .warn(format!("Terrain: write bake signature failed: {e}"));
+            }
         }
         self.console.info(format!(
             "Terrain: persisted {} tile(s) ({} failed)",

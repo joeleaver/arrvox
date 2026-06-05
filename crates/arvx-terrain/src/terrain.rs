@@ -188,11 +188,78 @@ impl Terrain {
         let idx = self.base_tier.saturating_sub(level as usize);
         RESOLUTION_TIERS[idx].voxel_size
     }
+
+    /// Stable 64-bit signature over every input that determines a
+    /// tile's baked content: the procedural `spec`, world `bounds`,
+    /// `base_tier` (voxel size), `skirt_depth_m`, and the stamp set.
+    ///
+    /// Persisted alongside cached `.arvxtile` files (as
+    /// `tiles/.bake_signature`). On load the streamer reuses cached
+    /// tiles ONLY when this matches the live terrain — so editing the
+    /// terrain (spec / tier / stamps) re-bakes affected tiles instead
+    /// of loading stale geometry. FNV-1a over the serde form keeps it
+    /// stable across process runs; a mismatch only ever causes a safe
+    /// re-bake, never a correctness error.
+    ///
+    /// Scope note: region GEOMETRY is guarded only by region count
+    /// (`BiomeRegion` isn't `Serialize`); a region edit that keeps the
+    /// count but changes material overrides falls back to the existing
+    /// in-session generation-bump invalidation + an explicit re-save.
+    pub fn bake_signature(&self) -> u64 {
+        // FNV-1a, computed inline to stay dependency-free and stable
+        // across runs (std's DefaultHasher is unspecified across
+        // versions; we want a fixed algorithm for an on-disk guard).
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut h = FNV_OFFSET;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        };
+        if let Ok(bytes) = serde_json::to_vec(&self.spec) {
+            mix(&bytes);
+        }
+        if let Ok(bytes) = serde_json::to_vec(&self.bounds) {
+            mix(&bytes);
+        }
+        mix(&(self.base_tier as u64).to_le_bytes());
+        mix(&self.skirt_depth_m.to_le_bytes());
+        // Stamps in composition order — the order is part of the
+        // identity, so don't sort.
+        for stamp in self.stamps.iter() {
+            if let Ok(bytes) = serde_json::to_vec(stamp) {
+                mix(&bytes);
+            }
+        }
+        // Coarse region guard (see scope note above).
+        mix(&(self.regions.len() as u64).to_le_bytes());
+        h
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bake_signature_is_deterministic_and_input_sensitive() {
+        let t = Terrain::default();
+        let base = t.bake_signature();
+        // Deterministic across calls (load-bearing: it's an on-disk guard).
+        assert_eq!(base, t.bake_signature());
+
+        // Skirt depth feeds the bake → must change the signature.
+        let mut t_skirt = Terrain::default();
+        t_skirt.skirt_depth_m += 1.0;
+        assert_ne!(base, t_skirt.bake_signature(), "skirt change must invalidate");
+
+        // Base tier (voxel size) feeds the bake → must change the signature.
+        let mut t_tier = Terrain::default();
+        t_tier.base_tier += 1;
+        assert_ne!(base, t_tier.bake_signature(), "tier change must invalidate");
+    }
 
     #[test]
     fn default_voxel_size_at_level0_is_quarter_meter() {

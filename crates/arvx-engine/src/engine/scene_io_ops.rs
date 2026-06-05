@@ -8,6 +8,24 @@
 use super::state::EngineState;
 use super::model_scan::spatial_from_handle;
 
+/// Decide whether a procedural-cache file holds a proxy mesh (`AVXP`)
+/// or a voxel asset (`AVX\x01`) by sniffing the 4-byte magic, NOT the
+/// file extension. The auto-bake path historically wrote proxy-mesh
+/// content to a `.arvx`-suffixed path (`procedural_cache_path` always
+/// returns `.arvx`), so routing on extension fed proxy caches to the
+/// voxel loader → "Invalid magic" → fall through to a full re-bake on
+/// every load. Content sniffing fixes those existing caches in place
+/// with no migration. Unreadable / too-short files return `false` so
+/// the voxel loader runs and surfaces its own diagnostic.
+fn cache_file_is_proxy(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok()
+        && buf == arvx_core::asset_file::ARVXPROXY_MAGIC
+}
+
 impl EngineState {
     pub(crate) fn load_scene_from_file(&mut self, path: &std::path::Path) {
         // Resolve the scene directory from the passed-in path rather
@@ -100,7 +118,7 @@ impl EngineState {
                                         obj.name,
                                     ));
                                     (None, None, 0)
-                                } else if rel.ends_with(".arvxproxy") {
+                                } else if cache_file_is_proxy(&full) {
                                     match arvx_core::asset_file::read_arvxproxy(&full) {
                                         Ok(cache) => {
                                             let aabb = arvx_core::Aabb {

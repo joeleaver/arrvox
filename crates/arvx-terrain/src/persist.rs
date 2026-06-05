@@ -37,6 +37,34 @@ pub fn tile_path(scene_dir: &Path, key: TileKey) -> PathBuf {
     ))
 }
 
+/// Path of the per-scene bake-signature sidecar:
+/// `<scene_dir>/tiles/.bake_signature`. Holds the
+/// [`crate::Terrain::bake_signature`] in effect when the cached tiles
+/// were written, so a load can tell whether the cache still matches the
+/// live terrain.
+pub fn signature_path(scene_dir: &Path) -> PathBuf {
+    scene_dir.join(TILES_SUBDIR).join(".bake_signature")
+}
+
+/// Write the bake signature for the currently-cached tiles. Creates the
+/// `tiles/` directory if needed.
+pub fn write_signature(scene_dir: &Path, signature: u64) -> Result<(), String> {
+    let path = signature_path(scene_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, signature.to_string())
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Read the cached bake signature, or `None` if absent / unparsable
+/// (treated as "no valid cache" → tiles re-bake).
+pub fn read_signature(scene_dir: &Path) -> Option<u64> {
+    let path = signature_path(scene_dir);
+    std::fs::read_to_string(&path).ok()?.trim().parse::<u64>().ok()
+}
+
 /// Read a `.arvxtile` back into a `BakeArtifact + MeshSectionsBlob`
 /// pair that `ArvxSceneManager::integrate_baked_tile` accepts.
 ///
@@ -233,6 +261,17 @@ mod tests {
     use crate::bake::bake_tile;
     use crate::fbm::FbmTerrainFn;
     use crate::tile_key::TileKey;
+
+    #[test]
+    fn signature_sidecar_roundtrips_and_is_absent_by_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // No cache yet → no signature.
+        assert_eq!(read_signature(tmp.path()), None);
+        // Write then read back the exact value (creates tiles/ on demand).
+        write_signature(tmp.path(), 0xDEAD_BEEF_1234_5678).expect("write_signature");
+        assert_eq!(read_signature(tmp.path()), Some(0xDEAD_BEEF_1234_5678));
+        assert!(signature_path(tmp.path()).exists());
+    }
 
     #[test]
     fn tile_path_uses_tiles_subdir_and_key_filename() {

@@ -258,6 +258,67 @@ impl RenderContext {
         }
     }
 
+    /// Request an ADDITIONAL device + queue from this context's adapter,
+    /// mirroring the primary headless device's feature/limit profile.
+    /// Returns `None` for shared-device contexts (no adapter retained,
+    /// e.g. `from_shared`) or if the adapter refuses a second device.
+    ///
+    /// Used to give background GPU work its own queue. A `wgpu::Queue` is
+    /// a single serialized submission stream, so a multi-hundred-ms bake
+    /// submitted to the *render* queue forces the next frame's submit +
+    /// present to wait behind it — that's the "viewport freezes during a
+    /// bake" stall. The bake worker's SDF evaluator + surface-nets run on
+    /// this secondary device instead; its buffers are self-contained and
+    /// its results are read back to the CPU, so nothing it produces is
+    /// shared GPU-side with the render device (no cross-device aliasing).
+    pub fn request_secondary_device(
+        &self,
+        label: &str,
+    ) -> Option<(wgpu::Device, wgpu::Queue)> {
+        let adapter = self.adapter.as_ref()?;
+        // Same feature/limit profile as `new_headless` so the evaluator /
+        // surface-nets shaders (elevated storage-buffer count + binding
+        // size) bind identically here. The adapter already proved it can
+        // grant this set when the primary device was created.
+        let result = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some(label),
+            required_features: wgpu::Features::FLOAT32_FILTERABLE
+                | wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+                | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+                | wgpu::Features::PIPELINE_STATISTICS_QUERY,
+            required_limits: wgpu::Limits {
+                max_bind_groups: 8,
+                max_storage_buffer_binding_size: adapter
+                    .limits()
+                    .max_storage_buffer_binding_size
+                    .min(1 << 31),
+                max_buffer_size: adapter.limits().max_buffer_size.min(1 << 31),
+                max_storage_buffers_per_shader_stage: 32,
+                max_storage_textures_per_shader_stage: 8,
+                max_color_attachment_bytes_per_sample: adapter
+                    .limits()
+                    .max_color_attachment_bytes_per_sample,
+                ..wgpu::Limits::default()
+            },
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+        }));
+        match result {
+            Ok((device, queue)) => {
+                device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
+                    eprintln!("[GPU ERROR bake] {error}");
+                }));
+                Some((device, queue))
+            }
+            Err(e) => {
+                eprintln!("[arvx_context] secondary (bake) device request failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Create a render context from a shared device and queue.
     ///
     /// Used when the engine shares a wgpu device with an external renderer

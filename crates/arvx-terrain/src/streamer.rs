@@ -162,6 +162,13 @@ pub struct TileStreamer {
     /// worker then runs `TerrainFn` baking exclusively. The engine
     /// updates this whenever `scene_path` changes (load / save-as).
     scene_dir: Option<std::path::PathBuf>,
+    /// Bake signature stored alongside the cached `.arvxtile` files
+    /// (`tiles/.bake_signature`), loaded when `scene_dir` is set. A
+    /// cached tile is only fed to the worker (`disk_path`) when this
+    /// equals the LIVE terrain's [`Terrain::bake_signature`] — so a
+    /// terrain edit (spec / tier / stamps) re-bakes instead of loading
+    /// stale tiles. `None` ⇒ no cache present ⇒ everything bakes.
+    cached_signature: Option<u64>,
 }
 
 impl TileStreamer {
@@ -176,6 +183,7 @@ impl TileStreamer {
             submit_scratch: Vec::new(),
             evict_scratch: Vec::new(),
             scene_dir: None,
+            cached_signature: None,
         }
     }
 
@@ -188,6 +196,10 @@ impl TileStreamer {
     /// run `TerrainFn` voxelization. The engine sets this on
     /// scene-load + save-as.
     pub fn set_scene_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        // Load the cached bake signature for this scene so `submit_pending`
+        // can decide whether the on-disk tiles still match the live
+        // terrain. Absent / unparsable ⇒ `None` ⇒ tiles re-bake.
+        self.cached_signature = dir.as_deref().and_then(crate::persist::read_signature);
         self.scene_dir = dir;
     }
 
@@ -616,6 +628,13 @@ impl TileStreamer {
         let mut budget = self
             .max_in_flight
             .saturating_sub(self.worker.in_flight());
+        // Reuse on-disk `.arvxtile` caches only when their stored
+        // signature matches the live terrain. A terrain edit changes
+        // `bake_signature()`, so cached tiles are ignored (re-baked)
+        // until the next save re-writes them under the new signature —
+        // no stale geometry, no per-load re-bake when nothing changed.
+        let cache_valid =
+            self.scene_dir.is_some() && self.cached_signature == Some(terrain.bake_signature());
         for (key, _) in self.submit_scratch.drain(..) {
             if budget == 0 {
                 break;
@@ -625,10 +644,13 @@ impl TileStreamer {
                 continue;
             }
             slot.requested_generation = slot.requested_generation.wrapping_add(1);
-            let disk_path = self
-                .scene_dir
-                .as_ref()
-                .map(|d| crate::persist::tile_path(d, key));
+            let disk_path = if cache_valid {
+                self.scene_dir
+                    .as_ref()
+                    .map(|d| crate::persist::tile_path(d, key))
+            } else {
+                None
+            };
             // Pre-filter Layer-2 stamps down to those whose AABB
             // overlaps the tile's XZ footprint. Skipped entirely
             // when no stamps exist — avoids the empty Vec allocation

@@ -15,6 +15,23 @@ impl EngineState {
         state_callback: StateCallback,
     ) -> Self {
         let ctx = arvx_render::RenderContext::new_headless();
+        // Dedicated GPU device+queue for the bake worker. A wgpu::Queue is
+        // a single serialized submission stream, so sharing it with the
+        // render worker means a multi-hundred-ms SDF bake forces the next
+        // frame's submit+present to wait behind it — the "viewport freezes
+        // during a bake" stall. A second device decouples the two queues so
+        // the GPU can schedule bake compute and frame presentation
+        // independently. Falls back to the shared render device+queue if the
+        // adapter won't grant a second device (preserving prior behaviour).
+        let (bake_device, bake_queue) = ctx
+            .request_secondary_device("arvx-bake device")
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "[arvx_engine] bake worker falling back to the shared render \
+                     device/queue — heavy bakes may briefly stall frame presentation"
+                );
+                (ctx.device.clone(), ctx.queue.clone())
+            });
         let device = ctx.device;
         let queue = ctx.queue;
 
@@ -38,12 +55,13 @@ impl EngineState {
         input_system.set_active_map("editor");
         let camera_control = CameraControlState::default();
 
-        // Bake worker: shares device/queue clones (cheap — wgpu wraps
-        // the underlying objects in Arcs internally) and the same
-        // scene_mgr we'll hand to the render thread below.
+        // Bake worker: runs on its own `bake_device`/`bake_queue` (see
+        // above) so its GPU work can't serialize ahead of frame
+        // presentation on the render queue. Shares the same `scene_mgr`
+        // we'll hand to the render thread below (CPU-side integrate).
         let bake_worker = crate::bake_worker::BakeWorker::spawn(
-            device.clone(),
-            queue.clone(),
+            bake_device,
+            bake_queue,
             scene_mgr.clone(),
         );
         let generator_system = crate::generator::GeneratorSystem::new(

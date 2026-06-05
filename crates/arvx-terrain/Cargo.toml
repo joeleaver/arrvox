@@ -14,6 +14,7 @@ hecs = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 crossbeam = { workspace = true }
 
 [dev-dependencies]
