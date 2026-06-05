@@ -55,11 +55,15 @@ pub struct LoadedAsset {
     dag_produced: Vec<u32>,
     skinning: Option<SkinningAssetData>,
     cluster_spatial_index: super::cluster_spatial_index::ClusterSpatialIndex,
-    /// The ≤16 material IDs this asset's bake-time leaves use (from the
-    /// `.arvx` header). Authoritative for the asset's glass-ness as long
-    /// as the shared pool hasn't been painted — lets the engine answer
-    /// `has_glass` in O(16) instead of walking every leaf.
-    material_palette: [u16; 16],
+    /// The complete, deduped set of project `material_primary` IDs across
+    /// this asset's leaves + prefilter attrs — the real runtime material
+    /// authority (the same IDs the per-leaf `LeafAttr.material_primary`
+    /// carries), collected off-thread during the build. Lets the engine
+    /// answer `has_glass` in O(distinct) without a per-leaf walk. (NOT the
+    /// `.arvx` header's `material_ids`, which is empty for procedural
+    /// assets and mesh-local + truncated for imports — not the runtime
+    /// authority.)
+    distinct_materials: Vec<u16>,
 }
 
 impl ArvxSceneManager {
@@ -527,6 +531,29 @@ impl ArvxSceneManager {
         // file-local leaf_attr count including the prefilter tail.
         let prefilter_added = leaf_attr_pool.allocated_count() - leaf_attr_slot_count;
 
+        // Distinct project `material_primary` IDs across every (leaf +
+        // prefilter) attr — the same coverage the runtime `has_glass`
+        // leaf-walk had, collected here off-thread so the runtime answers
+        // in O(distinct). A 65536-bit set (8 KiB) over the u16 id space
+        // gives one O(attrs) pass with no per-id hashing or sort.
+        let distinct_materials: Vec<u16> = {
+            let mut seen = vec![0u64; (u16::MAX as usize + 1) / 64];
+            for a in leaf_attr_pool.as_slice() {
+                let id = a.material_primary as usize;
+                seen[id >> 6] |= 1u64 << (id & 63);
+            }
+            let mut out = Vec::new();
+            for (word_idx, &word) in seen.iter().enumerate() {
+                let mut w = word;
+                while w != 0 {
+                    let bit = w.trailing_zeros() as usize;
+                    out.push((word_idx * 64 + bit) as u16);
+                    w &= w - 1;
+                }
+            }
+            out
+        };
+
         // v5+ pre-built mesh deserialization. The .arvx ships
         // `(MeshVertex[], u32[], MeshletCluster[])` so the editor
         // skips the ~12s `extract_surface_mesh` +
@@ -894,7 +921,7 @@ impl ArvxSceneManager {
             dag_produced,
             skinning,
             cluster_spatial_index,
-            material_palette: header.material_ids,
+            distinct_materials,
         })
     }
 
@@ -928,7 +955,7 @@ impl ArvxSceneManager {
             dag_produced,
             skinning,
             cluster_spatial_index,
-            material_palette,
+            distinct_materials,
         } = loaded;
 
         // Splice the private leaf_attr pool (attrs + colors + bones) in
@@ -1047,7 +1074,7 @@ impl ArvxSceneManager {
             // construction; the slice stays empty. Terrain tiles populate
             // this through `integrate_baked_tile`.
             halo_cells: Vec::new(),
-            material_palette,
+            distinct_materials: Some(distinct_materials),
         }
     }
 
@@ -1110,33 +1137,29 @@ impl ArvxSceneManager {
         self.asset_cache.get(handle)?.skinning.as_ref()
     }
 
-    /// Does any material in this asset's bake-time palette render as
-    /// glass? The `.arvx` header lists the ≤16 material IDs the asset's
-    /// leaves actually use, so this is an O(16) answer for an **unpainted**
-    /// asset — no leaf walk. `material_is_glass` is the engine's per-slot
-    /// glass table (indexed by material id).
+    /// Does any of this asset's materials render as glass, answered from
+    /// the precomputed distinct-material set — O(distinct), no leaf walk.
+    /// `material_is_glass` is the engine's per-slot glass table (indexed
+    /// by project material id).
     ///
-    /// **Conservative, never-under-reports:** unused palette slots are
-    /// zero-padded, so if material id 0 is itself configured as glass
-    /// every asset reports glass — a wasted glass pass, never a missed
-    /// one (glass leaves are never rendered opaque). Material 0 is the
-    /// default-opaque convention, so in practice the verdict is exact.
+    /// Returns `Some(verdict)` when the asset's distinct-material set is
+    /// known (the off-thread `.arvx` load computes it from the real
+    /// per-leaf `material_primary`s); `None` when it isn't (terrain tiles,
+    /// halo refresh), so the caller falls back to the per-leaf walk.
     ///
-    /// NOT authoritative once the shared pool has been painted with a
-    /// non-palette glass material — the caller must keep the per-leaf
-    /// scan for assets it knows have been painted to glass.
-    pub fn asset_palette_has_glass(
+    /// The set reflects the **bake-time** materials; once the shared pool
+    /// is painted with a material outside that set the caller must keep
+    /// the per-leaf walk for that asset (`assets_painted_glass`).
+    pub fn asset_has_glass_quick(
         &self,
         handle: AssetHandle,
         material_is_glass: &[bool],
-    ) -> bool {
-        let Some(entry) = self.asset_cache.get(handle) else {
-            return false;
-        };
-        entry.material_palette.iter().any(|&id| {
+    ) -> Option<bool> {
+        let mats = self.asset_cache.get(handle)?.distinct_materials.as_ref()?;
+        Some(mats.iter().any(|&id| {
             let id = id as usize;
             id < material_is_glass.len() && material_is_glass[id]
-        })
+        }))
     }
 
     /// Surface-mesh `(vertices, indices, lod0_index_count)` for
@@ -1476,28 +1499,41 @@ mod load_roundtrip_tests {
         }
     }
 
-    /// `asset_palette_has_glass` answers from the stored header palette,
-    /// indexed into the engine's per-slot glass table — no leaf walk.
-    /// The sphere uses material 0, so the verdict tracks whether material
-    /// 0 is marked glass.
+    /// `asset_has_glass_quick` answers from the build-time distinct
+    /// project-material set (the real per-leaf authority), not the
+    /// vestigial header palette. The sphere's leaves use material 0, so
+    /// the set is `[0]` and the verdict tracks whether material 0 is glass.
     #[test]
-    fn asset_palette_has_glass_reads_the_header_palette() {
+    fn asset_has_glass_quick_uses_the_distinct_material_set() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (path, _) = write_sphere_arvx(tmp.path());
         let mut sm = ArvxSceneManager::new(1_000_000);
         let (handle, _) = sm.acquire_asset(&path.to_string_lossy()).expect("acquire");
 
-        // Material 0 opaque → no glass.
+        // The build computed a distinct set covering the asset's materials
+        // (sphere uses material 0) — so the verdict is Some, never the
+        // walk-fallback None.
         let opaque = vec![false; 4];
-        assert!(!sm.asset_palette_has_glass(handle, &opaque));
+        assert_eq!(sm.asset_has_glass_quick(handle, &opaque), Some(false));
 
-        // Material 0 marked glass → palette reports glass.
+        // Material 0 marked glass → the set reports glass.
         let mut glass = vec![false; 4];
         glass[0] = true;
-        assert!(sm.asset_palette_has_glass(handle, &glass));
+        assert_eq!(sm.asset_has_glass_quick(handle, &glass), Some(true));
 
-        // Unknown handle → false (never panics / over-reports).
+        // Confirm the set is exactly the materials the leaves use, not the
+        // (empty, for procedural assets) header palette.
+        let entry_mats = sm
+            .asset_cache
+            .get(handle)
+            .unwrap()
+            .distinct_materials
+            .clone()
+            .expect("load path computes the distinct set");
+        assert_eq!(entry_mats, vec![0u16], "sphere leaves use only material 0");
+
+        // Unknown handle → None (caller falls back to the walk).
         let bogus = AssetHandle::from_raw(9999);
-        assert!(!sm.asset_palette_has_glass(bogus, &glass));
+        assert_eq!(sm.asset_has_glass_quick(bogus, &glass), None);
     }
 }

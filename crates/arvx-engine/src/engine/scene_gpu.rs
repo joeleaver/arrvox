@@ -307,49 +307,57 @@ impl EngineState {
                     {
                         Some(&v) => v,
                         None => {
-                            // Authority for an UNPAINTED asset is its ≤16-entry
-                            // material palette (the `.arvx` header lists exactly
-                            // the materials its leaves use) — an O(16) check, no
-                            // leaf walk. This is the path scene-load streaming
-                            // takes; it replaces a ~2.3M-leaf scan per big asset.
+                            // Fast path: the asset's precomputed distinct
+                            // project-material set (collected off-thread by the
+                            // `.arvx` load from the real per-leaf `material_primary`s).
+                            // `asset_has_glass_quick` answers in O(distinct) — this
+                            // is what scene-load streaming takes, replacing a
+                            // ~2.3M-leaf scan per big asset.
                             //
-                            // Once the shared pool has been painted with a
-                            // possibly-non-palette glass material the palette is
-                            // no longer authoritative, so those roots fall back
-                            // to the per-leaf walk (the same scan as before).
-                            let found = if self.assets_painted_glass.contains(&root_offset) {
-                                let sm = self.scene_mgr.lock().unwrap();
-                                let mut leaf_slots: Vec<u32> = Vec::new();
-                                let all_nodes = sm.octree.data();
-                                let internal_attrs = sm.octree.internal_attrs_data();
-                                crate::engine::model_scan::collect_leaf_slots(
-                                    all_nodes,
-                                    &sm.brick_pool,
-                                    root_offset as usize,
-                                    &mut leaf_slots,
-                                );
-                                crate::engine::model_scan::collect_internal_attr_slots(
-                                    all_nodes,
-                                    internal_attrs,
-                                    root_offset as usize,
-                                    &mut leaf_slots,
-                                );
-                                let pool_size = sm.leaf_attr_pool.allocated_count();
-                                leaf_slots.iter().any(|&slot| {
-                                    slot < pool_size && {
-                                        let mat_id =
-                                            sm.leaf_attr_pool.get(slot).material_primary as usize;
-                                        mat_id < self.material_is_glass.len()
-                                            && self.material_is_glass[mat_id]
-                                    }
-                                })
+                            // Walk fallback (the original authority) for two cases:
+                            //   - the asset has been painted with a material that may
+                            //     be outside its bake-time set (`assets_painted_glass`),
+                            //   - the set is unknown (`None` → terrain tiles / halo
+                            //     refresh, which never computed one).
+                            let quick = if self.assets_painted_glass.contains(&root_offset) {
+                                None
                             } else if let Some(h) = renderable.asset_handle {
                                 self.scene_mgr
                                     .lock()
                                     .unwrap()
-                                    .asset_palette_has_glass(h, &self.material_is_glass)
+                                    .asset_has_glass_quick(h, &self.material_is_glass)
                             } else {
-                                false
+                                None
+                            };
+                            let found = match quick {
+                                Some(v) => v,
+                                None => {
+                                    let sm = self.scene_mgr.lock().unwrap();
+                                    let mut leaf_slots: Vec<u32> = Vec::new();
+                                    let all_nodes = sm.octree.data();
+                                    let internal_attrs = sm.octree.internal_attrs_data();
+                                    crate::engine::model_scan::collect_leaf_slots(
+                                        all_nodes,
+                                        &sm.brick_pool,
+                                        root_offset as usize,
+                                        &mut leaf_slots,
+                                    );
+                                    crate::engine::model_scan::collect_internal_attr_slots(
+                                        all_nodes,
+                                        internal_attrs,
+                                        root_offset as usize,
+                                        &mut leaf_slots,
+                                    );
+                                    let pool_size = sm.leaf_attr_pool.allocated_count();
+                                    leaf_slots.iter().any(|&slot| {
+                                        slot < pool_size && {
+                                            let mat_id =
+                                                sm.leaf_attr_pool.get(slot).material_primary as usize;
+                                            mat_id < self.material_is_glass.len()
+                                                && self.material_is_glass[mat_id]
+                                        }
+                                    })
+                                }
                             };
                             self.asset_has_glass_cache.insert(root_offset, found);
                             found

@@ -286,12 +286,16 @@ pub(super) struct AssetEntry {
     /// had halo data, the re-extract didn't, the new cluster's
     /// boundary cubes diverge from the neighbour's.
     pub(super) halo_cells: Vec<(glam::IVec3, u32)>,
-    /// The ≤16 material IDs this asset's bake-time leaves use (from the
-    /// `.arvx` header's palette). Lets the engine answer `has_glass` in
-    /// O(16) without walking every leaf — authoritative while the shared
-    /// pool is unpainted. Terrain tiles (no `.arvx` header) leave this
-    /// zeroed; they're opaque, so the palette verdict is correctly false.
-    pub(super) material_palette: [u16; 16],
+    /// The complete deduped set of project `material_primary` IDs across
+    /// this asset's leaves + prefilter attrs, when known — the runtime
+    /// material authority (same IDs the per-leaf `LeafAttr` carries). Lets
+    /// the engine answer `has_glass` in O(distinct) without a leaf walk.
+    ///
+    /// `None` means "not computed for this integration path" — the engine
+    /// falls back to the per-leaf walk (correct, just not the fast path).
+    /// Only the off-thread `.arvx` load populates `Some`; terrain-tile and
+    /// halo-refresh entries leave it `None` and walk.
+    pub(super) distinct_materials: Option<Vec<u16>>,
 }
 
 impl AssetEntry {
@@ -856,7 +860,7 @@ mod slab_tests {
             sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
-            material_palette: [0u16; 16],
+            distinct_materials: None,
         }
     }
 
@@ -1062,7 +1066,7 @@ mod slab_tests {
             sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             halo_cells: Vec::new(),
-            material_palette: [0u16; 16],
+            distinct_materials: None,
         };
         let grid_origin = entry.grid_origin();
         let base_vs = entry.spatial_handle.base_voxel_size;

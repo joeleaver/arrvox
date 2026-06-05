@@ -345,9 +345,10 @@ impl ArvxSceneManager {
             sculpt_owned_slots: rustc_hash::FxHashSet::default(),
             halo_extra_slots: std::collections::HashSet::new(),
             halo_cells,
-            // Terrain tiles carry no `.arvx` palette; they're opaque, so a
-            // zeroed palette yields the correct `has_glass = false`.
-            material_palette: [0u16; 16],
+            // Terrain tiles don't precompute a distinct-material set, so
+            // the engine falls back to the per-leaf walk for them (they're
+            // opaque, so that correctly reports no glass).
+            distinct_materials: None,
         };
 
         let info = entry.info();
