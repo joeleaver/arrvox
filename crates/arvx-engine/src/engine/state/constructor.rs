@@ -215,6 +215,7 @@ impl EngineState {
             import_worker: crate::import_worker::ImportWorker::new(),
             geometry_dirty: crate::engine::geometry_dirty::GeometryDirty::new(),
             pending_conversions: std::collections::HashMap::new(),
+            pending_asset_loads: std::collections::VecDeque::new(),
             scene_dirty: super::super::scene_dirty::SceneDirty::new(),
             gpu_objects_dirty: {
                 // Initial state: full rebuild on first tick. World is

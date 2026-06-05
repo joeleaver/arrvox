@@ -74,6 +74,9 @@ pub(crate) fn tick_loop(
         // an otherwise-harmless one-tick stale queue entry.
         state.drain_bake_results();
         state.update_dirty_procedurals();
+        // Integrate a budget of deferred scene-load asset loads so a
+        // heavy load reveals geometry progressively instead of freezing.
+        state.drain_pending_asset_loads();
 
         // 1b3. Generator system — poll finished generator jobs,
         // detect param edits, submit stale jobs. Lives alongside the

@@ -732,6 +732,16 @@ pub(crate) struct EngineState {
     /// an imported `.glb`/`.fbx`. Cleared after the swap. Empty in
     /// steady state; one entry per active conversion (typically 0-1).
     pub(crate) pending_conversions: std::collections::HashMap<hecs::Entity, std::path::PathBuf>,
+    /// Deferred voxel-asset loads queued by `load_scene_from_file`. The
+    /// scene's heavy `.arvx` assets (millions of voxels each) integrate
+    /// into the shared pools on the sim thread under the `scene_mgr`
+    /// lock — doing all of them inline froze the viewport for seconds on
+    /// load. Instead the loader spawns each entity geometry-less and
+    /// pushes it here; `drain_pending_asset_loads` integrates a bounded
+    /// budget per tick so frames keep shipping and assets reveal
+    /// progressively. Empty in steady state.
+    pub(crate) pending_asset_loads:
+        std::collections::VecDeque<crate::engine::scene_io_ops::PendingAssetLoad>,
     /// Scene structure changed — push objects list to UI. Per-entity
     /// dirty set + sticky-all bit; see [`super::scene_dirty::SceneDirty`]
     /// and `docs/PERF_DEBT.md` B3. Today's consumer in

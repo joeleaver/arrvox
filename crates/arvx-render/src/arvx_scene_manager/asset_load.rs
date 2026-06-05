@@ -158,6 +158,7 @@ impl ArvxSceneManager {
     /// via the cache.
     fn load_asset_from_disk(&mut self, arvx_path: &std::path::Path) -> Result<AssetEntry, String> {
         use arvx_core::voxel::VoxelSample;
+        let t0 = std::time::Instant::now();
 
         let mut file = std::fs::File::open(arvx_path)
             .map_err(|e| format!("open {}: {e}", arvx_path.display()))?;
@@ -294,6 +295,7 @@ impl ArvxSceneManager {
         )
         .map_err(|e| format!("read dag produced: {e}"))?;
         let mesh_lod0_index_count_from_file = header.mesh_lod0_index_count;
+        let t_read_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
         let bytes_per_voxel = std::mem::size_of::<VoxelSample>();
         // `Option<u32>` for normal so we distinguish "file has no normals"
@@ -835,6 +837,13 @@ impl ArvxSceneManager {
             mesh_vertices_dirty.mark_full(vbo_total_bytes);
         }
 
+        eprintln!(
+            "[asset-load-timing] {} read+decompress={:.0}ms integrate={:.0}ms voxels={}",
+            arvx_path.display(),
+            t_read_ms,
+            t0.elapsed().as_secs_f32() * 1000.0 - t_read_ms,
+            voxel_count,
+        );
         Ok(AssetEntry {
             path: arvx_path.to_path_buf(),
             refcount: 1,

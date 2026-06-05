@@ -37,7 +37,7 @@ mod procedural_ops;
 mod procedural_params;
 mod region_ops;
 mod scene_gpu;
-mod scene_io_ops;
+pub(crate) mod scene_io_ops;
 mod scene_tree_ops;
 mod stamp_ops;
 mod state_update;

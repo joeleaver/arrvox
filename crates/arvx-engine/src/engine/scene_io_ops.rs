@@ -8,6 +8,14 @@
 use super::state::EngineState;
 use super::model_scan::spatial_from_handle;
 
+/// One queued voxel-asset load, drained by
+/// [`EngineState::drain_pending_asset_loads`]. See the field doc on
+/// `EngineState::pending_asset_loads` for why loads are deferred.
+pub(crate) struct PendingAssetLoad {
+    pub(crate) entity: hecs::Entity,
+    pub(crate) full_path: std::path::PathBuf,
+}
+
 /// Decide whether a procedural-cache file holds a proxy mesh (`AVXP`)
 /// or a voxel asset (`AVX\x01`) by sniffing the 4-byte magic, NOT the
 /// file extension. The auto-bake path historically wrote proxy-mesh
@@ -68,23 +76,28 @@ impl EngineState {
                         let full_path = self.project_dir.as_ref()
                             .map(|d| d.join("assets").join(asset_path))
                             .unwrap_or_else(|| std::path::PathBuf::from(asset_path));
-                        match self.scene_mgr.lock().unwrap().acquire_asset(&full_path.to_string_lossy()) {
-                            Ok((handle, info)) => {
-                                let spatial = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
-                                let e = self.world.spawn((transform, meta, Renderable {
-                                    asset_path: Some(asset_path.clone()),
-                                    material_id: obj.material_id,
-                                    voxel_count: info.voxel_count,
-                                    spatial: Some(crate::components::RenderGeometry::Octree(spatial)),
-                                    asset_handle: Some(handle),
-                                    material_overrides: obj.material_overrides.clone(),
-                                    ..Default::default()
-                                }));
-                                self.geometry_dirty.mark_all();
-                                Some(e)
-                            }
-                            Err(_) => None,
-                        }
+                        // Deferred: spawn the entity geometry-less now and
+                        // queue the heavy voxel integrate for
+                        // `drain_pending_asset_loads` (a budget per tick),
+                        // so loading a scene full of million-voxel assets
+                        // doesn't freeze the viewport for seconds. Parenting,
+                        // components, ordering and the inspector all resolve
+                        // against the real entity immediately; the geometry
+                        // pops in when its load completes.
+                        let e = self.world.spawn((transform, meta, Renderable {
+                            asset_path: Some(asset_path.clone()),
+                            material_id: obj.material_id,
+                            voxel_count: 0,
+                            spatial: None,
+                            asset_handle: None,
+                            material_overrides: obj.material_overrides.clone(),
+                            ..Default::default()
+                        }));
+                        self.pending_asset_loads.push_back(PendingAssetLoad {
+                            entity: e,
+                            full_path,
+                        });
+                        Some(e)
                     } else if obj.procedural_cache.is_some() {
                         // Three cases land here:
                         //   - Procedurals (`primitive == Some("procedural")`):
@@ -109,6 +122,9 @@ impl EngineState {
                         // empty — recoverable on the next Bake (for
                         // single procedurals) or generator regen (for
                         // children).
+                        // Set by the voxel sub-case below to defer the
+                        // heavy `.arvx` integrate to `drain_pending_asset_loads`.
+                        let mut deferred_voxel_path: Option<std::path::PathBuf> = None;
                         let (spatial, asset_handle, voxel_count) = match (&obj.procedural_cache, &scene_dir) {
                             (Some(rel), Some(dir)) => {
                                 let full = dir.join(rel);
@@ -162,19 +178,16 @@ impl EngineState {
                                         }
                                     }
                                 } else {
-                                    match self.scene_mgr.lock().unwrap().acquire_asset(&full.to_string_lossy()) {
-                                        Ok((handle, info)) => {
-                                            let sp = spatial_from_handle(&info.spatial, info.voxel_size, &info.aabb, info.grid_origin, info.leaf_attr_slot_start, info.leaf_attr_slot_count, Vec::new());
-                                            (Some(crate::components::RenderGeometry::Octree(sp)), Some(handle), info.voxel_count)
-                                        }
-                                        Err(e) => {
-                                            self.console.warn(format!(
-                                                "Failed to load procedural cache '{rel}' for '{}': {e}",
-                                                obj.name,
-                                            ));
-                                            (None, None, 0)
-                                        }
-                                    }
+                                    // Voxel cache (Convert'd object or
+                                    // voxelized generator child — never a
+                                    // ProceduralGeometry entity, which always
+                                    // caches as proxy). Defer the integrate to
+                                    // drain_pending_asset_loads so the big
+                                    // multi-million-voxel caches don't freeze
+                                    // the load; the entity spawns geometry-less
+                                    // and reveals when the load completes.
+                                    deferred_voxel_path = Some(full.clone());
+                                    (None, None, 0)
                                 }
                             }
                             _ => (None, None, 0),
@@ -194,7 +207,14 @@ impl EngineState {
                             material_overrides: obj.material_overrides.clone(),
                             ..Default::default()
                         }));
-                        self.geometry_dirty.mark_all();
+                        if let Some(path) = deferred_voxel_path {
+                            self.pending_asset_loads.push_back(PendingAssetLoad {
+                                entity: e,
+                                full_path: path,
+                            });
+                        } else {
+                            self.geometry_dirty.mark_all();
+                        }
                         Some(e)
                     } else if obj.primitive.as_deref() == Some("procedural") {
                         // Procedural without an on-disk bake cache.
@@ -490,6 +510,77 @@ impl EngineState {
                 self.gpu_objects_dirty.mark_all();
             }
             Err(e) => self.console.error(format!("Load scene failed: {e}")),
+        }
+    }
+
+    /// Integrate a bounded budget of deferred voxel-asset loads per
+    /// tick (see [`EngineState::pending_asset_loads`]). Each
+    /// `acquire_asset` reads + integrates one `.arvx` into the shared
+    /// pools under the `scene_mgr` lock; spreading them across ticks
+    /// keeps the viewport shipping frames during a heavy scene load
+    /// instead of freezing for seconds while every asset integrates.
+    pub(crate) fn drain_pending_asset_loads(&mut self) {
+        if self.pending_asset_loads.is_empty() {
+            return;
+        }
+        // Per-tick budget: finish the current asset even if it overruns
+        // (one integrate can't be sub-divided), but stop pulling new
+        // ones past the budget so a frame can ship between heavy assets.
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(6);
+        let start = std::time::Instant::now();
+        while let Some(p) = self.pending_asset_loads.pop_front() {
+            if !self.world.contains(p.entity) {
+                continue; // entity deleted before its deferred load ran
+            }
+            let acquired = self
+                .scene_mgr
+                .lock()
+                .unwrap()
+                .acquire_asset(&p.full_path.to_string_lossy());
+            match acquired {
+                Ok((handle, info)) => {
+                    let spatial = spatial_from_handle(
+                        &info.spatial,
+                        info.voxel_size,
+                        &info.aabb,
+                        info.grid_origin,
+                        info.leaf_attr_slot_start,
+                        info.leaf_attr_slot_count,
+                        Vec::new(),
+                    );
+                    // Snapshot overrides before the mutable Renderable borrow.
+                    let overrides: Vec<(u16, u16)> = self
+                        .world
+                        .get::<&crate::components::Renderable>(p.entity)
+                        .map(|r| r.material_overrides.clone())
+                        .unwrap_or_default();
+                    if let Ok(mut r) =
+                        self.world.get::<&mut crate::components::Renderable>(p.entity)
+                    {
+                        r.spatial = Some(crate::components::RenderGeometry::Octree(spatial));
+                        r.asset_handle = Some(handle);
+                        r.voxel_count = info.voxel_count;
+                    }
+                    // Replay persisted material overrides now that the
+                    // voxels exist (the load-time first-pass replay was a
+                    // no-op against the not-yet-loaded geometry).
+                    for (from, to) in overrides {
+                        self.remap_entity_material(p.entity, from, to);
+                    }
+                    self.geometry_dirty.mark_all();
+                    self.gpu_objects_dirty.mark_all();
+                    self.scene_dirty.mark_entity(p.entity);
+                }
+                Err(e) => {
+                    self.console.warn(format!(
+                        "Deferred asset load failed for {}: {e}",
+                        p.full_path.display(),
+                    ));
+                }
+            }
+            if start.elapsed() >= BUDGET {
+                break;
+            }
         }
     }
 
