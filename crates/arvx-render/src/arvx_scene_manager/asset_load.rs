@@ -13,7 +13,7 @@ use arvx_core::{BrickPool, LeafAttr, LeafAttrPool, SparseOctree};
 
 use super::manager::ArvxSceneManager;
 use super::types::{
-    AssetEntry, AssetHandle, AssetInfo, ReloadResult, SkinningAssetData,
+    AssetEntry, AssetHandle, AssetInfo, MeshView, ReloadResult, SkinningAssetData, VoxelModel,
 };
 use crate::mesh_pass::extract_surface_mesh;
 
@@ -108,11 +108,11 @@ impl ArvxSceneManager {
         if let Some(handle) = self.asset_cache.lookup_path(&canonical) {
             let entry = self.asset_cache.get_mut(handle).expect("cache/handle mismatch");
             entry.refcount += 1;
-            return Ok((handle, entry.info()));
+            return Ok((handle, entry.model.info()));
         }
 
         let entry = self.load_asset_from_disk(&canonical)?;
-        let info = entry.info();
+        let info = entry.model.info();
         let handle = self.asset_cache.insert(entry);
         Ok((handle, info))
     }
@@ -129,7 +129,7 @@ impl ArvxSceneManager {
         self.bump_geometry_epoch();
         let entry = self.asset_cache.get_mut(handle)?;
         entry.refcount += 1;
-        Some((handle, entry.info()))
+        Some((handle, entry.model.info()))
     }
 
     /// Force a reload of a cached asset from disk. Used after re-import
@@ -151,15 +151,15 @@ impl ArvxSceneManager {
             .map(|e| e.refcount).unwrap_or(0);
 
         let entry = self.asset_cache.remove(old_handle).expect("just looked up");
-        self.octree.deallocate(entry.spatial_handle);
-        self.leaf_attr_pool.deallocate_range(entry.leaf_attr_slot_start, entry.leaf_attr_slot_count);
-        for id in entry.brick_start..(entry.brick_start + entry.brick_count) {
+        self.octree.deallocate(entry.model.spatial_handle);
+        self.leaf_attr_pool.deallocate_range(entry.model.leaf_attr_slot_start, entry.model.leaf_attr_slot_count);
+        for id in entry.model.brick_start..(entry.model.brick_start + entry.model.brick_count) {
             self.brick_pool.deallocate(id);
         }
 
         let mut fresh = self.load_asset_from_disk(&canonical)?;
         fresh.refcount = old_refcount;
-        let info = fresh.info();
+        let info = fresh.model.info();
         let new_handle = self.asset_cache.insert(fresh);
         Ok(Some(ReloadResult { old_handle, new_handle, info }))
     }
@@ -176,23 +176,23 @@ impl ArvxSceneManager {
 
         // Last reference — free the pool ranges and drop the cache slot.
         let entry = self.asset_cache.remove(handle).expect("just looked up");
-        self.octree.deallocate(entry.spatial_handle);
-        self.leaf_attr_pool.deallocate_range(entry.leaf_attr_slot_start, entry.leaf_attr_slot_count);
+        self.octree.deallocate(entry.model.spatial_handle);
+        self.leaf_attr_pool.deallocate_range(entry.model.leaf_attr_slot_start, entry.model.leaf_attr_slot_count);
         // Free any sculpt-allocated slots outside the bake range so
         // they don't leak. The HashSet guarantees no double-frees
         // even if a slot was freed-then-realloc'd during the
         // session (sculpt's free path removes the entry).
-        for &slot in &entry.sculpt_extra_slots {
+        for &slot in &entry.model.sculpt_extra_slots {
             self.leaf_attr_pool.deallocate_range(slot, 1);
         }
         // Same for halo-extra slots (Phase 4.2b cross-tile halo
         // refresh): empty→solid transitions on a neighbour tile may
         // have allocated new halo slots outside this asset's bake
         // range. Free them here.
-        for &slot in &entry.halo_extra_slots {
+        for &slot in &entry.model.halo_extra_slots {
             self.leaf_attr_pool.deallocate_range(slot, 1);
         }
-        for id in entry.brick_start..(entry.brick_start + entry.brick_count) {
+        for id in entry.model.brick_start..(entry.model.brick_start + entry.model.brick_count) {
             self.brick_pool.deallocate(id);
         }
     }
@@ -1042,39 +1042,43 @@ impl ArvxSceneManager {
         AssetEntry {
             path,
             refcount: 1,
-            spatial_handle: handle,
-            voxel_size,
-            aabb,
-            voxel_count: actual_cell_count,
-            leaf_attr_slot_start,
-            leaf_attr_slot_count: final_leaf_attr_slot_count,
-            brick_start: scene_brick_offset,
-            brick_count: file_brick_count,
-            skinning,
-            mesh_vertices,
-            mesh_indices,
-            mesh_indices_free_list: Vec::new(),
-            mesh_indices_next_free,
-            mesh_indices_dirty,
-            mesh_vertices_dirty,
-            mesh_lod0_index_count,
-            bake_time_cluster_count: meshlet_clusters.len() as u32,
-            meshlet_clusters,
-            dag_groups,
-            dag_consumed,
-            dag_produced,
-            cpu_octree: tree,
-            mesh_dirty: true,
-            clusters_dirty: true,
-            cluster_spatial_index,
-            sculpt_extra_slots: std::collections::HashSet::new(),
-            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
-            halo_extra_slots: std::collections::HashSet::new(),
-            // Disk-loaded non-terrain assets have no halo by
-            // construction; the slice stays empty. Terrain tiles populate
-            // this through `integrate_baked_tile`.
-            halo_cells: Vec::new(),
-            distinct_materials: Some(distinct_materials),
+            model: VoxelModel {
+                spatial_handle: handle,
+                voxel_size,
+                aabb,
+                voxel_count: actual_cell_count,
+                leaf_attr_slot_start,
+                leaf_attr_slot_count: final_leaf_attr_slot_count,
+                brick_start: scene_brick_offset,
+                brick_count: file_brick_count,
+                skinning,
+                cpu_octree: tree,
+                sculpt_extra_slots: std::collections::HashSet::new(),
+                sculpt_owned_slots: rustc_hash::FxHashSet::default(),
+                halo_extra_slots: std::collections::HashSet::new(),
+                // Disk-loaded non-terrain assets have no halo by
+                // construction; the slice stays empty. Terrain tiles
+                // populate this through `integrate_baked_tile`.
+                halo_cells: Vec::new(),
+                distinct_materials: Some(distinct_materials),
+            },
+            view: MeshView {
+                mesh_vertices,
+                mesh_indices,
+                mesh_indices_free_list: Vec::new(),
+                mesh_indices_next_free,
+                mesh_indices_dirty,
+                mesh_vertices_dirty,
+                mesh_lod0_index_count,
+                bake_time_cluster_count: meshlet_clusters.len() as u32,
+                meshlet_clusters,
+                dag_groups,
+                dag_consumed,
+                dag_produced,
+                mesh_dirty: true,
+                clusters_dirty: true,
+                cluster_spatial_index,
+            },
         }
     }
 
@@ -1106,7 +1110,7 @@ impl ArvxSceneManager {
         loaded: LoadedAsset,
     ) -> (AssetHandle, AssetInfo) {
         let entry = self.splice_loaded_asset(loaded);
-        let info = entry.info();
+        let info = entry.model.info();
         let handle = self.asset_cache.insert(entry);
         (handle, info)
     }
@@ -1134,7 +1138,7 @@ impl ArvxSceneManager {
     /// Peek at an asset's skinning metadata. Returns `None` when the
     /// asset was imported without bone weights.
     pub fn skinning_data(&self, handle: AssetHandle) -> Option<&SkinningAssetData> {
-        self.asset_cache.get(handle)?.skinning.as_ref()
+        self.asset_cache.get(handle)?.model.skinning.as_ref()
     }
 
     /// Does any of this asset's materials render as glass, answered from
@@ -1155,7 +1159,7 @@ impl ArvxSceneManager {
         handle: AssetHandle,
         material_is_glass: &[bool],
     ) -> Option<bool> {
-        let mats = self.asset_cache.get(handle)?.distinct_materials.as_ref()?;
+        let mats = self.asset_cache.get(handle)?.model.distinct_materials.as_ref()?;
         Some(mats.iter().any(|&id| {
             let id = id as usize;
             id < material_is_glass.len() && material_is_glass[id]
@@ -1173,9 +1177,9 @@ impl ArvxSceneManager {
     ) -> Option<(&[crate::mesh_pass::MeshVertex], &[u32], u32)> {
         let entry = self.asset_cache.get(handle)?;
         Some((
-            entry.mesh_vertices.as_slice(),
-            entry.mesh_indices.as_slice(),
-            entry.mesh_lod0_index_count,
+            entry.view.mesh_vertices.as_slice(),
+            entry.view.mesh_indices.as_slice(),
+            entry.view.mesh_lod0_index_count,
         ))
     }
 
@@ -1213,16 +1217,16 @@ impl ArvxSceneManager {
             .enumerate()
             .filter_map(|(idx, slot)| {
                 let entry = slot.as_ref()?;
-                if !entry.mesh_dirty {
+                if !entry.view.mesh_dirty {
                     return None;
                 }
                 Some((
                     AssetHandle::from_raw(idx as u32),
-                    entry.mesh_vertices.as_slice(),
-                    entry.mesh_indices.as_slice(),
-                    &entry.mesh_vertices_dirty,
-                    &entry.mesh_indices_dirty,
-                    entry.mesh_lod0_index_count,
+                    entry.view.mesh_vertices.as_slice(),
+                    entry.view.mesh_indices.as_slice(),
+                    &entry.view.mesh_vertices_dirty,
+                    &entry.view.mesh_indices_dirty,
+                    entry.view.mesh_lod0_index_count,
                 ))
             })
     }
@@ -1244,12 +1248,12 @@ impl ArvxSceneManager {
             .enumerate()
             .filter_map(|(idx, slot)| {
                 let entry = slot.as_ref()?;
-                if !entry.clusters_dirty {
+                if !entry.view.clusters_dirty {
                     return None;
                 }
                 Some((
                     AssetHandle::from_raw(idx as u32),
-                    entry.meshlet_clusters.as_slice(),
+                    entry.view.meshlet_clusters.as_slice(),
                 ))
             })
     }
@@ -1263,13 +1267,13 @@ impl ArvxSceneManager {
     pub fn mark_loaded_asset_uploads_clean(&mut self) {
         for slot in self.asset_cache.entries.iter_mut() {
             if let Some(entry) = slot.as_mut() {
-                entry.mesh_dirty = false;
-                entry.clusters_dirty = false;
+                entry.view.mesh_dirty = false;
+                entry.view.clusters_dirty = false;
                 // Slab-allocator dirty ranges live in lockstep with
                 // `mesh_dirty` — they were just consumed by
                 // `upload_mesh_for_asset` to drive partial IBO writes.
-                entry.mesh_indices_dirty.clear();
-                entry.mesh_vertices_dirty.clear();
+                entry.view.mesh_indices_dirty.clear();
+                entry.view.mesh_vertices_dirty.clear();
             }
         }
     }
@@ -1396,10 +1400,10 @@ mod load_roundtrip_tests {
         // Spliced octree (nodes + prefilter internal_attr) identical.
         let e1 = sm_sync.asset_cache.get(h_sync).unwrap();
         let e2 = sm_async.asset_cache.get(h_async).unwrap();
-        assert_eq!(e1.cpu_octree.as_slice(), e2.cpu_octree.as_slice());
+        assert_eq!(e1.model.cpu_octree.as_slice(), e2.model.cpu_octree.as_slice());
         assert_eq!(
-            e1.cpu_octree.internal_attr_slice(),
-            e2.cpu_octree.internal_attr_slice()
+            e1.model.cpu_octree.internal_attr_slice(),
+            e2.model.cpu_octree.internal_attr_slice()
         );
     }
 
@@ -1437,7 +1441,7 @@ mod load_roundtrip_tests {
         let entry = sm.asset_cache.get(h2).unwrap();
 
         // Prefilter internal_attr ids: NONE-sentinel or in [start, end).
-        for &a in entry.cpu_octree.internal_attr_slice() {
+        for &a in entry.model.cpu_octree.internal_attr_slice() {
             if a != arvx_core::sparse_octree::INTERNAL_ATTR_NONE {
                 assert!(
                     a >= start && a < end,
@@ -1447,7 +1451,7 @@ mod load_roundtrip_tests {
         }
 
         // Brick cells: sentinels untouched, real slots shifted >= start.
-        let (brick_start, brick_count) = (entry.brick_start, entry.brick_count);
+        let (brick_start, brick_count) = (entry.model.brick_start, entry.model.brick_count);
         for bid in brick_start..(brick_start + brick_count) {
             for &cell in sm.brick_pool.brick_cells(bid) {
                 if cell != arvx_core::brick_pool::BRICK_EMPTY
@@ -1527,6 +1531,7 @@ mod load_roundtrip_tests {
             .asset_cache
             .get(handle)
             .unwrap()
+            .model
             .distinct_materials
             .clone()
             .expect("load path computes the distinct set");

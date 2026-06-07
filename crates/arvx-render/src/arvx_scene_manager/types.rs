@@ -79,12 +79,36 @@ pub struct SkinningAssetData {
     pub rest_bone_aabbs: Vec<[f32; 6]>,
 }
 
-/// One entry in the asset cache: the shared geometry allocations plus
-/// a refcount. When `refcount` hits zero, `release_asset` frees the
-/// octree / leaf_attr / brick ranges.
+/// One entry in the asset cache: the [`VoxelModel`] source-of-truth, its
+/// derived [`MeshView`], plus a refcount. When `refcount` hits zero,
+/// `release_asset` frees the octree / leaf_attr / brick ranges.
+///
+/// The split is the boundary between voxel ops and meshing
+/// ([`VoxelModel`] = truth, [`MeshView`] = disposable derived view): the
+/// re-extract paths read `&model` and rebuild `&mut view`, the shape the
+/// future `Mesher::remesh(&VoxelModel, &[RemeshRegion], &mut MeshView)`
+/// consumes. `path` / `refcount` are cache bookkeeping — neither truth
+/// nor derived mesh.
 pub(super) struct AssetEntry {
     pub(super) path: PathBuf,
     pub(super) refcount: u32,
+    /// Voxel source-of-truth: octree, pool allocations, halo, material
+    /// set. The only half a voxel edit mutates; never names a triangle.
+    pub(super) model: VoxelModel,
+    /// Derived surface-mesh view: vertices, indices + slab allocator,
+    /// meshlet clusters, DAG, dirty trackers, spatial index. Rebuilt
+    /// from [`VoxelModel`] by the re-extract paths; never edited by
+    /// voxel code.
+    pub(super) view: MeshView,
+}
+
+/// The voxel source-of-truth for one cached asset: the CPU octree
+/// mirror, its leaf_attr / brick pool allocations, the terrain halo, and
+/// the material set. The only state a voxel edit (sculpt / halo refresh)
+/// mutates directly; the mesher reads it shared (`&VoxelModel`) and never
+/// writes it. Carries no triangle, index, or cluster — those are derived
+/// into the companion [`MeshView`].
+pub(super) struct VoxelModel {
     pub(super) spatial_handle: OctreeHandle,
     pub(super) voxel_size: f32,
     pub(super) aabb: arvx_core::Aabb,
@@ -97,6 +121,98 @@ pub(super) struct AssetEntry {
     /// section. Phase-3 scatter pass reads this to drive the per-frame
     /// bone-field write.
     pub(super) skinning: Option<SkinningAssetData>,
+    /// CPU-side mirror of the asset's octree, retained after upload so
+    /// runtime sculpt can mutate it without round-tripping the GPU. Same
+    /// node buffer the load path built and uploaded; not memory-cheap on
+    /// big assets (~4 B per node + parallel prefilter index), but mesh-
+    /// mode sculpt edits can't reconstruct it from the cluster DAG.
+    pub(super) cpu_octree: SparseOctree,
+    /// Leaf-attr slots allocated for this asset by sculpt **after**
+    /// integration — i.e., not part of the contiguous bump range at
+    /// `[leaf_attr_slot_start, leaf_attr_slot_start + leaf_attr_slot_count)`.
+    ///
+    /// Sculpt's Add edits (Raise / Inflate / Deflate cavity walls /
+    /// material-replace) request fresh slots via the pool's general
+    /// `allocate()`, which can land anywhere in the global pool. The
+    /// asset's static range can't grow, so we track these here. Two
+    /// consumers care:
+    ///
+    /// 1. `apply_paint_sphere`'s slot validation — paint after sculpt
+    ///    on a tile (or any asset) was silently dropping every hit
+    ///    whose `leaf_slot` was outside the base range. Phase 4
+    ///    flushed this out on terrain ("paint stops working after
+    ///    sculpt") but the underlying bug pre-dates terrain.
+    /// 2. `release_asset` — bake-range slots get freed by
+    ///    `deallocate_range(slot_start, slot_count)`; these need
+    ///    individual `deallocate_range(slot, 1)` calls.
+    ///
+    /// Stored as a `HashSet<u32>` so freed-then-reallocated slots
+    /// don't accumulate duplicates that would double-free on release.
+    pub(super) sculpt_extra_slots: std::collections::HashSet<u32>,
+    /// Every leaf-attr slot the sculpt brush has allocated for this
+    /// asset (superset of `sculpt_extra_slots` — includes both
+    /// out-of-bake-range AND reused in-bake-range slots). Used by
+    /// `build_cube_vertex`'s sculpt-bias tie-break: when an SN cube
+    /// has corner cells from both sculpt and pre-existing surface,
+    /// the per-vertex `leaf_attr_id` (which drives material + color)
+    /// prefers the sculpt slot. Without this bias the lowest-coord
+    /// corner wins purely by position, so sculpt cells sometimes
+    /// inherit a procedural neighbour's material and the brush
+    /// material disappears in a position-dependent pattern.
+    ///
+    /// Populated on every sculpt-allocated slot in `apply_delta`'s
+    /// post-write loop; entries removed when slots are freed (so the
+    /// set tracks only currently-live sculpt cells). Empty for
+    /// assets that have never been sculpted — those paths see the
+    /// original `coord_less`-only behaviour.
+    pub(super) sculpt_owned_slots: rustc_hash::FxHashSet<u32>,
+    /// Phase 4.2b: leaf-attr slots allocated specifically for new
+    /// halo cells discovered during cross-tile halo refresh. The
+    /// bake-time halo's slots live inside the asset's contiguous
+    /// `[slot_start, +slot_count)` range; cells that flipped
+    /// empty→solid on the neighbour AFTER bake need fresh slots
+    /// allocated from the pool's general `allocate()`, which can
+    /// land anywhere. Tracked here so `release_asset` frees them
+    /// individually (the contiguous deallocate only covers the
+    /// bake range). HashSet because the same slot can be freed and
+    /// re-allocated within a session.
+    pub(super) halo_extra_slots: std::collections::HashSet<u32>,
+    /// Terrain Phase 4: per-cell halo data carried from the original
+    /// bake.
+    ///
+    /// Each entry maps an octree-frame coord OUTSIDE the nominal
+    /// `[0, S)³` cube to a `leaf_attr_id` (or [`CELL_INTERIOR`] for
+    /// halo cells classified bulk-solid). For terrain tiles this is
+    /// populated by `integrate_baked_tile` (the slot ids are scene-
+    /// pool-relocated to match the asset's leaf-attr range). For
+    /// disk-loaded non-terrain assets the vec is empty — they have
+    /// no halo by construction.
+    ///
+    /// **Used by sculpt:** the per-cluster re-extract folds these
+    /// cells into the local cell grid so SN-cubes at a tile boundary
+    /// see valid 8-corner classification. Without this, sculpting a
+    /// boundary cluster regresses its seam quads — the original bake
+    /// had halo data, the re-extract didn't, the new cluster's
+    /// boundary cubes diverge from the neighbour's.
+    pub(super) halo_cells: Vec<(glam::IVec3, u32)>,
+    /// The complete deduped set of project `material_primary` IDs across
+    /// this asset's leaves + prefilter attrs, when known — the runtime
+    /// material authority (same IDs the per-leaf `LeafAttr` carries). Lets
+    /// the engine answer `has_glass` in O(distinct) without a leaf walk.
+    ///
+    /// `None` means "not computed for this integration path" — the engine
+    /// falls back to the per-leaf walk (correct, just not the fast path).
+    /// Only the off-thread `.arvx` load populates `Some`; terrain-tile and
+    /// halo-refresh entries leave it `None` and walk.
+    pub(super) distinct_materials: Option<Vec<u16>>,
+}
+
+/// The derived surface-mesh view for one cached asset: the vertex / index
+/// buffers, their slab allocator + byte-range dirty trackers, the meshlet
+/// cluster DAG, and the cluster spatial index. Rebuilt from the companion
+/// [`VoxelModel`] by the re-extract paths and uploaded to the GPU; it is
+/// disposable derived state, never the source of truth.
+pub(super) struct MeshView {
     /// Surface-mesh vertices from naive surface-nets extraction.
     /// Object-local positions on grid corners; carries oct-packed
     /// normal + `leaf_attr_id`. Sized proportional to surface area,
@@ -194,12 +310,6 @@ pub(super) struct AssetEntry {
     pub(super) dag_consumed: Vec<u32>,
     /// Flat per-group produced cluster IDs.
     pub(super) dag_produced: Vec<u32>,
-    /// CPU-side mirror of the asset's octree, retained after upload so
-    /// runtime sculpt can mutate it without round-tripping the GPU. Same
-    /// node buffer the load path built and uploaded; not memory-cheap on
-    /// big assets (~4 B per node + parallel prefilter index), but mesh-
-    /// mode sculpt edits can't reconstruct it from the cluster DAG.
-    pub(super) cpu_octree: SparseOctree,
     /// Per-asset "needs GPU re-upload" flags. The render thread checks
     /// these on every geometry-epoch bump and skips assets whose data
     /// hasn't changed — cuts the ~25-asset × ~175 MB re-upload cost
@@ -218,87 +328,9 @@ pub(super) struct AssetEntry {
     /// mesh re-extract + incrementally updated on patch-cluster
     /// append. See `cluster_spatial_index.rs`.
     pub(super) cluster_spatial_index: super::cluster_spatial_index::ClusterSpatialIndex,
-    /// Leaf-attr slots allocated for this asset by sculpt **after**
-    /// integration — i.e., not part of the contiguous bump range at
-    /// `[leaf_attr_slot_start, leaf_attr_slot_start + leaf_attr_slot_count)`.
-    ///
-    /// Sculpt's Add edits (Raise / Inflate / Deflate cavity walls /
-    /// material-replace) request fresh slots via the pool's general
-    /// `allocate()`, which can land anywhere in the global pool. The
-    /// asset's static range can't grow, so we track these here. Two
-    /// consumers care:
-    ///
-    /// 1. `apply_paint_sphere`'s slot validation — paint after sculpt
-    ///    on a tile (or any asset) was silently dropping every hit
-    ///    whose `leaf_slot` was outside the base range. Phase 4
-    ///    flushed this out on terrain ("paint stops working after
-    ///    sculpt") but the underlying bug pre-dates terrain.
-    /// 2. `release_asset` — bake-range slots get freed by
-    ///    `deallocate_range(slot_start, slot_count)`; these need
-    ///    individual `deallocate_range(slot, 1)` calls.
-    ///
-    /// Stored as a `HashSet<u32>` so freed-then-reallocated slots
-    /// don't accumulate duplicates that would double-free on release.
-    pub(super) sculpt_extra_slots: std::collections::HashSet<u32>,
-    /// Every leaf-attr slot the sculpt brush has allocated for this
-    /// asset (superset of `sculpt_extra_slots` — includes both
-    /// out-of-bake-range AND reused in-bake-range slots). Used by
-    /// `build_cube_vertex`'s sculpt-bias tie-break: when an SN cube
-    /// has corner cells from both sculpt and pre-existing surface,
-    /// the per-vertex `leaf_attr_id` (which drives material + color)
-    /// prefers the sculpt slot. Without this bias the lowest-coord
-    /// corner wins purely by position, so sculpt cells sometimes
-    /// inherit a procedural neighbour's material and the brush
-    /// material disappears in a position-dependent pattern.
-    ///
-    /// Populated on every sculpt-allocated slot in `apply_delta`'s
-    /// post-write loop; entries removed when slots are freed (so the
-    /// set tracks only currently-live sculpt cells). Empty for
-    /// assets that have never been sculpted — those paths see the
-    /// original `coord_less`-only behaviour.
-    pub(super) sculpt_owned_slots: rustc_hash::FxHashSet<u32>,
-    /// Phase 4.2b: leaf-attr slots allocated specifically for new
-    /// halo cells discovered during cross-tile halo refresh. The
-    /// bake-time halo's slots live inside the asset's contiguous
-    /// `[slot_start, +slot_count)` range; cells that flipped
-    /// empty→solid on the neighbour AFTER bake need fresh slots
-    /// allocated from the pool's general `allocate()`, which can
-    /// land anywhere. Tracked here so `release_asset` frees them
-    /// individually (the contiguous deallocate only covers the
-    /// bake range). HashSet because the same slot can be freed and
-    /// re-allocated within a session.
-    pub(super) halo_extra_slots: std::collections::HashSet<u32>,
-    /// Terrain Phase 4: per-cell halo data carried from the original
-    /// bake.
-    ///
-    /// Each entry maps an octree-frame coord OUTSIDE the nominal
-    /// `[0, S)³` cube to a `leaf_attr_id` (or [`CELL_INTERIOR`] for
-    /// halo cells classified bulk-solid). For terrain tiles this is
-    /// populated by `integrate_baked_tile` (the slot ids are scene-
-    /// pool-relocated to match the asset's leaf-attr range). For
-    /// disk-loaded non-terrain assets the vec is empty — they have
-    /// no halo by construction.
-    ///
-    /// **Used by sculpt:** the per-cluster re-extract folds these
-    /// cells into the local cell grid so SN-cubes at a tile boundary
-    /// see valid 8-corner classification. Without this, sculpting a
-    /// boundary cluster regresses its seam quads — the original bake
-    /// had halo data, the re-extract didn't, the new cluster's
-    /// boundary cubes diverge from the neighbour's.
-    pub(super) halo_cells: Vec<(glam::IVec3, u32)>,
-    /// The complete deduped set of project `material_primary` IDs across
-    /// this asset's leaves + prefilter attrs, when known — the runtime
-    /// material authority (same IDs the per-leaf `LeafAttr` carries). Lets
-    /// the engine answer `has_glass` in O(distinct) without a leaf walk.
-    ///
-    /// `None` means "not computed for this integration path" — the engine
-    /// falls back to the per-leaf walk (correct, just not the fast path).
-    /// Only the off-thread `.arvx` load populates `Some`; terrain-tile and
-    /// halo-refresh entries leave it `None` and walk.
-    pub(super) distinct_materials: Option<Vec<u16>>,
 }
 
-impl AssetEntry {
+impl MeshView {
     /// Reset the slab allocator state to "everything beyond
     /// `mesh_indices.len()` is unallocated, the whole prefix is in use
     /// by callers". Use after a full mesh rebuild — the new
@@ -452,18 +484,6 @@ impl AssetEntry {
             .mark(offset * MESH_INDEX_STRIDE, (src.len() as u32) * MESH_INDEX_STRIDE);
     }
 
-    /// Object-local grid origin used by the spatial index and brush
-    /// math. Derived from `(aabb_center - extent/2)` — same formula
-    /// every caller uses (asset_load, sculpt, `info`); centralised here
-    /// so compaction can rebuild the spatial index without callers
-    /// having to thread the value through.
-    pub(super) fn grid_origin(&self) -> glam::Vec3 {
-        let extent = (1u32 << self.spatial_handle.depth) as f32
-            * self.spatial_handle.base_voxel_size;
-        let aabb_center = (self.aabb.min + self.aabb.max) * 0.5;
-        aabb_center - glam::Vec3::splat(extent * 0.5)
-    }
-
     /// Heuristic: does `mesh_indices` carry enough free-list fragments
     /// to make a `compact_mesh_indices` pass worth its O(N) cost?
     /// Returns true when free-list bytes exceed 30 % of the in-use
@@ -577,9 +597,11 @@ impl AssetEntry {
     ///
     /// When at least one patch was removed, the cluster IDs that
     /// `cluster_spatial_index` records under the moved entries are
-    /// now stale — full rebuild from the compacted table. Returns the
-    /// number of patches dropped.
-    pub(super) fn compact_empty_patches(&mut self) -> u32 {
+    /// now stale — full rebuild from the compacted table. The caller
+    /// supplies `grid_origin` / `base_vs` (from the companion
+    /// [`VoxelModel`]) since the view no longer holds the model.
+    /// Returns the number of patches dropped.
+    pub(super) fn compact_empty_patches(&mut self, grid_origin: glam::Vec3, base_vs: f32) -> u32 {
         let bake = self.bake_time_cluster_count as usize;
         if self.meshlet_clusters.len() <= bake {
             return 0;
@@ -597,12 +619,24 @@ impl AssetEntry {
             }
         }
         if removed > 0 {
-            let grid_origin = self.grid_origin();
-            let base_vs = self.spatial_handle.base_voxel_size;
             self.cluster_spatial_index
                 .rebuild(&self.meshlet_clusters, grid_origin, base_vs);
         }
         removed
+    }
+}
+
+impl VoxelModel {
+    /// Object-local grid origin used by the spatial index and brush
+    /// math. Derived from `(aabb_center - extent/2)` — same formula
+    /// every caller uses (asset_load, sculpt, `info`); centralised here
+    /// so compaction can rebuild the spatial index without callers
+    /// having to thread the value through.
+    pub(super) fn grid_origin(&self) -> glam::Vec3 {
+        let extent = (1u32 << self.spatial_handle.depth) as f32
+            * self.spatial_handle.base_voxel_size;
+        let aabb_center = (self.aabb.min + self.aabb.max) * 0.5;
+        aabb_center - glam::Vec3::splat(extent * 0.5)
     }
 
     pub(super) fn info(&self) -> AssetInfo {
@@ -822,45 +856,49 @@ mod slab_tests {
         AssetEntry {
             path: std::path::PathBuf::from("test:slab"),
             refcount: 1,
-            spatial_handle: OctreeHandle {
-                root_offset: 0,
-                len: 0,
-                depth: 8,
-                base_voxel_size: 1.0,
+            model: VoxelModel {
+                spatial_handle: OctreeHandle {
+                    root_offset: 0,
+                    len: 0,
+                    depth: 8,
+                    base_voxel_size: 1.0,
+                },
+                voxel_size: 1.0,
+                aabb: Aabb {
+                    min: glam::Vec3::ZERO,
+                    max: glam::Vec3::splat(256.0),
+                },
+                voxel_count: 0,
+                leaf_attr_slot_start: 0,
+                leaf_attr_slot_count: 0,
+                brick_start: 0,
+                brick_count: 0,
+                skinning: None,
+                cpu_octree: SparseOctree::new(8, 1.0),
+                sculpt_extra_slots: std::collections::HashSet::new(),
+                sculpt_owned_slots: rustc_hash::FxHashSet::default(),
+                halo_extra_slots: std::collections::HashSet::new(),
+                halo_cells: Vec::new(),
+                distinct_materials: None,
             },
-            voxel_size: 1.0,
-            aabb: Aabb {
-                min: glam::Vec3::ZERO,
-                max: glam::Vec3::splat(256.0),
+            view: MeshView {
+                mesh_vertices: Vec::new(),
+                mesh_indices: initial.to_vec(),
+                mesh_indices_free_list: Vec::new(),
+                mesh_indices_next_free: initial.len() as u32,
+                mesh_indices_dirty: DirtyRanges::new(),
+                mesh_vertices_dirty: DirtyRanges::new(),
+                mesh_lod0_index_count: 0,
+                bake_time_cluster_count: 0,
+                meshlet_clusters: Vec::new(),
+                dag_groups: Vec::new(),
+                dag_consumed: Vec::new(),
+                dag_produced: Vec::new(),
+                mesh_dirty: false,
+                clusters_dirty: false,
+                cluster_spatial_index:
+                    crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
             },
-            voxel_count: 0,
-            leaf_attr_slot_start: 0,
-            leaf_attr_slot_count: 0,
-            brick_start: 0,
-            brick_count: 0,
-            skinning: None,
-            mesh_vertices: Vec::new(),
-            mesh_indices: initial.to_vec(),
-            mesh_indices_free_list: Vec::new(),
-            mesh_indices_next_free: initial.len() as u32,
-            mesh_indices_dirty: DirtyRanges::new(),
-            mesh_vertices_dirty: DirtyRanges::new(),
-            mesh_lod0_index_count: 0,
-            bake_time_cluster_count: 0,
-            meshlet_clusters: Vec::new(),
-            dag_groups: Vec::new(),
-            dag_consumed: Vec::new(),
-            dag_produced: Vec::new(),
-            cpu_octree: SparseOctree::new(8, 1.0),
-            mesh_dirty: false,
-            clusters_dirty: false,
-            cluster_spatial_index:
-                crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
-            sculpt_extra_slots: std::collections::HashSet::new(),
-            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
-            halo_extra_slots: std::collections::HashSet::new(),
-            halo_cells: Vec::new(),
-            distinct_materials: None,
         }
     }
 
@@ -872,24 +910,24 @@ mod slab_tests {
     fn mesh_indices_slab_filter_reuses_slot() {
         // Imagine one cluster occupying [0..9): 3 tris.
         let mut entry = entry_with_indices(&[10, 11, 12, 20, 21, 22, 30, 31, 32]);
-        let before_len = entry.mesh_indices.len();
+        let before_len = entry.view.mesh_indices.len();
         // The filter drops the middle tri; kept is [10,11,12,30,31,32].
         let kept: [u32; 6] = [10, 11, 12, 30, 31, 32];
-        entry.mesh_indices_write_at(0, &kept);
-        entry.free_index_range(6, 3);
+        entry.view.mesh_indices_write_at(0, &kept);
+        entry.view.free_index_range(6, 3);
 
         assert_eq!(
-            entry.mesh_indices.len(),
+            entry.view.mesh_indices.len(),
             before_len,
             "filter must not grow the slab — kept tris fit in the existing slot",
         );
-        assert_eq!(&entry.mesh_indices[..6], &kept);
-        assert_eq!(entry.mesh_indices_free_list, vec![]);
+        assert_eq!(&entry.view.mesh_indices[..6], &kept);
+        assert_eq!(entry.view.mesh_indices_free_list, vec![]);
         assert_eq!(
-            entry.mesh_indices_next_free, 6,
+            entry.view.mesh_indices_next_free, 6,
             "freed tail abuts next_free → pulled back, no interior fragment",
         );
-        let dirty: Vec<_> = entry.mesh_indices_dirty.iter().collect();
+        let dirty: Vec<_> = entry.view.mesh_indices_dirty.iter().collect();
         assert_eq!(
             dirty,
             vec![(0, 24)],
@@ -905,32 +943,32 @@ mod slab_tests {
     fn mesh_indices_slab_patch_reuses_freed_slot() {
         // Empty asset, no baked indices. First patch grows the slab.
         let mut entry = entry_with_indices(&[]);
-        let first_offset = entry.alloc_index_range(6);
-        entry.mesh_indices_write_at(first_offset, &[100, 101, 102, 103, 104, 105]);
+        let first_offset = entry.view.alloc_index_range(6);
+        entry.view.mesh_indices_write_at(first_offset, &[100, 101, 102, 103, 104, 105]);
         assert_eq!(first_offset, 0);
-        let after_first_len = entry.mesh_indices.len();
+        let after_first_len = entry.view.mesh_indices.len();
         assert!(after_first_len >= 6);
 
         // Free the first patch (simulating cluster-table compaction or
         // a re-stamp that overwrites the prior patch's region).
-        entry.free_index_range(first_offset, 6);
+        entry.view.free_index_range(first_offset, 6);
         // Free range abuts next_free → next_free pulls back to 0.
-        assert_eq!(entry.mesh_indices_next_free, 0);
-        assert_eq!(entry.mesh_indices_free_list, vec![]);
+        assert_eq!(entry.view.mesh_indices_next_free, 0);
+        assert_eq!(entry.view.mesh_indices_free_list, vec![]);
 
         // Second same-size patch must reuse the slot, no growth.
-        let second_offset = entry.alloc_index_range(6);
+        let second_offset = entry.view.alloc_index_range(6);
         assert_eq!(
             second_offset, first_offset,
             "second patch reuses the first's offset",
         );
-        entry.mesh_indices_write_at(second_offset, &[200, 201, 202, 203, 204, 205]);
+        entry.view.mesh_indices_write_at(second_offset, &[200, 201, 202, 203, 204, 205]);
         assert_eq!(
-            entry.mesh_indices.len(),
+            entry.view.mesh_indices.len(),
             after_first_len,
             "slab does not grow when a freed slot fits the new alloc",
         );
-        assert_eq!(&entry.mesh_indices[..6], &[200, 201, 202, 203, 204, 205]);
+        assert_eq!(&entry.view.mesh_indices[..6], &[200, 201, 202, 203, 204, 205]);
     }
 
     /// Mirrors the long-session worst case: 100 successive patches at
@@ -944,28 +982,28 @@ mod slab_tests {
         const STAMPS: u32 = 100;
 
         for stamp in 0..STAMPS {
-            let off = entry.alloc_index_range(PATCH_LEN);
+            let off = entry.view.alloc_index_range(PATCH_LEN);
             // Same offset every time — proves we never grow past the
             // first stamp's allocation.
             assert_eq!(off, 0, "stamp {stamp} expected offset 0");
             let payload: Vec<u32> = (0..PATCH_LEN).map(|i| stamp * 1000 + i).collect();
-            entry.mesh_indices_write_at(off, &payload);
+            entry.view.mesh_indices_write_at(off, &payload);
             // Simulate the next stamp's "filter" path freeing the prior
             // patch's range before reallocating.
-            entry.free_index_range(off, PATCH_LEN);
+            entry.view.free_index_range(off, PATCH_LEN);
         }
 
         assert!(
-            entry.mesh_indices.len() <= (PATCH_LEN * 2) as usize,
+            entry.view.mesh_indices.len() <= (PATCH_LEN * 2) as usize,
             "100 stamps must not grow the slab linearly — got len {}",
-            entry.mesh_indices.len(),
+            entry.view.mesh_indices.len(),
         );
         assert_eq!(
-            entry.mesh_indices_next_free, 0,
+            entry.view.mesh_indices_next_free, 0,
             "every stamp freed before next alloc → bump pointer at 0",
         );
         assert!(
-            entry.mesh_indices_free_list.is_empty(),
+            entry.view.mesh_indices_free_list.is_empty(),
             "tail-pullback collapses the free list",
         );
     }
@@ -980,15 +1018,15 @@ mod slab_tests {
         let mut entry = entry_with_indices(&[0; 12]);
         // Slab thinks all 12 are "in use" (entry_with_indices sets
         // next_free to len). Free B = [4..8).
-        entry.free_index_range(4, 4);
-        assert_eq!(entry.mesh_indices_free_list, vec![(4, 4)]);
-        assert_eq!(entry.mesh_indices_next_free, 12);
+        entry.view.free_index_range(4, 4);
+        assert_eq!(entry.view.mesh_indices_free_list, vec![(4, 4)]);
+        assert_eq!(entry.view.mesh_indices_next_free, 12);
 
         // Free C = [8..12). Touches next_free → pull back; then absorbs
         // the abutting (4, 4) free-list entry on the left.
-        entry.free_index_range(8, 4);
-        assert_eq!(entry.mesh_indices_free_list, vec![]);
-        assert_eq!(entry.mesh_indices_next_free, 4);
+        entry.view.free_index_range(8, 4);
+        assert_eq!(entry.view.mesh_indices_free_list, vec![]);
+        assert_eq!(entry.view.mesh_indices_next_free, 4);
     }
 
     /// Cluster fixture for compaction tests. LOD-0, given AABB + index
@@ -1028,54 +1066,66 @@ mod slab_tests {
         let mut entry = AssetEntry {
             path: std::path::PathBuf::from("test:compact"),
             refcount: 1,
-            spatial_handle: OctreeHandle {
-                root_offset: 0,
-                len: 0,
-                depth: 8,
-                base_voxel_size: 1.0,
+            model: VoxelModel {
+                spatial_handle: OctreeHandle {
+                    root_offset: 0,
+                    len: 0,
+                    depth: 8,
+                    base_voxel_size: 1.0,
+                },
+                voxel_size: 1.0,
+                aabb: Aabb {
+                    min: glam::Vec3::ZERO,
+                    max: glam::Vec3::splat(256.0),
+                },
+                voxel_count: 0,
+                leaf_attr_slot_start: 0,
+                leaf_attr_slot_count: 0,
+                brick_start: 0,
+                brick_count: 0,
+                skinning: None,
+                cpu_octree: SparseOctree::new(8, 1.0),
+                sculpt_extra_slots: std::collections::HashSet::new(),
+                sculpt_owned_slots: rustc_hash::FxHashSet::default(),
+                halo_extra_slots: std::collections::HashSet::new(),
+                halo_cells: Vec::new(),
+                distinct_materials: None,
             },
-            voxel_size: 1.0,
-            aabb: Aabb {
-                min: glam::Vec3::ZERO,
-                max: glam::Vec3::splat(256.0),
+            view: MeshView {
+                mesh_vertices: Vec::new(),
+                mesh_indices: Vec::new(),
+                mesh_indices_free_list: Vec::new(),
+                mesh_indices_next_free: 0,
+                mesh_indices_dirty: DirtyRanges::new(),
+                mesh_vertices_dirty: DirtyRanges::new(),
+                mesh_lod0_index_count: 0,
+                bake_time_cluster_count: bake,
+                meshlet_clusters: clusters,
+                dag_groups: Vec::new(),
+                dag_consumed: Vec::new(),
+                dag_produced: Vec::new(),
+                mesh_dirty: false,
+                clusters_dirty: false,
+                cluster_spatial_index:
+                    crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
             },
-            voxel_count: 0,
-            leaf_attr_slot_start: 0,
-            leaf_attr_slot_count: 0,
-            brick_start: 0,
-            brick_count: 0,
-            skinning: None,
-            mesh_vertices: Vec::new(),
-            mesh_indices: Vec::new(),
-            mesh_indices_free_list: Vec::new(),
-            mesh_indices_next_free: 0,
-            mesh_indices_dirty: DirtyRanges::new(),
-            mesh_vertices_dirty: DirtyRanges::new(),
-            mesh_lod0_index_count: 0,
-            bake_time_cluster_count: bake,
-            meshlet_clusters: clusters,
-            dag_groups: Vec::new(),
-            dag_consumed: Vec::new(),
-            dag_produced: Vec::new(),
-            cpu_octree: SparseOctree::new(8, 1.0),
-            mesh_dirty: false,
-            clusters_dirty: false,
-            cluster_spatial_index:
-                crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
-            sculpt_extra_slots: std::collections::HashSet::new(),
-            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
-            halo_extra_slots: std::collections::HashSet::new(),
-            halo_cells: Vec::new(),
-            distinct_materials: None,
         };
-        let grid_origin = entry.grid_origin();
-        let base_vs = entry.spatial_handle.base_voxel_size;
-        entry.cluster_spatial_index.rebuild(
-            &entry.meshlet_clusters,
+        let grid_origin = entry.model.grid_origin();
+        let base_vs = entry.model.spatial_handle.base_voxel_size;
+        entry.view.cluster_spatial_index.rebuild(
+            &entry.view.meshlet_clusters,
             grid_origin,
             base_vs,
         );
         entry
+    }
+
+    /// Call `MeshView::compact_empty_patches` with the `grid_origin` /
+    /// `base_vs` the companion `VoxelModel` would supply at runtime.
+    fn compact_empty(entry: &mut AssetEntry) -> u32 {
+        let grid_origin = entry.model.grid_origin();
+        let base_vs = entry.model.spatial_handle.base_voxel_size;
+        entry.view.compact_empty_patches(grid_origin, base_vs)
     }
 
     /// Empty patch clusters are removed via swap_remove; the cluster
@@ -1089,11 +1139,11 @@ mod slab_tests {
             ],
             1,
         );
-        let removed = entry.compact_empty_patches();
+        let removed = compact_empty(&mut entry);
         assert_eq!(removed, 1);
-        assert_eq!(entry.meshlet_clusters.len(), 1);
+        assert_eq!(entry.view.meshlet_clusters.len(), 1);
         // Bake-time cluster preserved at its original id.
-        assert_eq!(entry.meshlet_clusters[0].index_count, 12);
+        assert_eq!(entry.view.meshlet_clusters[0].index_count, 12);
     }
 
     /// Empty bake-time clusters MUST NOT be swap_removed — DAG
@@ -1109,10 +1159,10 @@ mod slab_tests {
             ],
             2,
         );
-        let removed = entry.compact_empty_patches();
+        let removed = compact_empty(&mut entry);
         assert_eq!(removed, 0, "originals are tombstoned, not removed");
-        assert_eq!(entry.meshlet_clusters.len(), 2);
-        assert_eq!(entry.meshlet_clusters[0].index_count, 0);
+        assert_eq!(entry.view.meshlet_clusters.len(), 2);
+        assert_eq!(entry.view.meshlet_clusters[0].index_count, 0);
     }
 
     /// Interleaved empty/non-empty patches all get compacted in one
@@ -1131,13 +1181,13 @@ mod slab_tests {
             ],
             1,
         );
-        let removed = entry.compact_empty_patches();
+        let removed = compact_empty(&mut entry);
         assert_eq!(removed, 2);
-        assert_eq!(entry.meshlet_clusters.len(), 3);
+        assert_eq!(entry.view.meshlet_clusters.len(), 3);
         // Surviving patches keep their content (we can't predict their
         // post-compaction slot because swap_remove rearranges, but both
         // their AABBs should be present in the table).
-        let aabbs: Vec<_> = entry
+        let aabbs: Vec<_> = entry.view
             .meshlet_clusters
             .iter()
             .map(|c| c.aabb_min)
@@ -1165,25 +1215,25 @@ mod slab_tests {
 
         // Sanity: pre-compaction, patch ids 1 + 2 are both in the
         // spatial index.
-        let pre = entry.cluster_spatial_index.query(
+        let pre = entry.view.cluster_spatial_index.query(
             IVec3::new(50, 50, 50),
             IVec3::new(250, 250, 250),
         );
         assert_eq!(pre, vec![1, 2]);
 
-        let removed = entry.compact_empty_patches();
+        let removed = compact_empty(&mut entry);
         assert_eq!(removed, 1);
-        assert_eq!(entry.meshlet_clusters.len(), 2);
+        assert_eq!(entry.view.meshlet_clusters.len(), 2);
 
         // The empty patch is gone. The other patch slid into slot 1
         // via swap_remove. Query its bucket — must yield the new id.
-        let post = entry.cluster_spatial_index.query(
+        let post = entry.view.cluster_spatial_index.query(
             IVec3::new(195, 195, 195),
             IVec3::new(210, 210, 210),
         );
         assert_eq!(post, vec![1]);
         // The vacated region must NOT yield a hit any more.
-        let vacated = entry.cluster_spatial_index.query(
+        let vacated = entry.view.cluster_spatial_index.query(
             IVec3::new(95, 95, 95),
             IVec3::new(110, 110, 110),
         );
@@ -1203,14 +1253,14 @@ mod slab_tests {
         for stamp in 0..200 {
             // Simulate sculpt: emit an empty patch, then compact.
             let f = stamp as f32;
-            entry
+            entry.view
                 .meshlet_clusters
                 .push(cluster([f; 3], [f + 1.0; 3], 9, 0));
-            entry.compact_empty_patches();
+            compact_empty(&mut entry);
         }
 
         assert_eq!(
-            entry.meshlet_clusters.len(),
+            entry.view.meshlet_clusters.len(),
             1,
             "table grows by patch + immediately shrinks via compaction \
              — bake-time count is the steady state",
@@ -1234,27 +1284,27 @@ mod slab_tests {
             ],
             1, // 1 bake-time, 2 patches
         );
-        entry.mesh_indices = vec![
+        entry.view.mesh_indices = vec![
             100, 101, 102,           // cluster 0
             0, 0, 0, 0, 0, 0, 0,     // free
             200, 201, 202,           // cluster 1
             0, 0, 0, 0, 0, 0, 0,     // free
             300, 301,                // cluster 2
         ];
-        entry.mesh_indices_next_free = 22;
-        entry.mesh_indices_free_list = vec![(3, 7), (13, 7)];
+        entry.view.mesh_indices_next_free = 22;
+        entry.view.mesh_indices_free_list = vec![(3, 7), (13, 7)];
 
-        let reclaimed = entry.compact_mesh_indices();
+        let reclaimed = entry.view.compact_mesh_indices();
 
         // Densely packed at 3 + 3 + 2 = 8 elements.
-        assert_eq!(entry.mesh_indices_next_free, 8);
-        assert!(entry.mesh_indices_free_list.is_empty());
+        assert_eq!(entry.view.mesh_indices_next_free, 8);
+        assert!(entry.view.mesh_indices_free_list.is_empty());
         assert_eq!(reclaimed, 14 * 4, "reclaimed = 14 freed elems * 4 B");
 
         // Cluster offsets rewritten in table order.
-        assert_eq!(entry.meshlet_clusters[0].index_offset, 0);
-        assert_eq!(entry.meshlet_clusters[1].index_offset, 3);
-        assert_eq!(entry.meshlet_clusters[2].index_offset, 6);
+        assert_eq!(entry.view.meshlet_clusters[0].index_offset, 0);
+        assert_eq!(entry.view.meshlet_clusters[1].index_offset, 3);
+        assert_eq!(entry.view.meshlet_clusters[2].index_offset, 6);
     }
 
     /// Per-cluster index content is preserved by the compaction copy.
@@ -1273,23 +1323,23 @@ mod slab_tests {
         // 32-element scratch buffer with cluster content at the
         // expected offsets; everything else is garbage that compaction
         // should drop.
-        entry.mesh_indices = vec![999; 32];
-        entry.mesh_indices[5..9].copy_from_slice(&[10, 20, 30, 40]);
-        entry.mesh_indices[20..26].copy_from_slice(&[50, 60, 70, 80, 90, 100]);
-        entry.mesh_indices_next_free = 32;
-        entry.mesh_indices_free_list = vec![(0, 5), (9, 11), (26, 6)];
+        entry.view.mesh_indices = vec![999; 32];
+        entry.view.mesh_indices[5..9].copy_from_slice(&[10, 20, 30, 40]);
+        entry.view.mesh_indices[20..26].copy_from_slice(&[50, 60, 70, 80, 90, 100]);
+        entry.view.mesh_indices_next_free = 32;
+        entry.view.mesh_indices_free_list = vec![(0, 5), (9, 11), (26, 6)];
 
-        entry.compact_mesh_indices();
+        entry.view.compact_mesh_indices();
 
-        let c0 = &entry.meshlet_clusters[0];
-        let c1 = &entry.meshlet_clusters[1];
+        let c0 = &entry.view.meshlet_clusters[0];
+        let c1 = &entry.view.meshlet_clusters[1];
         assert_eq!(
-            &entry.mesh_indices
+            &entry.view.mesh_indices
                 [c0.index_offset as usize..(c0.index_offset + c0.index_count) as usize],
             &[10, 20, 30, 40],
         );
         assert_eq!(
-            &entry.mesh_indices
+            &entry.view.mesh_indices
                 [c1.index_offset as usize..(c1.index_offset + c1.index_count) as usize],
             &[50, 60, 70, 80, 90, 100],
         );
@@ -1308,17 +1358,17 @@ mod slab_tests {
             ],
             3,
         );
-        entry.mesh_indices = vec![0; 20];
-        entry.mesh_indices[0..4].copy_from_slice(&[1, 2, 3, 4]);
-        entry.mesh_indices[10..13].copy_from_slice(&[5, 6, 7]);
-        entry.mesh_indices_next_free = 20;
-        entry.mesh_indices_free_list = vec![(4, 6), (13, 7)];
+        entry.view.mesh_indices = vec![0; 20];
+        entry.view.mesh_indices[0..4].copy_from_slice(&[1, 2, 3, 4]);
+        entry.view.mesh_indices[10..13].copy_from_slice(&[5, 6, 7]);
+        entry.view.mesh_indices_next_free = 20;
+        entry.view.mesh_indices_free_list = vec![(4, 6), (13, 7)];
 
-        entry.compact_mesh_indices();
+        entry.view.compact_mesh_indices();
 
-        let final_len = entry.mesh_indices_next_free;
+        let final_len = entry.view.mesh_indices_next_free;
         // Every offset must satisfy `offset + count <= next_free`.
-        for c in &entry.meshlet_clusters {
+        for c in &entry.view.meshlet_clusters {
             assert!(
                 c.index_offset + c.index_count <= final_len,
                 "tombstone or live cluster offset {} + count {} exceeded next_free {}",
@@ -1328,15 +1378,15 @@ mod slab_tests {
             );
         }
         // Live clusters survived with their content intact.
-        let live0 = &entry.meshlet_clusters[0];
-        let live2 = &entry.meshlet_clusters[2];
+        let live0 = &entry.view.meshlet_clusters[0];
+        let live2 = &entry.view.meshlet_clusters[2];
         assert_eq!(
-            &entry.mesh_indices
+            &entry.view.mesh_indices
                 [live0.index_offset as usize..(live0.index_offset + 4) as usize],
             &[1, 2, 3, 4],
         );
         assert_eq!(
-            &entry.mesh_indices
+            &entry.view.mesh_indices
                 [live2.index_offset as usize..(live2.index_offset + 3) as usize],
             &[5, 6, 7],
         );
@@ -1351,19 +1401,19 @@ mod slab_tests {
             vec![cluster([0.0; 3], [1.0; 3], 0, 3)],
             1,
         );
-        entry.mesh_indices = vec![100, 101, 102, 0, 0, 0, 0];
-        entry.mesh_indices_next_free = 7;
-        entry.mesh_indices_free_list = vec![(3, 4)];
+        entry.view.mesh_indices = vec![100, 101, 102, 0, 0, 0, 0];
+        entry.view.mesh_indices_next_free = 7;
+        entry.view.mesh_indices_free_list = vec![(3, 4)];
         // Leave a residual per-stamp dirty entry that compaction must
         // clear (it's stale relative to the new dense layout).
-        entry.mesh_indices_dirty.mark(0, 12);
+        entry.view.mesh_indices_dirty.mark(0, 12);
 
-        entry.compact_mesh_indices();
+        entry.view.compact_mesh_indices();
 
         // Exactly one entry, covering the new dense buffer.
-        let ranges: Vec<_> = entry.mesh_indices_dirty.iter().collect();
+        let ranges: Vec<_> = entry.view.mesh_indices_dirty.iter().collect();
         assert_eq!(ranges, vec![(0, 3 * MESH_INDEX_STRIDE)]);
-        assert!(entry.mesh_indices_dirty.is_full_pool(3 * MESH_INDEX_STRIDE));
+        assert!(entry.view.mesh_indices_dirty.is_full_pool(3 * MESH_INDEX_STRIDE));
     }
 
     /// Threshold gating: small buffers don't trigger compaction even
@@ -1378,30 +1428,30 @@ mod slab_tests {
 
         // Small buffer, fully free → still below threshold (size floor
         // is 64k elems).
-        entry.mesh_indices = vec![0; 1024];
-        entry.mesh_indices_next_free = 1024;
-        entry.mesh_indices_free_list = vec![(0, 1024)];
+        entry.view.mesh_indices = vec![0; 1024];
+        entry.view.mesh_indices_next_free = 1024;
+        entry.view.mesh_indices_free_list = vec![(0, 1024)];
         assert!(
-            !entry.should_compact_mesh_indices(),
+            !entry.view.should_compact_mesh_indices(),
             "below size floor → false even at 100 % fragmentation",
         );
 
         // Past size floor but only 20 % free.
         let big = 200 * 1024;
         let twenty_pct = big / 5;
-        entry.mesh_indices = vec![0; big as usize];
-        entry.mesh_indices_next_free = big;
-        entry.mesh_indices_free_list = vec![(0, twenty_pct)];
+        entry.view.mesh_indices = vec![0; big as usize];
+        entry.view.mesh_indices_next_free = big;
+        entry.view.mesh_indices_free_list = vec![(0, twenty_pct)];
         assert!(
-            !entry.should_compact_mesh_indices(),
+            !entry.view.should_compact_mesh_indices(),
             "20 % fragmentation is below the 30 % cutoff",
         );
 
         // Past size floor and 35 % free → trip.
         let thirty_five_pct = (big as u64 * 35 / 100) as u32;
-        entry.mesh_indices_free_list = vec![(0, thirty_five_pct)];
+        entry.view.mesh_indices_free_list = vec![(0, thirty_five_pct)];
         assert!(
-            entry.should_compact_mesh_indices(),
+            entry.view.should_compact_mesh_indices(),
             "35 % fragmentation past size floor → compact",
         );
     }
@@ -1413,19 +1463,19 @@ mod slab_tests {
     fn mesh_indices_slab_first_fit_shrinks_from_front() {
         let mut entry = entry_with_indices(&[0; 32]);
         // Punch holes at [4..8) and [20..28).
-        entry.free_index_range(4, 4);
-        entry.free_index_range(20, 8);
-        assert_eq!(entry.mesh_indices_free_list, vec![(4, 4), (20, 8)]);
+        entry.view.free_index_range(4, 4);
+        entry.view.free_index_range(20, 8);
+        assert_eq!(entry.view.mesh_indices_free_list, vec![(4, 4), (20, 8)]);
 
         // Alloc 4 → first-fit picks the (4, 4) hole; free list drops it.
-        let off1 = entry.alloc_index_range(4);
+        let off1 = entry.view.alloc_index_range(4);
         assert_eq!(off1, 4);
-        assert_eq!(entry.mesh_indices_free_list, vec![(20, 8)]);
+        assert_eq!(entry.view.mesh_indices_free_list, vec![(20, 8)]);
 
         // Alloc 4 → first-fit picks the (20, 8) hole; it shrinks from
         // the front to (24, 4).
-        let off2 = entry.alloc_index_range(4);
+        let off2 = entry.view.alloc_index_range(4);
         assert_eq!(off2, 20);
-        assert_eq!(entry.mesh_indices_free_list, vec![(24, 4)]);
+        assert_eq!(entry.view.mesh_indices_free_list, vec![(24, 4)]);
     }
 }

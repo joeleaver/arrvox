@@ -266,9 +266,9 @@ impl ArvxSceneManager {
             let Some(entry) = self.asset_cache.get(handle) else {
                 return (dirty, stats);
             };
-            let clusters = &entry.meshlet_clusters;
-            let indices = &entry.mesh_indices;
-            let verts = &entry.mesh_vertices;
+            let clusters = &entry.view.meshlet_clusters;
+            let indices = &entry.view.mesh_indices;
+            let verts = &entry.view.mesh_vertices;
             dirty
                 .par_iter()
                 .filter_map(|&cid| {
@@ -317,18 +317,18 @@ impl ArvxSceneManager {
                 return (dirty, stats);
             };
             for (cid, kept) in &results {
-                let old_offset = entry.meshlet_clusters[*cid as usize].index_offset;
-                let old_count = entry.meshlet_clusters[*cid as usize].index_count;
+                let old_offset = entry.view.meshlet_clusters[*cid as usize].index_offset;
+                let old_count = entry.view.meshlet_clusters[*cid as usize].index_count;
                 let new_count = kept.len() as u32;
                 stats.kept_tris += (new_count as usize) / 3;
                 stats.dropped_tris += ((old_count - new_count) as usize) / 3;
                 if new_count > 0 {
-                    entry.mesh_indices_write_at(old_offset, kept);
+                    entry.view.mesh_indices_write_at(old_offset, kept);
                 }
                 if new_count < old_count {
-                    entry.free_index_range(old_offset + new_count, old_count - new_count);
+                    entry.view.free_index_range(old_offset + new_count, old_count - new_count);
                 }
-                entry.meshlet_clusters[*cid as usize].index_count = new_count;
+                entry.view.meshlet_clusters[*cid as usize].index_count = new_count;
             }
         }
 
@@ -370,22 +370,22 @@ impl ArvxSceneManager {
         }
 
         let entry = self.asset_cache.get_mut(handle)?;
-        let vertex_offset = entry.mesh_vertices.len() as u32;
+        let vertex_offset = entry.view.mesh_vertices.len() as u32;
         let append_start_bytes =
             (vertex_offset as usize * std::mem::size_of::<MeshVertex>()) as u32;
-        entry.mesh_vertices.extend_from_slice(verts);
+        entry.view.mesh_vertices.extend_from_slice(verts);
         let append_len_bytes = std::mem::size_of_val(verts) as u32;
         if append_len_bytes > 0 {
-            entry
+            entry.view
                 .mesh_vertices_dirty
                 .mark(append_start_bytes, append_len_bytes);
         }
 
         let patch_index_count = indices.len() as u32;
         let new_index_offset = if patch_index_count > 0 {
-            let offset = entry.alloc_index_range(patch_index_count);
+            let offset = entry.view.alloc_index_range(patch_index_count);
             let rebased: Vec<u32> = indices.iter().map(|&i| i + vertex_offset).collect();
-            entry.mesh_indices_write_at(offset, &rebased);
+            entry.view.mesh_indices_write_at(offset, &rebased);
             offset
         } else {
             0
@@ -405,9 +405,9 @@ impl ArvxSceneManager {
             group_below_idx: DAG_GROUP_NONE,
             _pad3: 0,
         };
-        let patch_cluster_id = entry.meshlet_clusters.len() as u32;
-        entry.meshlet_clusters.push(patch_cluster);
-        entry
+        let patch_cluster_id = entry.view.meshlet_clusters.len() as u32;
+        entry.view.meshlet_clusters.push(patch_cluster);
+        entry.view
             .cluster_spatial_index
             .insert(patch_cluster_id, &patch_cluster, grid_origin, base_vs);
         Some(patch_cluster_id)

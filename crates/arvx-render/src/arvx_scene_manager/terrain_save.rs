@@ -43,10 +43,10 @@ impl ArvxSceneManager {
         handle: AssetHandle,
     ) -> Option<BakeArtifact> {
         let entry = self.asset_cache.get(handle)?;
-        let leaf_attr_slot_start = entry.leaf_attr_slot_start;
-        let leaf_attr_slot_count = entry.leaf_attr_slot_count;
-        let brick_start = entry.brick_start;
-        let brick_count = entry.brick_count;
+        let leaf_attr_slot_start = entry.model.leaf_attr_slot_start;
+        let leaf_attr_slot_count = entry.model.leaf_attr_slot_count;
+        let brick_start = entry.model.brick_start;
+        let brick_count = entry.model.brick_count;
 
         // ── leaf_attrs + leaf_attr_colors ─────────────────────────
         let mut leaf_attrs: Vec<LeafAttr> =
@@ -101,7 +101,7 @@ impl ArvxSceneManager {
         }
 
         // ── Octree (clone + remap leaf/brick refs in every node) ──
-        let mut nodes = entry.cpu_octree.as_slice().to_vec();
+        let mut nodes = entry.model.cpu_octree.as_slice().to_vec();
         for node in nodes.iter_mut() {
             let v = *node;
             if is_leaf(v) {
@@ -114,12 +114,12 @@ impl ArvxSceneManager {
         }
         let mut octree = SparseOctree::from_raw(
             &nodes,
-            entry.cpu_octree.depth(),
-            entry.cpu_octree.base_voxel_size(),
+            entry.model.cpu_octree.depth(),
+            entry.model.cpu_octree.base_voxel_size(),
         );
         // Remap internal_attr_index (prefilter): same shift on every
         // non-sentinel entry.
-        let internal: Vec<u32> = entry
+        let internal: Vec<u32> = entry.model
             .cpu_octree
             .internal_attr_slice()
             .iter()
@@ -134,7 +134,7 @@ impl ArvxSceneManager {
         octree.set_internal_attr_index(internal);
 
         // ── Halo cells (remap LeafAttr slots) ─────────────────────
-        let halo_cells = entry
+        let halo_cells = entry.model
             .halo_cells
             .iter()
             .map(|&(coord, slot)| {
@@ -150,11 +150,11 @@ impl ArvxSceneManager {
         // ── grid_origin ───────────────────────────────────────────
         // AssetEntry's aabb is the tile's world-space AABB; grid
         // origin = aabb.min (same as the integrate path's reverse).
-        let grid_origin = entry.aabb.min;
+        let grid_origin = entry.model.aabb.min;
 
         Some(BakeArtifact {
             octree,
-            voxel_count: entry.voxel_count,
+            voxel_count: entry.model.voxel_count,
             grid_origin,
             leaf_attrs,
             leaf_attr_colors,
@@ -179,9 +179,9 @@ impl ArvxSceneManager {
         handle: AssetHandle,
     ) -> Option<MeshSectionsBlob> {
         let entry = self.asset_cache.get(handle)?;
-        let leaf_attr_slot_start = entry.leaf_attr_slot_start;
+        let leaf_attr_slot_start = entry.model.leaf_attr_slot_start;
 
-        let mut mesh_vertices = entry.mesh_vertices.clone();
+        let mut mesh_vertices = entry.view.mesh_vertices.clone();
         for v in &mut mesh_vertices {
             v.leaf_attr_id = v.leaf_attr_id.saturating_sub(leaf_attr_slot_start);
         }
@@ -189,12 +189,12 @@ impl ArvxSceneManager {
         // The full mesh_indices buffer includes both LOD-0 and the
         // higher LODs that the DAG bake produced. We pass it through
         // untouched — load relocates leaf_attr_id alongside.
-        let mesh_indices = entry.mesh_indices.clone();
-        let meshlet_clusters = entry.meshlet_clusters.clone();
-        let dag_groups = entry.dag_groups.clone();
-        let dag_consumed = entry.dag_consumed.clone();
-        let dag_produced = entry.dag_produced.clone();
-        let lod0_index_count = entry.mesh_lod0_index_count;
+        let mesh_indices = entry.view.mesh_indices.clone();
+        let meshlet_clusters = entry.view.meshlet_clusters.clone();
+        let dag_groups = entry.view.dag_groups.clone();
+        let dag_consumed = entry.view.dag_consumed.clone();
+        let dag_produced = entry.view.dag_produced.clone();
+        let lod0_index_count = entry.view.mesh_lod0_index_count;
 
         Some(MeshSectionsBlob {
             vertices: bytemuck::cast_slice(&mesh_vertices).to_vec(),

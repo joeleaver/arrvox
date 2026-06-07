@@ -133,19 +133,19 @@ fn local_aabb_intersects(
 ///
 /// Returns the number of clusters newly flagged dirty.
 pub(super) fn mark_lod_dirty_chains(
-    entry: &mut super::types::AssetEntry,
+    view: &mut super::types::MeshView,
     seeds: &[u32],
     brush_aabb_min: Vec3,
     brush_aabb_max: Vec3,
 ) -> usize {
     use arvx_core::mesh_cluster::{CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE};
-    let cluster_count = entry.meshlet_clusters.len();
+    let cluster_count = view.meshlet_clusters.len();
 
-    if entry.dag_groups.is_empty() {
+    if view.dag_groups.is_empty() {
         // Pre-v6 asset — no DAG topology baked. Asset-wide marking
         // preserves current behavior. Re-bake via
         // `arvx-convert --rebuild-mesh` to migrate to v6.
-        for c in entry.meshlet_clusters.iter_mut() {
+        for c in view.meshlet_clusters.iter_mut() {
             c.flags |= CLUSTER_FLAG_LOD_DIRTY;
         }
         return cluster_count;
@@ -163,7 +163,7 @@ pub(super) fn mark_lod_dirty_chains(
     // Step 2: LOD>0 clusters whose AABB intersects the brush AABB
     // become dirty. Push them onto a descent stack for step 3.
     let mut descent_stack: Vec<u32> = Vec::new();
-    for (idx, c) in entry.meshlet_clusters.iter().enumerate() {
+    for (idx, c) in view.meshlet_clusters.iter().enumerate() {
         if c.lod_level == 0 || dirty[idx] {
             continue;
         }
@@ -179,20 +179,20 @@ pub(super) fn mark_lod_dirty_chains(
     // a leaf in the DAG). The shared `dirty` array de-dupes work
     // when multiple ancestors share descendants.
     while let Some(cidx) = descent_stack.pop() {
-        let c = &entry.meshlet_clusters[cidx as usize];
+        let c = &view.meshlet_clusters[cidx as usize];
         if c.group_below_idx == DAG_GROUP_NONE {
             continue;
         }
-        let g = entry.dag_groups[c.group_below_idx as usize];
+        let g = view.dag_groups[c.group_below_idx as usize];
         let lo = g.consumed_first as usize;
         let hi = lo + g.consumed_count as usize;
-        for &child in &entry.dag_consumed[lo..hi] {
+        for &child in &view.dag_consumed[lo..hi] {
             let n = child as usize;
             if n >= cluster_count || dirty[n] {
                 continue;
             }
             dirty[n] = true;
-            if entry.meshlet_clusters[n].lod_level > 0 {
+            if view.meshlet_clusters[n].lod_level > 0 {
                 descent_stack.push(child);
             }
         }
@@ -200,7 +200,7 @@ pub(super) fn mark_lod_dirty_chains(
 
     // Step 4: apply dirty flags to clusters.
     let mut marked = 0usize;
-    for (idx, c) in entry.meshlet_clusters.iter_mut().enumerate() {
+    for (idx, c) in view.meshlet_clusters.iter_mut().enumerate() {
         if dirty[idx] {
             c.flags |= CLUSTER_FLAG_LOD_DIRTY;
             marked += 1;
@@ -271,10 +271,10 @@ impl ArvxSceneManager {
         // ── 1. Resolve grid coords ──────────────────────────────────
         let (op, depth, base_vs) = {
             let entry = self.asset_cache.get(handle)?;
-            let depth = entry.spatial_handle.depth;
-            let base_vs = entry.spatial_handle.base_voxel_size;
+            let depth = entry.model.spatial_handle.depth;
+            let base_vs = entry.model.spatial_handle.base_voxel_size;
             let extent = (1u32 << depth) as f32 * base_vs;
-            let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+            let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
             let asset_grid_origin = aabb_center - Vec3::splat(extent * 0.5);
 
             let inv_world = entity_world.inverse();
@@ -345,7 +345,7 @@ impl ArvxSceneManager {
         let delta = {
             let entry = self.asset_cache.get(handle)?;
             compute_brush_edits_in_stroke(
-                &entry.cpu_octree,
+                &entry.model.cpu_octree,
                 &self.brick_pool,
                 self.leaf_attr_pool.as_slice(),
                 op,
@@ -381,7 +381,7 @@ impl ArvxSceneManager {
             match edit.op {
                 LeafEditOp::Remove => {
                     let entry = self.asset_cache.get(handle)?;
-                    let Some(node) = entry.cpu_octree.lookup(edit.coord) else {
+                    let Some(node) = entry.model.cpu_octree.lookup(edit.coord) else {
                         continue;
                     };
                     if is_leaf(node) {
@@ -464,7 +464,7 @@ impl ArvxSceneManager {
                 ..
             } = self;
             let entry = asset_cache.get_mut(handle)?;
-            let octree = &mut entry.cpu_octree;
+            let octree = &mut entry.model.cpu_octree;
             apply_delta(
                 octree,
                 brick_pool,
@@ -482,7 +482,7 @@ impl ArvxSceneManager {
         // ── 4b. Sync cpu_octree mutations into OctreeGpu's packed buffer.
         //
         // Closes the latent CPU↔GPU sync bug: `apply_delta` mutated
-        // `entry.cpu_octree.nodes`, but without this step those changes
+        // `entry.model.cpu_octree.nodes`, but without this step those changes
         // never reach the packed buffer that `upload_geometry` ships.
         //
         // Growth handling: every drag stamp typically subdivides a few
@@ -495,14 +495,14 @@ impl ArvxSceneManager {
         // re-allocation then reserves more headroom for future stamps.
         {
             let entry = self.asset_cache.get_mut(handle)?;
-            let spatial = entry.spatial_handle;
-            let new_node_count = entry.cpu_octree.node_count() as u32;
+            let spatial = entry.model.spatial_handle;
+            let new_node_count = entry.model.cpu_octree.node_count() as u32;
             if applied.octree_log.grew(new_node_count) {
                 let extended = self.octree.try_extend_in_slack(&spatial, new_node_count);
                 match extended {
                     Some(new_handle) => {
                         let entry = self.asset_cache.get_mut(handle)?;
-                        entry.spatial_handle = new_handle;
+                        entry.model.spatial_handle = new_handle;
                         self.octree.apply_mutation_log(&new_handle, &applied.octree_log);
                     }
                     None => {
@@ -512,9 +512,9 @@ impl ArvxSceneManager {
                         );
                         self.octree.deallocate(spatial);
                         let entry = self.asset_cache.get_mut(handle)?;
-                        let new_handle = self.octree.allocate_with_slack(&entry.cpu_octree, 1.5);
+                        let new_handle = self.octree.allocate_with_slack(&entry.model.cpu_octree, 1.5);
                         let entry = self.asset_cache.get_mut(handle)?;
-                        entry.spatial_handle = new_handle;
+                        entry.model.spatial_handle = new_handle;
                     }
                 }
             } else if !applied.octree_log.is_empty() {
@@ -545,10 +545,10 @@ impl ArvxSceneManager {
             // override".
             self.leaf_attr_pool.set_color(*slot, 0);
             let entry = self.asset_cache.get_mut(handle)?;
-            let base_lo = entry.leaf_attr_slot_start;
-            let base_hi = base_lo + entry.leaf_attr_slot_count;
+            let base_lo = entry.model.leaf_attr_slot_start;
+            let base_hi = base_lo + entry.model.leaf_attr_slot_count;
             if *slot < base_lo || *slot >= base_hi {
-                entry.sculpt_extra_slots.insert(*slot);
+                entry.model.sculpt_extra_slots.insert(*slot);
             }
             // Mark this slot as sculpt-owned regardless of whether
             // it sits in the bake range. The mesh-extract tie-break
@@ -557,7 +557,7 @@ impl ArvxSceneManager {
             // otherwise the position-only `coord_less` tie-break in
             // `build_cube_vertex` leaks the procedural neighbour's
             // material/colour into the sculpt vertex.
-            entry.sculpt_owned_slots.insert(*slot);
+            entry.model.sculpt_owned_slots.insert(*slot);
         }
         // Renormalize pre-existing neighbour slots whose post-stamp
         // gradient differs from the stored normal. Patches only the
@@ -579,13 +579,13 @@ impl ArvxSceneManager {
         for slot in &applied.freed_slots {
             self.leaf_attr_pool.deallocate_range(*slot, 1);
             if let Some(entry) = self.asset_cache.get_mut(handle) {
-                entry.sculpt_extra_slots.remove(slot);
+                entry.model.sculpt_extra_slots.remove(slot);
                 // Drop from the sculpt-owned set too — a freed slot
                 // may be re-allocated for a non-sculpt purpose (paint
                 // doesn't currently do that, but defensive against
                 // future allocators). The tie-break only wants slots
                 // that are CURRENTLY live sculpt cells.
-                entry.sculpt_owned_slots.remove(slot);
+                entry.model.sculpt_owned_slots.remove(slot);
             }
         }
         _p_leaf_attr_ms = _ph_t5.elapsed().as_secs_f64() * 1000.0;
@@ -740,7 +740,7 @@ impl ArvxSceneManager {
                 continue;
             }
             let entry = self.asset_cache.get(handle)?;
-            let Some(node) = entry.cpu_octree.lookup(edit.coord) else {
+            let Some(node) = entry.model.cpu_octree.lookup(edit.coord) else {
                 continue;
             };
             if is_leaf(node) {
@@ -777,7 +777,7 @@ impl ArvxSceneManager {
                 ..
             } = self;
             let entry = asset_cache.get_mut(handle)?;
-            let octree = &mut entry.cpu_octree;
+            let octree = &mut entry.model.cpu_octree;
             apply_delta(octree, brick_pool, &delta, || {
                 leaf_attr_pool
                     .allocate()
@@ -788,14 +788,14 @@ impl ArvxSceneManager {
         // ── Sync octree mutations to GPU (mirrors brush Phase 4b).
         {
             let entry = self.asset_cache.get_mut(handle)?;
-            let spatial = entry.spatial_handle;
-            let new_node_count = entry.cpu_octree.node_count() as u32;
+            let spatial = entry.model.spatial_handle;
+            let new_node_count = entry.model.cpu_octree.node_count() as u32;
             if applied.octree_log.grew(new_node_count) {
                 let extended = self.octree.try_extend_in_slack(&spatial, new_node_count);
                 match extended {
                     Some(new_handle) => {
                         let entry = self.asset_cache.get_mut(handle)?;
-                        entry.spatial_handle = new_handle;
+                        entry.model.spatial_handle = new_handle;
                         self.octree.apply_mutation_log(&new_handle, &applied.octree_log);
                     }
                     None => {
@@ -805,9 +805,9 @@ impl ArvxSceneManager {
                         );
                         self.octree.deallocate(spatial);
                         let entry = self.asset_cache.get_mut(handle)?;
-                        let new_handle = self.octree.allocate_with_slack(&entry.cpu_octree, 1.5);
+                        let new_handle = self.octree.allocate_with_slack(&entry.model.cpu_octree, 1.5);
                         let entry = self.asset_cache.get_mut(handle)?;
-                        entry.spatial_handle = new_handle;
+                        entry.model.spatial_handle = new_handle;
                     }
                 }
             } else if !applied.octree_log.is_empty() {
@@ -820,12 +820,12 @@ impl ArvxSceneManager {
             *self.leaf_attr_pool.get_mut(*slot) = attrs.to_leaf_attr();
             self.leaf_attr_pool.set_color(*slot, 0);
             let entry = self.asset_cache.get_mut(handle)?;
-            let base_lo = entry.leaf_attr_slot_start;
-            let base_hi = base_lo + entry.leaf_attr_slot_count;
+            let base_lo = entry.model.leaf_attr_slot_start;
+            let base_hi = base_lo + entry.model.leaf_attr_slot_count;
             if *slot < base_lo || *slot >= base_hi {
-                entry.sculpt_extra_slots.insert(*slot);
+                entry.model.sculpt_extra_slots.insert(*slot);
             }
-            entry.sculpt_owned_slots.insert(*slot);
+            entry.model.sculpt_owned_slots.insert(*slot);
         }
         for (slot, normal) in &applied.renormalized_slots {
             let attr = self.leaf_attr_pool.get_mut(*slot);
@@ -834,8 +834,8 @@ impl ArvxSceneManager {
         for slot in &applied.freed_slots {
             self.leaf_attr_pool.deallocate_range(*slot, 1);
             if let Some(entry) = self.asset_cache.get_mut(handle) {
-                entry.sculpt_extra_slots.remove(slot);
-                entry.sculpt_owned_slots.remove(slot);
+                entry.model.sculpt_extra_slots.remove(slot);
+                entry.model.sculpt_owned_slots.remove(slot);
             }
         }
 
@@ -883,17 +883,17 @@ impl ArvxSceneManager {
         let Some(entry) = self.asset_cache.get(handle) else {
             return Vec::new();
         };
-        if entry.meshlet_clusters.is_empty() {
+        if entry.view.meshlet_clusters.is_empty() {
             return Vec::new();
         }
         // Empty brush AABB → no clusters can intersect.
         if brush_lo.x >= brush_hi.x || brush_lo.y >= brush_hi.y || brush_lo.z >= brush_hi.z {
             return Vec::new();
         }
-        let depth = entry.spatial_handle.depth;
-        let base_vs = entry.spatial_handle.base_voxel_size;
+        let depth = entry.model.spatial_handle.depth;
+        let base_vs = entry.model.spatial_handle.base_voxel_size;
         let extent = (1u32 << depth) as f32 * base_vs;
-        let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+        let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
         let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
 
         // **D7 — spatial-indexed query.** Walk the bucket grid for
@@ -902,10 +902,10 @@ impl ArvxSceneManager {
         // test. On splat5 elephant the linear scan ran in ~1.2 ms
         // (104 k clusters × ~12 ns); the indexed path visits a few
         // hundred candidates and finishes in <100 µs.
-        let candidates = entry.cluster_spatial_index.query(brush_lo, brush_hi);
+        let candidates = entry.view.cluster_spatial_index.query(brush_lo, brush_hi);
         let mut dirty = Vec::with_capacity(candidates.len());
         for cid in candidates {
-            let c = &entry.meshlet_clusters[cid as usize];
+            let c = &entry.view.meshlet_clusters[cid as usize];
             // LOD filter — index only stores LOD-0, but a future
             // change might let an entry slip through; keep the
             // check for safety.
@@ -1000,13 +1000,13 @@ impl ArvxSceneManager {
              brush_center_local,
              brush_radius_local, brush_radius_sq) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
-            if entry.meshlet_clusters.is_empty() {
+            if entry.view.meshlet_clusters.is_empty() {
                 return false;
             }
-            let depth = entry.spatial_handle.depth;
-            let base_vs = entry.spatial_handle.base_voxel_size;
+            let depth = entry.model.spatial_handle.depth;
+            let base_vs = entry.model.spatial_handle.base_voxel_size;
             let extent_f = (1u32 << depth) as f32 * base_vs;
-            let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+            let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
             let grid_origin = aabb_center - Vec3::splat(extent_f * 0.5);
 
             let extent = 1u32 << depth;
@@ -1095,7 +1095,7 @@ impl ArvxSceneManager {
         let cells = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             collect_cell_map_in_region(
-                entry.cpu_octree.as_slice(),
+                entry.model.cpu_octree.as_slice(),
                 depth,
                 self.brick_pool.as_slice(),
                 cells_min,
@@ -1113,15 +1113,15 @@ impl ArvxSceneManager {
                 &cells,
                 brush_lo,
                 brush_hi,
-                entry.cpu_octree.as_slice(),
+                entry.model.cpu_octree.as_slice(),
                 depth,
                 base_vs,
                 grid_origin,
                 self.brick_pool.as_slice(),
                 self.leaf_attr_pool.as_slice(),
                 self.leaf_attr_pool.bones_as_slice(),
-                &entry.halo_cells,
-                Some(&entry.sculpt_owned_slots),
+                &entry.model.halo_cells,
+                Some(&entry.model.sculpt_owned_slots),
                 // TODO(stage-b): sdf_fn param now always None on the
                 // sculpt path (brush projection deleted in A4); remove
                 // the generic sdf_fn thread from the extract fns in
@@ -1202,7 +1202,7 @@ impl ArvxSceneManager {
         let brush_aabb_max = brush_center_local + Vec3::splat(brush_radius_local + base_vs);
         let walk_visited_count = {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            mark_lod_dirty_chains(entry, &dirty, brush_aabb_min, brush_aabb_max)
+            mark_lod_dirty_chains(&mut entry.view, &dirty, brush_aabb_min, brush_aabb_max)
         };
         _p_cc_walk_ms = _ph_t5.elapsed().as_secs_f64() * 1000.0;
 
@@ -1225,7 +1225,9 @@ impl ArvxSceneManager {
         // still indexes into the un-shifted table.
         let compacted_patches = {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            entry.compact_empty_patches()
+            let grid_origin = entry.model.grid_origin();
+            let base_vs = entry.model.spatial_handle.base_voxel_size;
+            entry.view.compact_empty_patches(grid_origin, base_vs)
         };
 
         // ── Phase 4.6: defrag mesh_indices when fragmentation is high ─
@@ -1241,22 +1243,22 @@ impl ArvxSceneManager {
         // index stay valid.
         let defrag_reclaimed_bytes = {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            if entry.should_compact_mesh_indices() {
-                let pre_free: usize = entry
+            if entry.view.should_compact_mesh_indices() {
+                let pre_free: usize = entry.view
                     .mesh_indices_free_list
                     .iter()
                     .map(|(_, l)| *l as usize)
                     .sum();
-                let pre_next_free = entry.mesh_indices_next_free;
-                let pre_holes = entry.mesh_indices_free_list.len();
-                let reclaimed = entry.compact_mesh_indices();
+                let pre_next_free = entry.view.mesh_indices_next_free;
+                let pre_holes = entry.view.mesh_indices_free_list.len();
+                let reclaimed = entry.view.compact_mesh_indices();
                 eprintln!(
                     "[sculpt] defrag mesh_indices: pre next_free={} free={} holes={} → \
                      post next_free={} reclaimed={} B",
                     pre_next_free,
                     pre_free,
                     pre_holes,
-                    entry.mesh_indices_next_free,
+                    entry.view.mesh_indices_next_free,
                     reclaimed,
                 );
                 reclaimed
@@ -1275,16 +1277,16 @@ impl ArvxSceneManager {
         // Mark mesh + clusters dirty so the next geometry-epoch upload
         // loop picks this asset up and skips all the others.
         let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-        entry.mesh_lod0_index_count = entry
+        entry.view.mesh_lod0_index_count = entry.view
             .meshlet_clusters
             .iter()
             .filter(|c| c.lod_level == 0)
             .map(|c| c.index_count)
             .sum();
-        entry.mesh_dirty = true;
-        entry.clusters_dirty = true;
+        entry.view.mesh_dirty = true;
+        entry.view.clusters_dirty = true;
 
-        let total_clusters = entry.meshlet_clusters.len();
+        let total_clusters = entry.view.meshlet_clusters.len();
         // D0 — per-phase breakdown of rebuild_dirty_clusters. The
         // dominant sub-phase identifies which step of the cluster
         // patch path to target next (filter vs extract vs CC walk).
@@ -1300,8 +1302,8 @@ impl ArvxSceneManager {
             total_dropped_tris,
             brush_verts.len(),
             brush_indices.len() / 3,
-            entry.mesh_vertices.len(),
-            entry.mesh_indices.len(),
+            entry.view.mesh_vertices.len(),
+            entry.view.mesh_indices.len(),
             walk_visited_count,
             total_clusters,
             if total_clusters > 0 {
@@ -1339,14 +1341,14 @@ impl ArvxSceneManager {
         // borrows of the asset entry) because the entry will be
         // re-borrowed mutably later to write back the new mesh.
         let Some(entry) = self.asset_cache.get(handle) else { return; };
-        let depth = entry.spatial_handle.depth;
-        let voxel_size = entry.spatial_handle.base_voxel_size;
+        let depth = entry.model.spatial_handle.depth;
+        let voxel_size = entry.model.spatial_handle.base_voxel_size;
         let extent = (1u32 << depth) as f32 * voxel_size;
-        let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+        let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
         let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
 
         let (vertices, indices_unc) = extract_surface_mesh(
-            entry.cpu_octree.as_slice(),
+            entry.model.cpu_octree.as_slice(),
             depth,
             voxel_size,
             grid_origin,
@@ -1357,31 +1359,31 @@ impl ArvxSceneManager {
             // sculpt-allocated slots so brush-added cells keep their
             // material/colour at vertices shared with procedural
             // neighbours.
-            Some(&entry.sculpt_owned_slots),
+            Some(&entry.model.sculpt_owned_slots),
         );
 
         if vertices.is_empty() {
             // Asset carved away to nothing — clear mesh state. The
             // upload path drops the GPU buffers on empty input.
             if let Some(entry) = self.asset_cache.get_mut(handle) {
-                entry.mesh_vertices.clear();
-                entry.mesh_indices.clear();
-                entry.meshlet_clusters.clear();
-                entry.bake_time_cluster_count = 0;
-                entry.mesh_lod0_index_count = 0;
+                entry.view.mesh_vertices.clear();
+                entry.view.mesh_indices.clear();
+                entry.view.meshlet_clusters.clear();
+                entry.view.bake_time_cluster_count = 0;
+                entry.view.mesh_lod0_index_count = 0;
                 // Slab allocator must reset in lockstep — the
                 // upload path uses `mesh_indices.len() == 0` to drop
                 // the GPU buffer, but the allocator state would
                 // otherwise hold stale `next_free` and free-list
                 // entries that violate the "all offsets <= len()"
                 // invariant on the next stamp.
-                entry.reset_mesh_indices_slab();
-                entry.mesh_dirty = true;
-                entry.clusters_dirty = true;
+                entry.view.reset_mesh_indices_slab();
+                entry.view.mesh_dirty = true;
+                entry.view.clusters_dirty = true;
                 // D7 — spatial index must drop in lockstep with the
                 // cluster table; an empty index agrees with the empty
                 // cluster vec.
-                entry.cluster_spatial_index =
+                entry.view.cluster_spatial_index =
                     super::cluster_spatial_index::ClusterSpatialIndex::new();
             }
             return;
@@ -1396,41 +1398,41 @@ impl ArvxSceneManager {
         let mesh_lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
 
         let Some(entry) = self.asset_cache.get_mut(handle) else { return; };
-        entry.mesh_vertices = vertices;
-        entry.mesh_indices = dag.indices;
-        entry.meshlet_clusters = dag.clusters;
-        entry.bake_time_cluster_count = entry.meshlet_clusters.len() as u32;
-        entry.mesh_lod0_index_count = mesh_lod0_index_count;
+        entry.view.mesh_vertices = vertices;
+        entry.view.mesh_indices = dag.indices;
+        entry.view.meshlet_clusters = dag.clusters;
+        entry.view.bake_time_cluster_count = entry.view.meshlet_clusters.len() as u32;
+        entry.view.mesh_lod0_index_count = mesh_lod0_index_count;
         // Full re-extract replaces every cluster + every index — slab
         // allocator state from before the rebuild is meaningless. Reset
         // it and mark the full new buffer dirty so the IBO upload
         // pushes the whole new layout to the GPU.
-        entry.reset_mesh_indices_slab();
+        entry.view.reset_mesh_indices_slab();
         // Mirror: the VBO was fully replaced too. Mark the entire new
         // vertex range dirty so the upload doesn't keep stale prefix
         // bytes from the previous mesh under the same handle.
-        entry.mesh_vertices_dirty.clear();
-        let vbo_bytes = (entry.mesh_vertices.len()
+        entry.view.mesh_vertices_dirty.clear();
+        let vbo_bytes = (entry.view.mesh_vertices.len()
             * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
             as u32;
         if vbo_bytes > 0 {
-            entry.mesh_vertices_dirty.mark_full(vbo_bytes);
+            entry.view.mesh_vertices_dirty.mark_full(vbo_bytes);
         }
-        entry.mesh_dirty = true;
-        entry.clusters_dirty = true;
+        entry.view.mesh_dirty = true;
+        entry.view.clusters_dirty = true;
         // D7 — full re-extract replaced every cluster; rebuild the
         // spatial index from scratch. Grid origin matches the
         // convention used by `clusters_in_brush_grid_aabb`.
-        entry
+        entry.view
             .cluster_spatial_index
-            .rebuild(&entry.meshlet_clusters, grid_origin, voxel_size);
+            .rebuild(&entry.view.meshlet_clusters, grid_origin, voxel_size);
 
         eprintln!(
             "[sculpt] mesh re-extract: handle={:?} verts={} indices={} clusters={} ({:.2}ms)",
             handle,
-            entry.mesh_vertices.len(),
-            entry.mesh_indices.len(),
-            entry.meshlet_clusters.len(),
+            entry.view.mesh_vertices.len(),
+            entry.view.mesh_indices.len(),
+            entry.view.meshlet_clusters.len(),
             t0.elapsed().as_secs_f64() * 1000.0,
         );
     }
@@ -1443,13 +1445,13 @@ impl ArvxSceneManager {
 
         let (depth, base_vs, grid_origin) = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
-            if entry.meshlet_clusters.is_empty() {
+            if entry.view.meshlet_clusters.is_empty() {
                 return false;
             }
-            let depth = entry.spatial_handle.depth;
-            let base_vs = entry.spatial_handle.base_voxel_size;
+            let depth = entry.model.spatial_handle.depth;
+            let base_vs = entry.model.spatial_handle.base_voxel_size;
             let extent_f = (1u32 << depth) as f32 * base_vs;
-            let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+            let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
             let grid_origin = aabb_center - Vec3::splat(extent_f * 0.5);
             (depth, base_vs, grid_origin)
         };
@@ -1483,15 +1485,17 @@ impl ArvxSceneManager {
         {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
             for &cid in &prev_patch_ids {
-                if (cid as usize) < entry.meshlet_clusters.len() {
-                    let c = &entry.meshlet_clusters[cid as usize];
+                if (cid as usize) < entry.view.meshlet_clusters.len() {
+                    let c = &entry.view.meshlet_clusters[cid as usize];
                     if c.index_count > 0 {
-                        entry.free_index_range(c.index_offset, c.index_count);
+                        entry.view.free_index_range(c.index_offset, c.index_count);
                     }
-                    entry.meshlet_clusters[cid as usize].index_count = 0;
+                    entry.view.meshlet_clusters[cid as usize].index_count = 0;
                 }
             }
-            entry.compact_empty_patches();
+            let grid_origin = entry.model.grid_origin();
+            let base_vs = entry.model.spatial_handle.base_voxel_size;
+            entry.view.compact_empty_patches(grid_origin, base_vs);
         }
 
         // ── Step 3: filter bake-time clusters inside the union AABB ──
@@ -1520,7 +1524,7 @@ impl ArvxSceneManager {
         let cells = {
             let Some(entry) = self.asset_cache.get(handle) else { return false; };
             collect_cell_map_in_region(
-                entry.cpu_octree.as_slice(),
+                entry.model.cpu_octree.as_slice(),
                 depth,
                 self.brick_pool.as_slice(),
                 cells_min,
@@ -1534,15 +1538,15 @@ impl ArvxSceneManager {
                 &cells,
                 union_lo,
                 union_hi,
-                entry.cpu_octree.as_slice(),
+                entry.model.cpu_octree.as_slice(),
                 depth,
                 base_vs,
                 grid_origin,
                 self.brick_pool.as_slice(),
                 self.leaf_attr_pool.as_slice(),
                 self.leaf_attr_pool.bones_as_slice(),
-                &entry.halo_cells,
-                Some(&entry.sculpt_owned_slots),
+                &entry.model.halo_cells,
+                Some(&entry.model.sculpt_owned_slots),
                 // TODO(stage-b): sdf_fn param now always None on the
                 // sculpt path (stroke projection deleted in A4); remove
                 // the generic sdf_fn thread from the extract fns in
@@ -1585,16 +1589,16 @@ impl ArvxSceneManager {
         let union_aabb_max_local = grid_origin + union_hi.as_vec3() * base_vs + Vec3::splat(base_vs);
         {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            mark_lod_dirty_chains(entry, &dirty, union_aabb_min_local, union_aabb_max_local);
-            entry.compact_empty_patches();
-            entry.mesh_lod0_index_count = entry
+            mark_lod_dirty_chains(&mut entry.view, &dirty, union_aabb_min_local, union_aabb_max_local);
+            entry.view.compact_empty_patches(grid_origin, base_vs);
+            entry.view.mesh_lod0_index_count = entry.view
                 .meshlet_clusters
                 .iter()
                 .filter(|c| c.lod_level == 0)
                 .map(|c| c.index_count)
                 .sum();
-            entry.mesh_dirty = true;
-            entry.clusters_dirty = true;
+            entry.view.mesh_dirty = true;
+            entry.view.clusters_dirty = true;
         }
 
         eprintln!(
@@ -1616,7 +1620,7 @@ impl ArvxSceneManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arvx_scene_manager::types::AssetEntry;
+    use crate::arvx_scene_manager::types::{AssetEntry, MeshView, VoxelModel};
     use arvx_core::mesh_cluster::{DAG_GROUP_NONE, MeshletCluster, PARENT_GROUP_ERROR_ROOT};
     use arvx_core::sparse_octree::SparseOctree;
     use arvx_core::{Aabb, OctreeHandle};
@@ -1668,41 +1672,45 @@ mod tests {
         AssetEntry {
             path: std::path::PathBuf::from("test:in-memory"),
             refcount: 1,
-            spatial_handle: OctreeHandle {
-                root_offset: 0,
-                len: 0,
-                depth,
-                base_voxel_size: base_vs,
+            model: VoxelModel {
+                spatial_handle: OctreeHandle {
+                    root_offset: 0,
+                    len: 0,
+                    depth,
+                    base_voxel_size: base_vs,
+                },
+                voxel_size: base_vs,
+                aabb,
+                voxel_count: 0,
+                leaf_attr_slot_start: 0,
+                leaf_attr_slot_count: 0,
+                brick_start: 0,
+                brick_count: 0,
+                skinning: None,
+                cpu_octree: SparseOctree::new(depth, base_vs),
+                sculpt_extra_slots: std::collections::HashSet::new(),
+                sculpt_owned_slots: rustc_hash::FxHashSet::default(),
+                halo_extra_slots: std::collections::HashSet::new(),
+                halo_cells: Vec::new(),
+                distinct_materials: None,
             },
-            voxel_size: base_vs,
-            aabb,
-            voxel_count: 0,
-            leaf_attr_slot_start: 0,
-            leaf_attr_slot_count: 0,
-            brick_start: 0,
-            brick_count: 0,
-            skinning: None,
-            mesh_vertices: Vec::new(),
-            mesh_indices: Vec::new(),
-            mesh_indices_free_list: Vec::new(),
-            mesh_indices_next_free: 0,
-            mesh_indices_dirty: arvx_core::DirtyRanges::new(),
-            mesh_vertices_dirty: arvx_core::DirtyRanges::new(),
-            mesh_lod0_index_count: 0,
-            bake_time_cluster_count: clusters.len() as u32,
-            meshlet_clusters: clusters,
-            dag_groups: Vec::new(),
-            dag_consumed: Vec::new(),
-            dag_produced: Vec::new(),
-            cpu_octree: SparseOctree::new(depth, base_vs),
-            sculpt_extra_slots: std::collections::HashSet::new(),
-            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
-            halo_extra_slots: std::collections::HashSet::new(),
-            halo_cells: Vec::new(),
-            distinct_materials: None,
-            mesh_dirty: false,
-            clusters_dirty: false,
-            cluster_spatial_index,
+            view: MeshView {
+                mesh_vertices: Vec::new(),
+                mesh_indices: Vec::new(),
+                mesh_indices_free_list: Vec::new(),
+                mesh_indices_next_free: 0,
+                mesh_indices_dirty: arvx_core::DirtyRanges::new(),
+                mesh_vertices_dirty: arvx_core::DirtyRanges::new(),
+                mesh_lod0_index_count: 0,
+                bake_time_cluster_count: clusters.len() as u32,
+                meshlet_clusters: clusters,
+                dag_groups: Vec::new(),
+                dag_consumed: Vec::new(),
+                dag_produced: Vec::new(),
+                mesh_dirty: false,
+                clusters_dirty: false,
+                cluster_spatial_index,
+            },
         }
     }
 
@@ -1791,25 +1799,25 @@ mod tests {
             cluster([5.0; 3], [7.0; 3], 1),  // 5 c1_y (chain Y)
         ];
         let mut entry = make_entry(clusters, 8);
-        entry.dag_groups = vec![
+        entry.view.dag_groups = vec![
             DagGroup { consumed_first: 0, consumed_count: 2, produced_first: 0, produced_count: 1 },
             DagGroup { consumed_first: 2, consumed_count: 2, produced_first: 1, produced_count: 1 },
         ];
-        entry.dag_consumed = vec![0, 1, 2, 3];
-        entry.dag_produced = vec![4, 5];
+        entry.view.dag_consumed = vec![0, 1, 2, 3];
+        entry.view.dag_produced = vec![4, 5];
         // Set per-cluster topology pointers consistent with groups.
-        entry.meshlet_clusters[0].group_above_idx = 0;
-        entry.meshlet_clusters[1].group_above_idx = 0;
-        entry.meshlet_clusters[4].group_below_idx = 0;
-        entry.meshlet_clusters[2].group_above_idx = 1;
-        entry.meshlet_clusters[3].group_above_idx = 1;
-        entry.meshlet_clusters[5].group_below_idx = 1;
+        entry.view.meshlet_clusters[0].group_above_idx = 0;
+        entry.view.meshlet_clusters[1].group_above_idx = 0;
+        entry.view.meshlet_clusters[4].group_below_idx = 0;
+        entry.view.meshlet_clusters[2].group_above_idx = 1;
+        entry.view.meshlet_clusters[3].group_above_idx = 1;
+        entry.view.meshlet_clusters[5].group_below_idx = 1;
         entry
     }
 
     fn dirty_set(entry: &AssetEntry) -> Vec<u32> {
         use arvx_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
-        entry
+        entry.view
             .meshlet_clusters
             .iter()
             .enumerate()
@@ -1842,7 +1850,7 @@ mod tests {
         // doesn't intersect the brush, so c0_c / c0_d are covered.
         let mut entry = two_chain_entry();
         let (bmin, bmax) = brush_chain_x();
-        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        let marked = mark_lod_dirty_chains(&mut entry.view, &[0], bmin, bmax);
         assert_eq!(marked, 3);
         assert_eq!(dirty_set(&entry), vec![0, 1, 4]);
     }
@@ -1854,7 +1862,7 @@ mod tests {
         // c0_b, c0_d's only ancestor is dirty → force-admit. All 6.
         let mut entry = two_chain_entry();
         let (bmin, bmax) = brush_both_chains();
-        let marked = mark_lod_dirty_chains(&mut entry, &[0, 2], bmin, bmax);
+        let marked = mark_lod_dirty_chains(&mut entry.view, &[0, 2], bmin, bmax);
         assert_eq!(marked, 6);
         assert_eq!(dirty_set(&entry), vec![0, 1, 2, 3, 4, 5]);
     }
@@ -1864,15 +1872,15 @@ mod tests {
         // V5 asset with no baked DAG topology — fallback marks
         // every cluster (preserving the R4d V1 behavior).
         let mut entry = two_chain_entry();
-        entry.dag_groups.clear();
-        entry.dag_consumed.clear();
-        entry.dag_produced.clear();
-        for c in entry.meshlet_clusters.iter_mut() {
+        entry.view.dag_groups.clear();
+        entry.view.dag_consumed.clear();
+        entry.view.dag_produced.clear();
+        for c in entry.view.meshlet_clusters.iter_mut() {
             c.group_above_idx = arvx_core::mesh_cluster::DAG_GROUP_NONE;
             c.group_below_idx = arvx_core::mesh_cluster::DAG_GROUP_NONE;
         }
         let (bmin, bmax) = brush_chain_x();
-        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        let marked = mark_lod_dirty_chains(&mut entry.view, &[0], bmin, bmax);
         assert_eq!(marked, 6);
         assert_eq!(dirty_set(&entry), vec![0, 1, 2, 3, 4, 5]);
     }
@@ -1884,7 +1892,7 @@ mod tests {
         // finds non-dirty ancestors for every LOD-0 leaf.
         let mut entry = two_chain_entry();
         let (bmin, bmax) = brush_far_away();
-        let marked = mark_lod_dirty_chains(&mut entry, &[], bmin, bmax);
+        let marked = mark_lod_dirty_chains(&mut entry.view, &[], bmin, bmax);
         assert_eq!(marked, 0);
         assert!(dirty_set(&entry).is_empty());
     }
@@ -1896,7 +1904,7 @@ mod tests {
         // don't want to panic.
         let mut entry = two_chain_entry();
         let (bmin, bmax) = brush_chain_x();
-        let marked = mark_lod_dirty_chains(&mut entry, &[0, 999], bmin, bmax);
+        let marked = mark_lod_dirty_chains(&mut entry.view, &[0, 999], bmin, bmax);
         assert_eq!(marked, 3);
         assert_eq!(dirty_set(&entry), vec![0, 1, 4]);
     }
@@ -1918,7 +1926,7 @@ mod tests {
             cluster([0.0; 3], [4.0; 3], 2),  // 6 c2_z (root, full asset)
         ];
         let mut entry = make_entry(clusters, 8);
-        entry.dag_groups = vec![
+        entry.view.dag_groups = vec![
             // g0: consumed [c0_a, c0_b] produced [c1_x]
             DagGroup { consumed_first: 0, consumed_count: 2, produced_first: 0, produced_count: 1 },
             // g1: consumed [c0_c, c0_d] produced [c1_y]
@@ -1926,18 +1934,18 @@ mod tests {
             // g2: consumed [c1_x, c1_y] produced [c2_z]
             DagGroup { consumed_first: 4, consumed_count: 2, produced_first: 2, produced_count: 1 },
         ];
-        entry.dag_consumed = vec![0, 1, 2, 3, 4, 5];
-        entry.dag_produced = vec![4, 5, 6];
+        entry.view.dag_consumed = vec![0, 1, 2, 3, 4, 5];
+        entry.view.dag_produced = vec![4, 5, 6];
         // Pointer wiring.
-        entry.meshlet_clusters[0].group_above_idx = 0;
-        entry.meshlet_clusters[1].group_above_idx = 0;
-        entry.meshlet_clusters[4].group_below_idx = 0;
-        entry.meshlet_clusters[2].group_above_idx = 1;
-        entry.meshlet_clusters[3].group_above_idx = 1;
-        entry.meshlet_clusters[5].group_below_idx = 1;
-        entry.meshlet_clusters[4].group_above_idx = 2;
-        entry.meshlet_clusters[5].group_above_idx = 2;
-        entry.meshlet_clusters[6].group_below_idx = 2;
+        entry.view.meshlet_clusters[0].group_above_idx = 0;
+        entry.view.meshlet_clusters[1].group_above_idx = 0;
+        entry.view.meshlet_clusters[4].group_below_idx = 0;
+        entry.view.meshlet_clusters[2].group_above_idx = 1;
+        entry.view.meshlet_clusters[3].group_above_idx = 1;
+        entry.view.meshlet_clusters[5].group_below_idx = 1;
+        entry.view.meshlet_clusters[4].group_above_idx = 2;
+        entry.view.meshlet_clusters[5].group_above_idx = 2;
+        entry.view.meshlet_clusters[6].group_below_idx = 2;
         entry
     }
 
@@ -1958,7 +1966,7 @@ mod tests {
         let mut entry = three_lod_connected_entry();
         let bmin = Vec3::splat(0.0);
         let bmax = Vec3::splat(1.5);
-        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        let marked = mark_lod_dirty_chains(&mut entry.view, &[0], bmin, bmax);
         assert_eq!(marked, 7, "single-root DAG → descent marks everything");
         assert_eq!(dirty_set(&entry), vec![0, 1, 2, 3, 4, 5, 6]);
     }
@@ -1983,7 +1991,7 @@ mod tests {
             cluster([5.0; 3], [7.0; 3], 2),  // 7 c2_y (root Y)
         ];
         let mut entry = make_entry(clusters, 8);
-        entry.dag_groups = vec![
+        entry.view.dag_groups = vec![
             // g0: consumed [c0_a, c0_b] produced [c1_x]
             DagGroup { consumed_first: 0, consumed_count: 2, produced_first: 0, produced_count: 1 },
             // g1: consumed [c0_c, c0_d] produced [c1_y]
@@ -1993,18 +2001,18 @@ mod tests {
             // g3: consumed [c1_y] produced [c2_y]
             DagGroup { consumed_first: 5, consumed_count: 1, produced_first: 3, produced_count: 1 },
         ];
-        entry.dag_consumed = vec![0, 1, 2, 3, 4, 5];
-        entry.dag_produced = vec![4, 5, 6, 7];
-        entry.meshlet_clusters[0].group_above_idx = 0;
-        entry.meshlet_clusters[1].group_above_idx = 0;
-        entry.meshlet_clusters[4].group_below_idx = 0;
-        entry.meshlet_clusters[2].group_above_idx = 1;
-        entry.meshlet_clusters[3].group_above_idx = 1;
-        entry.meshlet_clusters[5].group_below_idx = 1;
-        entry.meshlet_clusters[4].group_above_idx = 2;
-        entry.meshlet_clusters[6].group_below_idx = 2;
-        entry.meshlet_clusters[5].group_above_idx = 3;
-        entry.meshlet_clusters[7].group_below_idx = 3;
+        entry.view.dag_consumed = vec![0, 1, 2, 3, 4, 5];
+        entry.view.dag_produced = vec![4, 5, 6, 7];
+        entry.view.meshlet_clusters[0].group_above_idx = 0;
+        entry.view.meshlet_clusters[1].group_above_idx = 0;
+        entry.view.meshlet_clusters[4].group_below_idx = 0;
+        entry.view.meshlet_clusters[2].group_above_idx = 1;
+        entry.view.meshlet_clusters[3].group_above_idx = 1;
+        entry.view.meshlet_clusters[5].group_below_idx = 1;
+        entry.view.meshlet_clusters[4].group_above_idx = 2;
+        entry.view.meshlet_clusters[6].group_below_idx = 2;
+        entry.view.meshlet_clusters[5].group_above_idx = 3;
+        entry.view.meshlet_clusters[7].group_below_idx = 3;
         entry
     }
 
@@ -2020,7 +2028,7 @@ mod tests {
         let mut entry = multi_root_entry();
         let bmin = Vec3::splat(0.0);
         let bmax = Vec3::splat(1.5);
-        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        let marked = mark_lod_dirty_chains(&mut entry.view, &[0], bmin, bmax);
         assert_eq!(
             marked, 4,
             "narrow to chain X: c0_a + c0_b + c1_x + c2_x"
@@ -2044,7 +2052,7 @@ mod tests {
         let mut entry = multi_root_entry();
         let bmin = Vec3::splat(0.0);
         let bmax = Vec3::splat(0.5);  // Only touches c0_a, c1_x, c2_x.
-        let marked = mark_lod_dirty_chains(&mut entry, &[0], bmin, bmax);
+        let marked = mark_lod_dirty_chains(&mut entry.view, &[0], bmin, bmax);
         // Chain X: c0_a seed, c1_x + c2_x AABB-dirty, c0_b force-admitted
         // by descent through c1_x. Chain Y untouched.
         assert_eq!(marked, 4);
@@ -2122,7 +2130,7 @@ mod tests {
         coord: glam::UVec3,
     ) -> Option<u32> {
         use arvx_core::sparse_octree::{is_brick, is_leaf, leaf_slot, brick_id};
-        let node = entry.cpu_octree.lookup(coord)?;
+        let node = entry.model.cpu_octree.lookup(coord)?;
         if is_leaf(node) {
             return Some(leaf_slot(node));
         }

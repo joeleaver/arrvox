@@ -31,7 +31,7 @@ use arvx_core::asset_file::MeshSectionsBlob;
 use arvx_core::BakeArtifact;
 
 use super::manager::ArvxSceneManager;
-use super::types::{AssetEntry, AssetHandle, AssetInfo, MESH_INDEX_STRIDE};
+use super::types::{AssetEntry, AssetHandle, AssetInfo, MeshView, VoxelModel, MESH_INDEX_STRIDE};
 
 impl ArvxSceneManager {
     /// Integrate a `(BakeArtifact, MeshSectionsBlob)` pair produced by
@@ -316,42 +316,46 @@ impl ArvxSceneManager {
         let entry = AssetEntry {
             path: synthetic_path,
             refcount: 1,
-            spatial_handle: handle,
-            voxel_size,
-            aabb,
-            voxel_count: actual_cell_count,
-            leaf_attr_slot_start,
-            leaf_attr_slot_count: n_attrs,
-            brick_start,
-            brick_count: n_bricks,
-            skinning: None,
-            mesh_vertices,
-            mesh_indices,
-            mesh_indices_free_list: Vec::new(),
-            mesh_indices_next_free,
-            mesh_indices_dirty,
-            mesh_vertices_dirty,
-            mesh_lod0_index_count: mesh.lod0_index_count,
-            bake_time_cluster_count: meshlet_clusters.len() as u32,
-            meshlet_clusters,
-            dag_groups,
-            dag_consumed,
-            dag_produced,
-            cpu_octree: artifact.octree,
-            mesh_dirty: true,
-            clusters_dirty: true,
-            cluster_spatial_index,
-            sculpt_extra_slots: std::collections::HashSet::new(),
-            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
-            halo_extra_slots: std::collections::HashSet::new(),
-            halo_cells,
-            // Terrain tiles don't precompute a distinct-material set, so
-            // the engine falls back to the per-leaf walk for them (they're
-            // opaque, so that correctly reports no glass).
-            distinct_materials: None,
+            model: VoxelModel {
+                spatial_handle: handle,
+                voxel_size,
+                aabb,
+                voxel_count: actual_cell_count,
+                leaf_attr_slot_start,
+                leaf_attr_slot_count: n_attrs,
+                brick_start,
+                brick_count: n_bricks,
+                skinning: None,
+                cpu_octree: artifact.octree,
+                sculpt_extra_slots: std::collections::HashSet::new(),
+                sculpt_owned_slots: rustc_hash::FxHashSet::default(),
+                halo_extra_slots: std::collections::HashSet::new(),
+                halo_cells,
+                // Terrain tiles don't precompute a distinct-material set,
+                // so the engine falls back to the per-leaf walk for them
+                // (they're opaque, so that correctly reports no glass).
+                distinct_materials: None,
+            },
+            view: MeshView {
+                mesh_vertices,
+                mesh_indices,
+                mesh_indices_free_list: Vec::new(),
+                mesh_indices_next_free,
+                mesh_indices_dirty,
+                mesh_vertices_dirty,
+                mesh_lod0_index_count: mesh.lod0_index_count,
+                bake_time_cluster_count: meshlet_clusters.len() as u32,
+                meshlet_clusters,
+                dag_groups,
+                dag_consumed,
+                dag_produced,
+                mesh_dirty: true,
+                clusters_dirty: true,
+                cluster_spatial_index,
+            },
         };
 
-        let info = entry.info();
+        let info = entry.model.info();
         let asset_handle = self.asset_cache.insert(entry);
 
         if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
@@ -379,14 +383,14 @@ impl ArvxSceneManager {
     pub(super) fn asset_cache_get_index_count(&self, handle: AssetHandle) -> u32 {
         self.asset_cache
             .get(handle)
-            .map(|e| e.mesh_indices.len() as u32)
+            .map(|e| e.view.mesh_indices.len() as u32)
             .unwrap_or(0)
     }
 
     pub(super) fn asset_cache_get_cluster_count(&self, handle: AssetHandle) -> u32 {
         self.asset_cache
             .get(handle)
-            .map(|e| e.meshlet_clusters.len() as u32)
+            .map(|e| e.view.meshlet_clusters.len() as u32)
             .unwrap_or(0)
     }
 }

@@ -149,9 +149,9 @@ impl ArvxSceneManager {
         let live_entry = handle.and_then(|h| self.asset_cache.get(h));
         let (root_offset, depth, base_voxel_size) = match live_entry {
             Some(entry) => (
-                entry.spatial_handle.root_offset,
-                entry.spatial_handle.depth,
-                entry.spatial_handle.base_voxel_size,
+                entry.model.spatial_handle.root_offset,
+                entry.model.spatial_handle.depth,
+                entry.model.spatial_handle.base_voxel_size,
             ),
             None => match asset.spatial {
                 SpatialHandle::Octree { root_offset, depth, base_voxel_size, .. } => {
@@ -191,15 +191,15 @@ impl ArvxSceneManager {
         }
 
         // Validate slots against the live asset's allocated range +
-        // any sculpt-extended slots (kept in `entry.sculpt_extra_slots`
+        // any sculpt-extended slots (kept in `entry.model.sculpt_extra_slots`
         // — sculpt allocations whose IDs landed outside the bake-time
         // contiguous range). When `handle` is `None` we fall back to
         // the stale `asset` snapshot's range only.
         let (slot_lo, slot_hi, extra_slots) = match live_entry {
             Some(entry) => (
-                entry.leaf_attr_slot_start,
-                entry.leaf_attr_slot_start + entry.leaf_attr_slot_count,
-                Some(&entry.sculpt_extra_slots),
+                entry.model.leaf_attr_slot_start,
+                entry.model.leaf_attr_slot_start + entry.model.leaf_attr_slot_count,
+                Some(&entry.model.sculpt_extra_slots),
             ),
             None => (
                 asset.leaf_attr_slot_start,

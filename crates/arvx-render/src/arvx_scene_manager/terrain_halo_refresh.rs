@@ -138,15 +138,15 @@ impl ArvxSceneManager {
             // We hold the octree node slice by clone for the lookup loop;
             // brick / leaf-attr pools are shared so we keep refs via
             // self below.
-            let nodes = entry.cpu_octree.as_slice().to_vec();
-            let depth = entry.cpu_octree.depth();
-            let voxel_size = entry.cpu_octree.base_voxel_size();
-            ((nodes, depth, voxel_size), entry.brick_start, entry.leaf_attr_slot_start)
+            let nodes = entry.model.cpu_octree.as_slice().to_vec();
+            let depth = entry.model.cpu_octree.depth();
+            let voxel_size = entry.model.cpu_octree.base_voxel_size();
+            ((nodes, depth, voxel_size), entry.model.brick_start, entry.model.leaf_attr_slot_start)
         };
         let (source_nodes, source_depth, _source_voxel_size) = source_octree;
         let _ = source_brick_pool_offset; // brick refs in nodes are already scene-global
 
-        let target_depth = self.asset_cache.get(target)?.cpu_octree.depth();
+        let target_depth = self.asset_cache.get(target)?.model.cpu_octree.depth();
         debug_assert_eq!(
             source_depth, target_depth,
             "halo refresh assumes tiles share LOD level",
@@ -216,7 +216,7 @@ impl ArvxSceneManager {
         let target_attr_base = self
             .asset_cache
             .get(target)
-            .map(|e| (e.leaf_attr_slot_start, e.leaf_attr_slot_count))?;
+            .map(|e| (e.model.leaf_attr_slot_start, e.model.leaf_attr_slot_count))?;
         let target_lo = target_attr_base.0;
         let target_hi = target_lo + target_attr_base.1;
 
@@ -224,7 +224,7 @@ impl ArvxSceneManager {
         // target's existing entries, then iterate updates against it.
         let existing: std::collections::HashMap<IVec3, (usize, u32)> = {
             let entry = self.asset_cache.get(target)?;
-            entry
+            entry.model
                 .halo_cells
                 .iter()
                 .enumerate()
@@ -320,7 +320,7 @@ impl ArvxSceneManager {
             let target_halo: Vec<(IVec3, u32)> = self
                 .asset_cache
                 .get(target)
-                .map(|e| e.halo_cells.clone())
+                .map(|e| e.model.halo_cells.clone())
                 .unwrap_or_default();
             for (idx, source_slot) in &overwrite_at {
                 let Some((_coord, target_slot)) = target_halo.get(*idx) else { continue };
@@ -331,7 +331,7 @@ impl ArvxSceneManager {
                 } else if self
                     .asset_cache
                     .get(target)
-                    .map(|e| e.halo_extra_slots.contains(target_slot))
+                    .map(|e| e.model.halo_extra_slots.contains(target_slot))
                     .unwrap_or(false)
                 {
                     let attr = *self.leaf_attr_pool.get(*source_slot);
@@ -349,17 +349,17 @@ impl ArvxSceneManager {
         if let Some(entry) = self.asset_cache.get_mut(target) {
             if !drop_indices.is_empty() {
                 let mut keep: Vec<(IVec3, u32)> = Vec::with_capacity(
-                    entry.halo_cells.len().saturating_sub(drop_indices.len()),
+                    entry.model.halo_cells.len().saturating_sub(drop_indices.len()),
                 );
-                for (i, e) in entry.halo_cells.iter().enumerate() {
+                for (i, e) in entry.model.halo_cells.iter().enumerate() {
                     if !drop_indices.contains(&i) {
                         keep.push(*e);
                     }
                 }
-                entry.halo_cells = keep;
+                entry.model.halo_cells = keep;
             }
-            entry.halo_cells.extend(new_entries);
-            entry.halo_extra_slots.extend(new_extra_slots);
+            entry.model.halo_cells.extend(new_entries);
+            entry.model.halo_extra_slots.extend(new_extra_slots);
         }
 
         Some(changed)
@@ -450,13 +450,13 @@ impl ArvxSceneManager {
         // Resolve asset geometry config + build the slab change-region.
         let (depth, base_vs, grid_origin, region, slab_aabb_min_obj, slab_aabb_max_obj) = {
             let Some(entry) = self.asset_cache.get(handle) else { return };
-            if entry.meshlet_clusters.is_empty() {
+            if entry.view.meshlet_clusters.is_empty() {
                 return;
             }
-            let depth = entry.spatial_handle.depth;
-            let base_vs = entry.spatial_handle.base_voxel_size;
+            let depth = entry.model.spatial_handle.depth;
+            let base_vs = entry.model.spatial_handle.base_voxel_size;
             let extent_f = (1u32 << depth) as f32 * base_vs;
-            let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+            let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
             let grid_origin = aabb_center - Vec3::splat(extent_f * 0.5);
 
             let s = 1i32 << depth;
@@ -495,7 +495,7 @@ impl ArvxSceneManager {
             let cells_lo = region.extract_lo - IVec3::splat(3);
             let cells_hi = region.extract_hi + IVec3::splat(3);
             let cells = collect_cell_map_in_region(
-                entry.cpu_octree.as_slice(),
+                entry.model.cpu_octree.as_slice(),
                 depth,
                 self.brick_pool.as_slice(),
                 cells_lo,
@@ -507,15 +507,15 @@ impl ArvxSceneManager {
                 &cells,
                 region.extract_lo,
                 region.extract_hi,
-                entry.cpu_octree.as_slice(),
+                entry.model.cpu_octree.as_slice(),
                 depth,
                 base_vs,
                 grid_origin,
                 self.brick_pool.as_slice(),
                 self.leaf_attr_pool.as_slice(),
                 self.leaf_attr_pool.bones_as_slice(),
-                &entry.halo_cells,
-                Some(&entry.sculpt_owned_slots),
+                &entry.model.halo_cells,
+                Some(&entry.model.sculpt_owned_slots),
                 None::<&fn(glam::Vec3) -> f32>,
             );
             (verts, indices, cells_count)
@@ -534,7 +534,7 @@ impl ArvxSceneManager {
         let _walk_visited = if !dirty.is_empty() {
             let Some(entry) = self.asset_cache.get_mut(handle) else { return };
             super::sculpt::mark_lod_dirty_chains(
-                entry,
+                &mut entry.view,
                 &dirty,
                 slab_aabb_min_obj,
                 slab_aabb_max_obj,
@@ -547,8 +547,8 @@ impl ArvxSceneManager {
         // at the `apply_halo_refresh` call site, mirroring the
         // sculpt path.
         if let Some(entry) = self.asset_cache.get_mut(handle) {
-            entry.mesh_dirty = true;
-            entry.clusters_dirty = true;
+            entry.view.mesh_dirty = true;
+            entry.view.clusters_dirty = true;
         }
 
         if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
@@ -579,17 +579,17 @@ impl ArvxSceneManager {
 
         let (depth, voxel_size, grid_origin, halo_cells) = {
             let Some(entry) = self.asset_cache.get(handle) else { return; };
-            let depth = entry.spatial_handle.depth;
-            let voxel_size = entry.spatial_handle.base_voxel_size;
+            let depth = entry.model.spatial_handle.depth;
+            let voxel_size = entry.model.spatial_handle.base_voxel_size;
             let extent = (1u32 << depth) as f32 * voxel_size;
-            let aabb_center = (entry.aabb.min + entry.aabb.max) * 0.5;
+            let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
             let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
-            (depth, voxel_size, grid_origin, entry.halo_cells.clone())
+            (depth, voxel_size, grid_origin, entry.model.halo_cells.clone())
         };
 
         let (vertices, indices_unc) = {
             let entry = self.asset_cache.get(handle).expect("just confirmed above");
-            let nodes = entry.cpu_octree.as_slice();
+            let nodes = entry.model.cpu_octree.as_slice();
             extract_surface_mesh_haloed(
                 nodes,
                 depth,
@@ -606,21 +606,21 @@ impl ArvxSceneManager {
                 // keep their material/colour against neighbour
                 // halo cells (which always carry the procedural
                 // material).
-                Some(&entry.sculpt_owned_slots),
+                Some(&entry.model.sculpt_owned_slots),
             )
         };
 
         if vertices.is_empty() {
             if let Some(entry) = self.asset_cache.get_mut(handle) {
-                entry.mesh_vertices.clear();
-                entry.mesh_indices.clear();
-                entry.meshlet_clusters.clear();
-                entry.bake_time_cluster_count = 0;
-                entry.mesh_lod0_index_count = 0;
-                entry.reset_mesh_indices_slab();
-                entry.mesh_dirty = true;
-                entry.clusters_dirty = true;
-                entry.cluster_spatial_index =
+                entry.view.mesh_vertices.clear();
+                entry.view.mesh_indices.clear();
+                entry.view.meshlet_clusters.clear();
+                entry.view.bake_time_cluster_count = 0;
+                entry.view.mesh_lod0_index_count = 0;
+                entry.view.reset_mesh_indices_slab();
+                entry.view.mesh_dirty = true;
+                entry.view.clusters_dirty = true;
+                entry.view.cluster_spatial_index =
                     super::cluster_spatial_index::ClusterSpatialIndex::new();
             }
             return;
@@ -635,34 +635,34 @@ impl ArvxSceneManager {
         let mesh_lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
 
         let Some(entry) = self.asset_cache.get_mut(handle) else { return; };
-        entry.mesh_vertices = vertices;
-        entry.mesh_indices = dag.indices;
-        entry.meshlet_clusters = dag.clusters;
-        entry.bake_time_cluster_count = entry.meshlet_clusters.len() as u32;
-        entry.mesh_lod0_index_count = mesh_lod0_index_count;
-        entry.reset_mesh_indices_slab();
+        entry.view.mesh_vertices = vertices;
+        entry.view.mesh_indices = dag.indices;
+        entry.view.meshlet_clusters = dag.clusters;
+        entry.view.bake_time_cluster_count = entry.view.meshlet_clusters.len() as u32;
+        entry.view.mesh_lod0_index_count = mesh_lod0_index_count;
+        entry.view.reset_mesh_indices_slab();
         // Full re-extract — mirror the IBO reset on the VBO side so the
         // upload doesn't carry stale prefix bytes.
-        entry.mesh_vertices_dirty.clear();
-        let vbo_bytes = (entry.mesh_vertices.len()
+        entry.view.mesh_vertices_dirty.clear();
+        let vbo_bytes = (entry.view.mesh_vertices.len()
             * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
             as u32;
         if vbo_bytes > 0 {
-            entry.mesh_vertices_dirty.mark_full(vbo_bytes);
+            entry.view.mesh_vertices_dirty.mark_full(vbo_bytes);
         }
-        entry.mesh_dirty = true;
-        entry.clusters_dirty = true;
-        entry
+        entry.view.mesh_dirty = true;
+        entry.view.clusters_dirty = true;
+        entry.view
             .cluster_spatial_index
-            .rebuild(&entry.meshlet_clusters, grid_origin, voxel_size);
+            .rebuild(&entry.view.meshlet_clusters, grid_origin, voxel_size);
 
         if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
             eprintln!(
                 "[halo-refresh] mesh re-extract handle={:?} verts={} indices={} clusters={} ({:.2}ms)",
                 handle,
-                entry.mesh_vertices.len(),
-                entry.mesh_indices.len(),
-                entry.meshlet_clusters.len(),
+                entry.view.mesh_vertices.len(),
+                entry.view.mesh_indices.len(),
+                entry.view.meshlet_clusters.len(),
                 t0.elapsed().as_secs_f64() * 1000.0,
             );
         }
@@ -1005,7 +1005,7 @@ mod tests {
     #[test]
     fn rebuild_face_band_clusters_bails_on_empty_clusters() {
         use crate::arvx_scene_manager::manager::ArvxSceneManager;
-        use crate::arvx_scene_manager::types::AssetEntry;
+        use crate::arvx_scene_manager::types::{AssetEntry, MeshView, VoxelModel};
         use arvx_core::sparse_octree::SparseOctree;
         use arvx_core::{Aabb, OctreeHandle};
 
@@ -1016,52 +1016,56 @@ mod tests {
         let entry = AssetEntry {
             path: std::path::PathBuf::from("test:empty-tile"),
             refcount: 1,
-            spatial_handle: OctreeHandle {
-                root_offset: 0,
-                len: 0,
-                depth,
-                base_voxel_size: base_vs,
+            model: VoxelModel {
+                spatial_handle: OctreeHandle {
+                    root_offset: 0,
+                    len: 0,
+                    depth,
+                    base_voxel_size: base_vs,
+                },
+                voxel_size: base_vs,
+                aabb: Aabb {
+                    min: Vec3::ZERO,
+                    max: Vec3::splat(extent),
+                },
+                voxel_count: 0,
+                leaf_attr_slot_start: 0,
+                leaf_attr_slot_count: 0,
+                brick_start: 0,
+                brick_count: 0,
+                skinning: None,
+                cpu_octree: SparseOctree::new(depth, base_vs),
+                sculpt_extra_slots: std::collections::HashSet::new(),
+                sculpt_owned_slots: rustc_hash::FxHashSet::default(),
+                halo_extra_slots: std::collections::HashSet::new(),
+                halo_cells: Vec::new(),
+                distinct_materials: None,
             },
-            voxel_size: base_vs,
-            aabb: Aabb {
-                min: Vec3::ZERO,
-                max: Vec3::splat(extent),
+            view: MeshView {
+                mesh_vertices: Vec::new(),
+                mesh_indices: Vec::new(),
+                mesh_indices_free_list: Vec::new(),
+                mesh_indices_next_free: 0,
+                mesh_indices_dirty: arvx_core::DirtyRanges::new(),
+                mesh_vertices_dirty: arvx_core::DirtyRanges::new(),
+                mesh_lod0_index_count: 0,
+                bake_time_cluster_count: 0,
+                meshlet_clusters: Vec::new(),
+                dag_groups: Vec::new(),
+                dag_consumed: Vec::new(),
+                dag_produced: Vec::new(),
+                mesh_dirty: false,
+                clusters_dirty: false,
+                cluster_spatial_index:
+                    crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
             },
-            voxel_count: 0,
-            leaf_attr_slot_start: 0,
-            leaf_attr_slot_count: 0,
-            brick_start: 0,
-            brick_count: 0,
-            skinning: None,
-            mesh_vertices: Vec::new(),
-            mesh_indices: Vec::new(),
-            mesh_indices_free_list: Vec::new(),
-            mesh_indices_next_free: 0,
-            mesh_indices_dirty: arvx_core::DirtyRanges::new(),
-            mesh_vertices_dirty: arvx_core::DirtyRanges::new(),
-            mesh_lod0_index_count: 0,
-            bake_time_cluster_count: 0,
-            meshlet_clusters: Vec::new(),
-            dag_groups: Vec::new(),
-            dag_consumed: Vec::new(),
-            dag_produced: Vec::new(),
-            cpu_octree: SparseOctree::new(depth, base_vs),
-            sculpt_extra_slots: std::collections::HashSet::new(),
-            sculpt_owned_slots: rustc_hash::FxHashSet::default(),
-            halo_extra_slots: std::collections::HashSet::new(),
-            halo_cells: Vec::new(),
-            mesh_dirty: false,
-            clusters_dirty: false,
-            cluster_spatial_index:
-                crate::arvx_scene_manager::cluster_spatial_index::ClusterSpatialIndex::new(),
-            distinct_materials: None,
         };
         let handle = sm.asset_cache.insert(entry);
 
         // Should be a no-op: no clusters to filter, no panic.
         sm.rebuild_face_band_clusters(handle, FACE_PX);
         let entry = sm.asset_cache.get(handle).expect("entry should still exist");
-        assert!(entry.meshlet_clusters.is_empty());
-        assert!(!entry.mesh_dirty, "no-op refresh should leave mesh_dirty unset");
+        assert!(entry.view.meshlet_clusters.is_empty());
+        assert!(!entry.view.mesh_dirty, "no-op refresh should leave mesh_dirty unset");
     }
 }
