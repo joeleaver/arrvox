@@ -27,7 +27,8 @@
 use glam::{Affine3A, IVec3, Vec3};
 
 use arvx_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aabb};
-use arvx_core::mesh_cluster::{MeshletCluster, PARENT_GROUP_ERROR_ROOT};
+
+use super::remesh_region::{RemeshFilter, RemeshRegion};
 use arvx_core::mesh_extract::{
     collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
     extract_surface_mesh, MeshVertex,
@@ -985,7 +986,10 @@ impl ArvxSceneManager {
         // the apply_sculpt_brush phase timings; written into the
         // `[sculpt] V2 patch` log line at the end.
         let mut _p_setup_ms = 0.0;
-        let mut _p_dirty_query_ms = 0.0;
+        // Dirty-query time is now folded into the filter phase (the
+        // shared `remesh_filter_dirty_clusters` does both); kept in the
+        // log line as 0.0 for format stability.
+        let _p_dirty_query_ms = 0.0;
         let mut _p_filter_ms = 0.0;
         let mut _p_extract_ms = 0.0;
         let mut _p_append_patch_ms = 0.0;
@@ -1023,209 +1027,55 @@ impl ArvxSceneManager {
             return false;
         }
         _p_setup_ms = _ph_t0.elapsed().as_secs_f64() * 1000.0;
-        let _ph_t1 = std::time::Instant::now();
+        let _ph_t2 = std::time::Instant::now();
 
-        let dirty = self.clusters_in_brush_grid_aabb(handle, brush_lo, brush_hi);
-        _p_dirty_query_ms = _ph_t1.elapsed().as_secs_f64() * 1000.0;
+        // ── Phases 1–3: query dirty clusters + drop stale tris ────────
+        //
+        // **Carve / Deflate / Smooth / ClayStrip filter; Raise / Inflate
+        // keep all.** The brush-sphere filter drops every triangle with
+        // a vertex inside the sphere — correct when those cells are
+        // being emptied (Carve / Deflate: the original surface is gone)
+        // or re-meshed with updated normals (Smooth re-extracts every
+        // brush-region tri against the just-updated LeafAttrPool normals;
+        // without the drop the stale-normal originals would render over
+        // the patch and "Smooth does nothing"). The Phase-4 patch
+        // re-extracts the whole sphere and SN re-emits the surviving
+        // surface, so dropping cells that aren't actually emptied is
+        // safe.
+        //
+        // Raise / Inflate only ADD cells, so the original ground
+        // geometry under the brush stays a valid post-stamp surface —
+        // `KeepAll` skips the filter entirely (no per-cluster work, no
+        // IBO writes). An unconditional filter here would delete the
+        // ground tris under a Raise dome, leaving a hole the SN
+        // re-extract can't refill (SOLID↔INTERIOR cubes have no EMPTY
+        // corner and emit no surface).
+        //
+        // The shared `remesh_filter_dirty_clusters` owns the dirty
+        // query, the rayon per-triangle filter (incl. the closest-point
+        // sphere-AABB cluster reject), and the in-place merge + slab
+        // free-tail. The `RemeshFilter` selected here is the single
+        // authority for which tris a brush drops — see
+        // `arvx_scene_manager::remesh_region`.
+        let filter = if matches!(
+            op.mode,
+            BrushMode::Carve | BrushMode::Deflate | BrushMode::Smooth | BrushMode::ClayStrip
+        ) {
+            RemeshFilter::SphereTouch {
+                center: brush_center_local,
+                radius_sq: brush_radius_sq,
+            }
+        } else {
+            RemeshFilter::KeepAll
+        };
+        let region = RemeshRegion::brush(brush_lo, brush_hi, filter);
+        let (dirty, filter_stats) = self.remesh_filter_dirty_clusters(handle, &region);
         if dirty.is_empty() {
             return false;
         }
-        let _ph_t2 = std::time::Instant::now();
-
-        // ── Phase 1: filter each dirty cluster's tris ─────────────────
-        //
-        // **Carve and Deflate filter; Raise and Inflate skip.** The
-        // filter drops every tri with at least one vertex inside the
-        // brush sphere — correct when those cells are being emptied
-        // (the original surface is gone) and safe for cells inside
-        // the sphere that *aren't* emptied because the patch in
-        // Phase 3 re-extracts the whole region and SN re-emits their
-        // surface tris.
-        //
-        // For Raise / Inflate we skip the filter entirely: neither
-        // removes any SOLID / INTERIOR cells, so the original ground
-        // geometry under the brush is still a valid post-stamp
-        // surface. The patch contributes the new dome / puffed layer
-        // *on top of* the original geometry; the z-buffer handles
-        // the visual overlap. Pre-fix, an unconditional filter
-        // deleted the ground tris under a Raise stamp, leaving a
-        // visible hole beneath the dome (the post-stamp SN
-        // re-extract can't replace them — SOLID↔INTERIOR cubes have
-        // no EMPTY corner and emit no surface).
-        //
-        // The Deflate-specific subtlety: the kernel only erodes a
-        // falloff-shaped region inside the brush sphere, so cells
-        // at the brush rim (target_thickness ≈ 0) keep their pre-
-        // stamp Solid state. Filtering drops their tris too — that's
-        // OK because those cells *still* have an Empty neighbour
-        // post-stamp (the cells above them haven't changed), so SN
-        // re-emits their tris in the patch. Without filtering Deflate
-        // the original tris in the eroded region survive and z-fight
-        // with the new cavity-wall tris from the patch, producing
-        // the "scattered cyan over original surface" artifact users
-        // saw before this fix.
-        //
-        // Walk each cluster's existing tris; keep only those with ALL
-        // three verts strictly outside the brush sphere. Write the kept
-        // indices BACK INTO the cluster's existing slot (in-place) and
-        // return the unused tail of that slot to the slab allocator's
-        // free list. Old behaviour was a tail-append that orphaned the
-        // entire pre-filter range — every stamp grew `mesh_indices`
-        // monotonically until the GPU buffer hit `max_buffer_size`.
-        // See `project_sculpt_mesh_indices_slab_allocator`.
-        //
-        // Reading `mesh_vertices[idx]` is safe alongside the in-place
-        // index writes: the per-cluster filter is read-only on
-        // `mesh_indices` and the writes happen in a sequential merge
-        // step below.
-        //
-        // **D1 — cluster-AABB → brush-sphere rejection.** `clusters_in_
-        // brush_grid_aabb` returns every LOD-0 cluster whose grid AABB
-        // overlaps the brush AABB. A box-vs-box test admits clusters
-        // whose AABB corners touch the brush box but whose closest
-        // point to the brush *sphere* center is still outside the
-        // sphere — every triangle in those clusters would survive the
-        // per-tri test below. Pre-D1 the loop ran the per-tri test
-        // anyway: 80+ clusters × ~3000 tris × 3 length_squared = ~700k
-        // float ops/stamp on splat5 elephant. D1 short-circuits each
-        // sphere-outside cluster to a single `extend_from_slice` of
-        // its original indices — saves the per-tri loop entirely
-        // for those clusters. Sphere-inside clusters still run the
-        // per-tri test (some of their tris may be inside the sphere).
-        // D2 — parallelize the filter across dirty clusters.
-        //
-        // Each cluster's tri filter is independent: it reads its own
-        // slice of `mesh_indices` + indexed `mesh_vertices`, produces
-        // a `Vec<u32>` of kept indices. Step 1 fans this out across
-        // rayon's pool; step 2 walks the results in-order and appends
-        // each kept vec to the tail of `mesh_indices`, assigning new
-        // `index_offset` / `index_count` on the cluster.
-        //
-        // Order preservation: rayon's `into_par_iter().map(...).collect()`
-        // preserves input order, so the sequential merge below applies
-        // results in the same order the pre-D2 serial loop did.
-        //
-        // The merge can't be parallelized — it mutates a single
-        // `mesh_indices` Vec and each step's `new_offset` depends on
-        // the previous step's growth. That's fine: the per-cluster
-        // tri filter dominates wall-clock by ~3 orders of magnitude
-        // over the `extend_from_slice` tail append.
-        use rayon::prelude::*;
-
-        // D1 telemetry — atomic so each rayon worker can bump it
-        // without contention concerns.
-        let d1_counter = std::sync::atomic::AtomicUsize::new(0);
-
-        // Both Carve and Deflate remove cells; the filter is correct
-        // for them. Raise and Inflate add cells without removing any,
-        // so their original tris stay valid: skip the filter entirely
-        // and leave every cluster's slot untouched. Slab allocator
-        // bonus — no per-cluster work, no IBO writes, no dirty marks.
-        // Smooth joins the filter side because its patch in Phase 3
-        // re-extracts every brush-region tri with the *current*
-        // (just-updated) LeafAttrPool normals. Without the filter the
-        // original cluster's tris stay in place with their stale
-        // normals and the patch's updated normals end up rendered on
-        // top of (or instead of) them — the user-visible symptom is
-        // "Smooth does nothing". Carve and Deflate already need the
-        // same drop-and-replace dance; Smooth shares the mechanism
-        // without changing occupancy.
-        let needs_filter =
-            matches!(op.mode, BrushMode::Carve | BrushMode::Deflate | BrushMode::Smooth | BrushMode::ClayStrip);
-        let results: Vec<(u32, Vec<u32>)> = if needs_filter {
-            let Some(entry) = self.asset_cache.get(handle) else { return false; };
-            let clusters = &entry.meshlet_clusters;
-            let indices = &entry.mesh_indices;
-            let verts = &entry.mesh_vertices;
-            dirty
-                .par_iter()
-                .filter_map(|&cid| {
-                    let c = &clusters[cid as usize];
-                    let start = c.index_offset as usize;
-                    let count = c.index_count as usize;
-                    let cluster_aabb_min = Vec3::from(c.aabb_min);
-                    let cluster_aabb_max = Vec3::from(c.aabb_max);
-
-                    // Sphere-AABB rejection (D1): closest point on
-                    // the cluster's AABB to the brush center. If it's
-                    // outside the brush sphere, no tri in this
-                    // cluster can have a vertex inside — leave the
-                    // cluster's slot untouched.
-                    let closest = brush_center_local
-                        .clamp(cluster_aabb_min, cluster_aabb_max);
-                    let aabb_dist_sq = (closest - brush_center_local).length_squared();
-                    if aabb_dist_sq > brush_radius_sq {
-                        d1_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return None;
-                    }
-
-                    let mut out = Vec::with_capacity(count);
-                    for tri_start in (start..start + count).step_by(3) {
-                        let i0 = indices[tri_start];
-                        let i1 = indices[tri_start + 1];
-                        let i2 = indices[tri_start + 2];
-                        let p0 = Vec3::from(verts[i0 as usize].local_pos);
-                        let p1 = Vec3::from(verts[i1 as usize].local_pos);
-                        let p2 = Vec3::from(verts[i2 as usize].local_pos);
-                        let d0 = (p0 - brush_center_local).length_squared();
-                        let d1 = (p1 - brush_center_local).length_squared();
-                        let d2 = (p2 - brush_center_local).length_squared();
-                        if d0 > brush_radius_sq
-                            && d1 > brush_radius_sq
-                            && d2 > brush_radius_sq
-                        {
-                            out.push(i0);
-                            out.push(i1);
-                            out.push(i2);
-                        }
-                    }
-                    Some((cid, out))
-                })
-                .collect()
-        } else {
-            // Raise / Inflate: nothing to filter. The atomic counter
-            // would normally fire once per cluster; bump it by the full
-            // dirty set so the `[sculpt] V2 patch` log line stays
-            // truthful about how many clusters short-circuited.
-            d1_counter.fetch_add(dirty.len(), std::sync::atomic::Ordering::Relaxed);
-            Vec::new()
-        };
-        let d1_clusters_sphere_outside =
-            d1_counter.load(std::sync::atomic::Ordering::Relaxed);
-
-        // Sequential merge — write each cluster's kept indices BACK
-        // INTO its original slot, then return the freed tail to the
-        // slab allocator. The kept list is a strict subset of the
-        // original tris (filter only drops), so it always fits in the
-        // pre-filter range `[index_offset, index_offset + index_count)`.
-        let mut total_kept_tris = 0usize;
-        let mut total_dropped_tris = 0usize;
-        {
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            for (cid, kept) in results {
-                let old_offset = entry.meshlet_clusters[cid as usize].index_offset;
-                let old_count = entry.meshlet_clusters[cid as usize].index_count;
-                let new_count = kept.len() as u32;
-                total_kept_tris += (new_count as usize) / 3;
-                total_dropped_tris += ((old_count - new_count) as usize) / 3;
-
-                // In-place write at the existing offset, then return
-                // the (potentially empty) tail to the free list.
-                if new_count > 0 {
-                    entry.mesh_indices_write_at(old_offset, &kept);
-                }
-                if new_count < old_count {
-                    entry.free_index_range(old_offset + new_count, old_count - new_count);
-                }
-                let cluster = &mut entry.meshlet_clusters[cid as usize];
-                cluster.index_count = new_count;
-                // `index_offset` stays the same — in-place write keeps
-                // the cluster anchored at its original slot.
-                // AABB stays at the cluster's pre-stamp bounds — the
-                // kept tris are a subset of the original, so they fit
-                // inside the original AABB. Shrinking is left to R5.
-            }
-        }
+        let d1_clusters_sphere_outside = filter_stats.clusters_rejected;
+        let total_kept_tris = filter_stats.kept_tris;
+        let total_dropped_tris = filter_stats.dropped_tris;
 
         _p_filter_ms = _ph_t2.elapsed().as_secs_f64() * 1000.0;
         let _ph_t3 = std::time::Instant::now();
@@ -1300,99 +1150,13 @@ impl ArvxSceneManager {
         let _ph_t4 = std::time::Instant::now();
 
         // ── Phase 3: append brush region as a new LOD-0 patch cluster ─
-        if !brush_verts.is_empty() {
-            let mut patch_aabb_min = [f32::INFINITY; 3];
-            let mut patch_aabb_max = [f32::NEG_INFINITY; 3];
-            for v in &brush_verts {
-                for k in 0..3 {
-                    if v.local_pos[k] < patch_aabb_min[k] {
-                        patch_aabb_min[k] = v.local_pos[k];
-                    }
-                    if v.local_pos[k] > patch_aabb_max[k] {
-                        patch_aabb_max[k] = v.local_pos[k];
-                    }
-                }
-            }
-
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            let vertex_offset = entry.mesh_vertices.len() as u32;
-            let append_start_bytes = (vertex_offset as usize
-                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
-                as u32;
-            entry.mesh_vertices.extend_from_slice(&brush_verts);
-            // Mark the appended range as dirty so the renderer uploads
-            // just the new tail. (For terrain integrate the whole VBO
-            // is marked full-dirty instead; the dirty-range mechanism
-            // serves both cases uniformly.)
-            let append_len_bytes = (brush_verts.len()
-                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
-                as u32;
-            if append_len_bytes > 0 {
-                entry
-                    .mesh_vertices_dirty
-                    .mark(append_start_bytes, append_len_bytes);
-            }
-
-            // Slab-allocate the patch's index range. If a prior stamp
-            // freed a slot ≥ this size, we reuse it (interior write);
-            // otherwise the bump pointer extends, which is the same
-            // as the pre-slab tail-append behaviour. Indices need
-            // `vertex_offset` rebased into the asset's global vertex
-            // range before writing.
-            let patch_index_count = brush_indices.len() as u32;
-            let new_index_offset = if patch_index_count > 0 {
-                let offset = entry.alloc_index_range(patch_index_count);
-                // Build the rebased indices in a temp buffer (sized
-                // for the patch — typically a few hundred), then commit
-                // them to the slab in one mark+copy.
-                let rebased: Vec<u32> = brush_indices
-                    .iter()
-                    .map(|&i| i + vertex_offset)
-                    .collect();
-                entry.mesh_indices_write_at(offset, &rebased);
-                offset
-            } else {
-                // Defensive: extractor produced verts but no tris (no
-                // SN-cube admitted any triangle this stamp). Cluster
-                // gets index_count=0 → no draw, no slab consumption.
-                0
-            };
-
-            let patch_cluster = MeshletCluster {
-                aabb_min: patch_aabb_min,
-                _pad0: 0.0,
-                aabb_max: patch_aabb_max,
-                index_offset: new_index_offset,
-                index_count: patch_index_count,
-                lod_level: 0,
-                // Patch cluster is born already-dirty so it admits
-                // unconditionally on the next render (its position
-                // wasn't in the original DAG so Karis would otherwise
-                // have nothing to project against).
-                flags: arvx_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY,
-                cluster_error: 0.0,
-                parent_group_error: PARENT_GROUP_ERROR_ROOT,
-                // Patch cluster is appended after the bake-time DAG;
-                // it has no group on either side. CC walks from
-                // brush-touched LOD-0 clusters don't traverse through
-                // it, which is correct — the patch is standalone-dirty
-                // and force-admits unconditionally.
-                group_above_idx: arvx_core::mesh_cluster::DAG_GROUP_NONE,
-                group_below_idx: arvx_core::mesh_cluster::DAG_GROUP_NONE,
-                _pad3: 0,
-            };
-            // D7 — record the new cluster's id and insert it into
-            // the spatial index so the next stamp's `dirty_q` query
-            // finds it.
-            let patch_cluster_id = entry.meshlet_clusters.len() as u32;
-            entry.meshlet_clusters.push(patch_cluster);
-            entry.cluster_spatial_index.insert(
-                patch_cluster_id,
-                &patch_cluster,
-                grid_origin,
-                base_vs,
-            );
-        }
+        // Shared with the stroke + terrain-band paths via
+        // `append_remesh_patch`: extend the VBO (marking the appended
+        // tail dirty), slab-allocate + rebase the IBO range, push the
+        // born-dirty standalone patch cluster, and index it spatially so
+        // the next stamp's dirty query finds it. No-op when the extract
+        // produced no verts.
+        self.append_remesh_patch(handle, &brush_verts, &brush_indices, grid_origin, base_vs);
 
         _p_append_patch_ms = _ph_t4.elapsed().as_secs_f64() * 1000.0;
         let _ph_t5 = std::time::Instant::now();
@@ -1732,62 +1496,23 @@ impl ArvxSceneManager {
 
         // ── Step 3: filter bake-time clusters inside the union AABB ──
         // The stroke patch re-extracts the entire union AABB, so any
-        // bake-time tris inside it are redundant. Filter by AABB (not
-        // stroke tube) to avoid circular per-stamp artifacts.
+        // bake-time tri *fully inside* it is redundant. Boundary-
+        // straddling tris are kept — the `BoxContain` predicate — so the
+        // seam to untouched geometry stays welded (filtering by AABB,
+        // not the stroke tube, avoids circular per-stamp artifacts). The
+        // shared `remesh_filter_dirty_clusters` owns the query + rayon
+        // filter + in-place merge.
         let filter_min = grid_origin + union_lo.as_vec3() * base_vs;
         let filter_max = grid_origin + union_hi.as_vec3() * base_vs;
-        let dirty = self.clusters_in_brush_grid_aabb(handle, union_lo, union_hi);
-        if !dirty.is_empty() {
-            use rayon::prelude::*;
-            let results: Vec<(u32, Vec<u32>)> = {
-                let Some(entry) = self.asset_cache.get(handle) else { return false; };
-                let clusters = &entry.meshlet_clusters;
-                let indices = &entry.mesh_indices;
-                let verts = &entry.mesh_vertices;
-                dirty
-                    .par_iter()
-                    .filter_map(|&cid| {
-                        let c = &clusters[cid as usize];
-                        let start = c.index_offset as usize;
-                        let count = c.index_count as usize;
-                        if count == 0 { return None; }
-                        let mut out = Vec::with_capacity(count);
-                        for tri_start in (start..start + count).step_by(3) {
-                            let i0 = indices[tri_start];
-                            let i1 = indices[tri_start + 1];
-                            let i2 = indices[tri_start + 2];
-                            let p0 = Vec3::from(verts[i0 as usize].local_pos);
-                            let p1 = Vec3::from(verts[i1 as usize].local_pos);
-                            let p2 = Vec3::from(verts[i2 as usize].local_pos);
-                            let in_aabb = |p: Vec3| -> bool {
-                                p.x >= filter_min.x && p.x <= filter_max.x
-                                    && p.y >= filter_min.y && p.y <= filter_max.y
-                                    && p.z >= filter_min.z && p.z <= filter_max.z
-                            };
-                            if !in_aabb(p0) || !in_aabb(p1) || !in_aabb(p2) {
-                                out.push(i0);
-                                out.push(i1);
-                                out.push(i2);
-                            }
-                        }
-                        Some((cid, out))
-                    })
-                    .collect()
-            };
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            for (cid, kept) in results {
-                let old_offset = entry.meshlet_clusters[cid as usize].index_offset;
-                let old_count = entry.meshlet_clusters[cid as usize].index_count;
-                let new_count = kept.len() as u32;
-                if new_count > 0 {
-                    entry.mesh_indices_write_at(old_offset, &kept);
-                }
-                if new_count < old_count {
-                    entry.free_index_range(old_offset + new_count, old_count - new_count);
-                }
-                entry.meshlet_clusters[cid as usize].index_count = new_count;
-            }
-        }
+        let region = RemeshRegion::stroke_union(
+            union_lo,
+            union_hi,
+            RemeshFilter::BoxContain {
+                min: filter_min,
+                max: filter_max,
+            },
+        );
+        let (dirty, _filter_stats) = self.remesh_filter_dirty_clusters(handle, &region);
 
         // ── Step 4: extract mesh over the union AABB ──
         let cells_min = union_lo - IVec3::splat(3);
@@ -1842,72 +1567,13 @@ impl ArvxSceneManager {
         self.splat_relaxed_normals_to_pool(&stroke_verts);
 
         // ── Step 6: append as unified patch cluster ──
-        if !stroke_verts.is_empty() {
-            let mut patch_aabb_min = [f32::INFINITY; 3];
-            let mut patch_aabb_max = [f32::NEG_INFINITY; 3];
-            for v in &stroke_verts {
-                for k in 0..3 {
-                    if v.local_pos[k] < patch_aabb_min[k] {
-                        patch_aabb_min[k] = v.local_pos[k];
-                    }
-                    if v.local_pos[k] > patch_aabb_max[k] {
-                        patch_aabb_max[k] = v.local_pos[k];
-                    }
-                }
-            }
-
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            let vertex_offset = entry.mesh_vertices.len() as u32;
-            let append_start_bytes = (vertex_offset as usize
-                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
-                as u32;
-            entry.mesh_vertices.extend_from_slice(&stroke_verts);
-            let append_len_bytes = (stroke_verts.len()
-                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
-                as u32;
-            if append_len_bytes > 0 {
-                entry
-                    .mesh_vertices_dirty
-                    .mark(append_start_bytes, append_len_bytes);
-            }
-
-            let patch_index_count = stroke_indices.len() as u32;
-            let new_index_offset = if patch_index_count > 0 {
-                let offset = entry.alloc_index_range(patch_index_count);
-                let rebased: Vec<u32> = stroke_indices
-                    .iter()
-                    .map(|&i| i + vertex_offset)
-                    .collect();
-                entry.mesh_indices_write_at(offset, &rebased);
-                offset
-            } else {
-                0
-            };
-
-            let patch_cluster = MeshletCluster {
-                aabb_min: patch_aabb_min,
-                _pad0: 0.0,
-                aabb_max: patch_aabb_max,
-                index_offset: new_index_offset,
-                index_count: patch_index_count,
-                lod_level: 0,
-                flags: arvx_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY,
-                cluster_error: 0.0,
-                parent_group_error: PARENT_GROUP_ERROR_ROOT,
-                group_above_idx: arvx_core::mesh_cluster::DAG_GROUP_NONE,
-                group_below_idx: arvx_core::mesh_cluster::DAG_GROUP_NONE,
-                _pad3: 0,
-            };
-            let patch_cluster_id = entry.meshlet_clusters.len() as u32;
-            entry.meshlet_clusters.push(patch_cluster);
-            entry.cluster_spatial_index.insert(
-                patch_cluster_id,
-                &patch_cluster,
-                grid_origin,
-                base_vs,
-            );
-
-            // Record the new cluster for replacement on next stamp.
+        // Shared `append_remesh_patch` builds the born-dirty standalone
+        // patch cluster (VBO extend + dirty-mark, slab IBO alloc +
+        // rebase, spatial insert). Record the new patch id so the next
+        // stamp in this stroke replaces it (Step 2).
+        if let Some(patch_cluster_id) =
+            self.append_remesh_patch(handle, &stroke_verts, &stroke_indices, grid_origin, base_vs)
+        {
             if let Some(stroke) = self.sculpt_stroke_extracts.get_mut(&handle) {
                 stroke.stroke_patch_cluster_ids.clear();
                 stroke.stroke_patch_cluster_ids.push(patch_cluster_id);

@@ -396,7 +396,15 @@ impl EngineState {
                     target: target_handle,
                     target_face: neighbour_face,
                     source: source_handle,
-                    skip_remesh: touched_keys.contains(&neighbour_key),
+                    // The neighbour was also sculpted this stamp →
+                    // re-extract the whole tile so the halo refresh welds
+                    // with the existing sculpt patch instead of dropping
+                    // its tris.
+                    scope: if touched_keys.contains(&neighbour_key) {
+                        arvx_render::RemeshScope::FullAsset
+                    } else {
+                        arvx_render::RemeshScope::FaceBand
+                    },
                 });
             }
         }

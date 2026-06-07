@@ -18,9 +18,6 @@ use std::collections::HashSet;
 use glam::{IVec3, UVec3, Vec3};
 
 use arvx_core::brick_pool::{BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
-use arvx_core::mesh_cluster::{
-    MeshletCluster, CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE, PARENT_GROUP_ERROR_ROOT,
-};
 use arvx_core::mesh_extract::{
     collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
     extract_surface_mesh_haloed, CELL_INTERIOR,
@@ -30,6 +27,7 @@ use arvx_core::sparse_octree::{brick_id, is_brick, is_leaf, leaf_slot, EMPTY_NOD
 use arvx_core::LeafAttr;
 
 use super::manager::ArvxSceneManager;
+use super::remesh_region::{RemeshRegion, RemeshScope};
 use super::types::AssetHandle;
 
 /// Face index in `arvx_core::mesh_extract::FACE_DIRS` order.
@@ -64,13 +62,13 @@ pub struct HaloRefresh {
     /// Asset handle of the tile whose interior provides the new data
     /// (the sculpted tile).
     pub source: AssetHandle,
-    /// When true, refresh the halo cell data but skip the slab
-    /// re-mesh (`rebuild_face_band_clusters`). Set for targets that
-    /// were ALSO sculpted this stamp — their mesh was already updated
-    /// by `rebuild_dirty_clusters`, and a second re-mesh via the slab
-    /// path would drop the sculpt patch tris (the slab's filter region
-    /// is wider than its extract region).
-    pub skip_remesh: bool,
+    /// How much of the target tile to re-mesh after refreshing its halo
+    /// cells. [`RemeshScope::FullAsset`] is set for targets that were
+    /// ALSO sculpted this stamp — their mesh was already updated by the
+    /// sculpt path, and the narrow face-band slab's wider filter region
+    /// would drop the sculpt patch tris, so a full haloed re-extract
+    /// welds both edits instead.
+    pub scope: RemeshScope,
 }
 
 /// Resolved cell state for a single source coord. `Interior` means
@@ -97,17 +95,17 @@ impl ArvxSceneManager {
 
         let changed = self.refresh_halo_face(op.target, op.target_face, op.source)?;
         if changed > 0 {
-            if op.skip_remesh {
-                // Target was also sculpted this stamp —
-                // `rebuild_dirty_clusters` already updated its mesh at
-                // the brush footprint, but that mesh was built against
-                // the PRE-refresh halo. A full re-extract incorporates
-                // both the sculpt edits AND the updated halo cells in
-                // one pass. The slab path can't be used here because
-                // its wider filter region would destroy the sculpt
-                // patch tris without re-emitting them.
-                self.rebuild_asset_mesh_haloed(op.target);
-            } else if std::env::var("ARVX_TERRAIN_HALO_FULL_REEXTRACT").is_ok() {
+            // `FullAsset`: target was also sculpted this stamp — the
+            // sculpt path already updated its mesh at the brush
+            // footprint, but against the PRE-refresh halo. A full
+            // re-extract incorporates both the sculpt edits AND the
+            // updated halo cells in one pass; the face-band slab can't
+            // be used here because its wider filter region would destroy
+            // the sculpt patch tris without re-emitting them. The env
+            // override forces the same full path for debugging.
+            let full = matches!(op.scope, RemeshScope::FullAsset)
+                || std::env::var("ARVX_TERRAIN_HALO_FULL_REEXTRACT").is_ok();
+            if full {
                 self.rebuild_asset_mesh_haloed(op.target);
             } else {
                 self.rebuild_face_band_clusters(op.target, op.target_face);
@@ -449,18 +447,8 @@ impl ArvxSceneManager {
     fn rebuild_face_band_clusters(&mut self, handle: AssetHandle, target_face: u8) {
         let t0 = std::time::Instant::now();
 
-        // Resolve asset geometry config + slab corners.
-        let (
-            depth,
-            base_vs,
-            grid_origin,
-            extract_lo,
-            extract_hi,
-            filter_lo,
-            filter_hi,
-            slab_aabb_min_obj,
-            slab_aabb_max_obj,
-        ) = {
+        // Resolve asset geometry config + build the slab change-region.
+        let (depth, base_vs, grid_origin, region, slab_aabb_min_obj, slab_aabb_max_obj) = {
             let Some(entry) = self.asset_cache.get(handle) else { return };
             if entry.meshlet_clusters.is_empty() {
                 return;
@@ -475,117 +463,37 @@ impl ArvxSceneManager {
             let (extract_lo, extract_hi, filter_lo, filter_hi) =
                 slab_grid_for_face(target_face, s);
 
-            // Obj-local AABB for the per-vertex filter test. filter_lo /
-            // filter_hi are in cube coords; a vertex from SN cube `C`
-            // has position in `[C, C+1) * vs + grid_origin`, so the
-            // inclusive AABB `[filter_lo * vs + grid_origin,
-            // filter_hi * vs + grid_origin]` catches every vertex
-            // whose source cube is in the cube range `[filter_lo,
-            // filter_hi)`.
+            // Obj-local slab AABB — drives both the `RemeshRegion`'s
+            // per-triangle box filter and the LOD-dirty CC walk below.
+            // filter_lo / filter_hi are in cube coords; a vertex from SN
+            // cube `C` lives in `[C, C+1) * vs + grid_origin`, so the
+            // inclusive AABB catches every vertex whose source cube is in
+            // `[filter_lo, filter_hi)`.
             let slab_min = grid_origin + filter_lo.as_vec3() * base_vs;
             let slab_max = grid_origin + filter_hi.as_vec3() * base_vs;
 
-            (
-                depth, base_vs, grid_origin, extract_lo, extract_hi,
-                filter_lo, filter_hi, slab_min, slab_max,
-            )
+            let region = RemeshRegion::face_band(
+                extract_lo, extract_hi, filter_lo, filter_hi, grid_origin, base_vs,
+            );
+            (depth, base_vs, grid_origin, region, slab_min, slab_max)
         };
 
-        // Phase 1: query LOD-0 clusters overlapping the slab.
-        let dirty = self.clusters_in_brush_grid_aabb(handle, filter_lo, filter_hi);
+        // Phases 1–3: query the dirty clusters overlapping the slab and
+        // drop the stale boundary triangles (`BoxTouch` predicate), all
+        // in the shared executor.
+        let (dirty, stats) = self.remesh_filter_dirty_clusters(handle, &region);
 
-        // Phase 2: rayon-parallel per-tri filter on dirty clusters.
-        // Drops tris with any vertex inside the slab AABB; kept tris
-        // get rewritten in-place at the cluster's existing slot.
-        let results: Vec<(u32, Vec<u32>)> = if dirty.is_empty() {
-            Vec::new()
-        } else {
-            use rayon::prelude::*;
-            let Some(entry) = self.asset_cache.get(handle) else { return };
-            let clusters = &entry.meshlet_clusters;
-            let indices = &entry.mesh_indices;
-            let verts = &entry.mesh_vertices;
-            dirty
-                .par_iter()
-                .filter_map(|&cid| {
-                    let c = &clusters[cid as usize];
-                    let start = c.index_offset as usize;
-                    let count = c.index_count as usize;
-                    // Cluster-AABB rejection: skip clusters whose AABB
-                    // is fully outside the slab AABB. Mirrors the
-                    // sphere-AABB rejection in sculpt's V2 patch.
-                    let cluster_aabb_min = Vec3::from(c.aabb_min);
-                    let cluster_aabb_max = Vec3::from(c.aabb_max);
-                    if cluster_aabb_max.x < slab_aabb_min_obj.x
-                        || cluster_aabb_min.x > slab_aabb_max_obj.x
-                        || cluster_aabb_max.y < slab_aabb_min_obj.y
-                        || cluster_aabb_min.y > slab_aabb_max_obj.y
-                        || cluster_aabb_max.z < slab_aabb_min_obj.z
-                        || cluster_aabb_min.z > slab_aabb_max_obj.z
-                    {
-                        return None;
-                    }
-
-                    let inside = |p: Vec3| -> bool {
-                        p.x >= slab_aabb_min_obj.x
-                            && p.x <= slab_aabb_max_obj.x
-                            && p.y >= slab_aabb_min_obj.y
-                            && p.y <= slab_aabb_max_obj.y
-                            && p.z >= slab_aabb_min_obj.z
-                            && p.z <= slab_aabb_max_obj.z
-                    };
-
-                    let mut out = Vec::with_capacity(count);
-                    for tri_start in (start..start + count).step_by(3) {
-                        let i0 = indices[tri_start];
-                        let i1 = indices[tri_start + 1];
-                        let i2 = indices[tri_start + 2];
-                        let p0 = Vec3::from(verts[i0 as usize].local_pos);
-                        let p1 = Vec3::from(verts[i1 as usize].local_pos);
-                        let p2 = Vec3::from(verts[i2 as usize].local_pos);
-                        if !inside(p0) && !inside(p1) && !inside(p2) {
-                            out.push(i0);
-                            out.push(i1);
-                            out.push(i2);
-                        }
-                    }
-                    Some((cid, out))
-                })
-                .collect()
-        };
-
-        // Phase 3: sequential merge — write each cluster's kept indices
-        // back in-place at its original slot, return the freed tail to
-        // the slab allocator.
-        let mut total_dropped_tris = 0usize;
-        let mut total_kept_tris = 0usize;
-        {
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return };
-            for (cid, kept) in &results {
-                let cluster = &entry.meshlet_clusters[*cid as usize];
-                let old_offset = cluster.index_offset;
-                let old_count = cluster.index_count;
-                let new_count = kept.len() as u32;
-                total_kept_tris += (new_count as usize) / 3;
-                total_dropped_tris += ((old_count - new_count) as usize) / 3;
-                if new_count > 0 {
-                    entry.mesh_indices_write_at(old_offset, kept);
-                }
-                if new_count < old_count {
-                    entry.free_index_range(old_offset + new_count, old_count - new_count);
-                }
-                entry.meshlet_clusters[*cid as usize].index_count = new_count;
-            }
-        }
-
-        // Phase 4: re-extract slab region.
+        // Phase 4: re-extract the slab region. (Terrain does NOT splat
+        // ∇D normals into the pool — the band refresh only welds the
+        // halo seam; it doesn't re-derive the interior normals the way
+        // the sculpt paths do.)
         let (slab_verts, slab_indices, cells_count) = {
             let Some(entry) = self.asset_cache.get(handle) else { return };
             // Pad collect by +3 each side so the extractor's pad gets
             // boundary cells for 8-corner classification (mirrors
             // sculpt.rs's `cells_min = brush_lo - IVec3::splat(3)`).
-            let cells_lo = extract_lo - IVec3::splat(3);
-            let cells_hi = extract_hi + IVec3::splat(3);
+            let cells_lo = region.extract_lo - IVec3::splat(3);
+            let cells_hi = region.extract_hi + IVec3::splat(3);
             let cells = collect_cell_map_in_region(
                 entry.cpu_octree.as_slice(),
                 depth,
@@ -597,8 +505,8 @@ impl ArvxSceneManager {
             let (verts, indices) = extract_mesh_region_from_cells_pooled_haloed(
                 &mut self.sculpt_extract_scratch,
                 &cells,
-                extract_lo,
-                extract_hi,
+                region.extract_lo,
+                region.extract_hi,
                 entry.cpu_octree.as_slice(),
                 depth,
                 base_vs,
@@ -613,80 +521,10 @@ impl ArvxSceneManager {
             (verts, indices, cells_count)
         };
 
-        // Phase 5: append slab as a fresh LOD-0 patch cluster.
-        let patch_indices_count = slab_indices.len();
+        // Phase 5: append the slab as a fresh LOD-0 patch cluster.
         let patch_verts_count = slab_verts.len();
-        if !slab_verts.is_empty() {
-            let mut patch_min = [f32::INFINITY; 3];
-            let mut patch_max = [f32::NEG_INFINITY; 3];
-            for v in &slab_verts {
-                for k in 0..3 {
-                    if v.local_pos[k] < patch_min[k] {
-                        patch_min[k] = v.local_pos[k];
-                    }
-                    if v.local_pos[k] > patch_max[k] {
-                        patch_max[k] = v.local_pos[k];
-                    }
-                }
-            }
-
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return };
-            let vertex_offset = entry.mesh_vertices.len() as u32;
-            let append_start_bytes = (vertex_offset as usize
-                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
-                as u32;
-            entry.mesh_vertices.extend_from_slice(&slab_verts);
-            let append_len_bytes = (slab_verts.len()
-                * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
-                as u32;
-            if append_len_bytes > 0 {
-                entry
-                    .mesh_vertices_dirty
-                    .mark(append_start_bytes, append_len_bytes);
-            }
-
-            let patch_index_count = slab_indices.len() as u32;
-            let new_index_offset = if patch_index_count > 0 {
-                let offset = entry.alloc_index_range(patch_index_count);
-                let rebased: Vec<u32> = slab_indices
-                    .iter()
-                    .map(|&i| i + vertex_offset)
-                    .collect();
-                entry.mesh_indices_write_at(offset, &rebased);
-                offset
-            } else {
-                0
-            };
-
-            let patch_cluster = MeshletCluster {
-                aabb_min: patch_min,
-                _pad0: 0.0,
-                aabb_max: patch_max,
-                index_offset: new_index_offset,
-                index_count: patch_index_count,
-                lod_level: 0,
-                // Born dirty — the patch is outside the bake-time DAG
-                // so the LOD selector's Karis admit has nothing to
-                // project against. Force unconditional admit.
-                flags: CLUSTER_FLAG_LOD_DIRTY,
-                cluster_error: 0.0,
-                parent_group_error: PARENT_GROUP_ERROR_ROOT,
-                // Standalone — no DAG chain. CC walks from
-                // brush-touched LOD-0 clusters don't traverse through
-                // it, which is correct.
-                group_above_idx: DAG_GROUP_NONE,
-                group_below_idx: DAG_GROUP_NONE,
-                _pad3: 0,
-            };
-            let patch_cluster_id = entry.meshlet_clusters.len() as u32;
-            entry.meshlet_clusters.push(patch_cluster);
-            entry.cluster_spatial_index.insert(
-                patch_cluster_id,
-                &patch_cluster,
-                grid_origin,
-                base_vs,
-            );
-        }
+        let patch_indices_count = slab_indices.len();
+        self.append_remesh_patch(handle, &slab_verts, &slab_indices, grid_origin, base_vs);
 
         // Phase 6: CC-walk LOD_DIRTY marking over slab AABB. Forces
         // the LOD selector to drop dirty ancestors and admit dirty
@@ -722,8 +560,8 @@ impl ArvxSceneManager {
                 target_face,
                 dirty.len(),
                 cells_count,
-                total_kept_tris,
-                total_dropped_tris,
+                stats.kept_tris,
+                stats.dropped_tris,
                 patch_verts_count,
                 patch_indices_count,
                 t0.elapsed().as_secs_f64() * 1000.0,
