@@ -32,6 +32,7 @@ import package::lib::types::ArvxInstance;
 import package::lib::types::ArvxAsset;
 import package::lib::types::OverlayEntry;
 import package::lib::types::OctreeResult;
+import package::lib::types::is_glass;
 import package::lib::oct_normal::unpack_oct_normal;
 import package::lib::leaf_attr::fetch_leaf_attr_for;
 import package::lib::leaf_attr::is_leaf_removed;
@@ -430,17 +431,17 @@ fn frag_main(in: VsOut) -> FsOut {
     let attr = fetch_leaf_attr_for(inst, in.leaf_attr_id);
     let mat_id = attr.material_packed & 0xFFFFu;
     // Bounds-check the material lookup. WGSL OOB array reads return
-    // a zero `GpuMaterial` whose `opacity` is `0.0 < 0.99`, which
-    // would cause the fragment to discard as if it were glass — the
-    // pixel falls through to the dark background and shows up as a
-    // thin black ring at painted-region boundaries on assets whose
-    // leaves point at material slots outside the project's loaded
-    // palette. Clamp OOB ids to slot 0 (default material) so those
-    // fragments stay in the opaque path.
+    // a zero `GpuMaterial` whose `opacity` is below the glass
+    // threshold, which would cause the fragment to discard as if it
+    // were glass — the pixel falls through to the dark background and
+    // shows up as a thin black ring at painted-region boundaries on
+    // assets whose leaves point at material slots outside the
+    // project's loaded palette. Clamp OOB ids to slot 0 (default
+    // material) so those fragments stay in the opaque path.
     let mat_id_safe = select(
         mat_id, 0u, mat_id >= arrayLength(&materials),
     );
-    if materials[mat_id_safe].opacity < 0.99 {
+    if is_glass(materials[mat_id_safe].opacity) {
         discard;
     }
 

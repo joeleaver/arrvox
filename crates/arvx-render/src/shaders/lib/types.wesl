@@ -127,6 +127,29 @@ fn mat_albedo(m: GpuMaterial) -> vec3<f32> {
     return vec3<f32>(m.albedo_r, m.albedo_g, m.albedo_b);
 }
 
+// ──────────────────────────────────────────────────────────────────
+// Glass classification — single authority
+// ──────────────────────────────────────────────────────────────────
+//
+// A surface voxel is "glass" iff its material opacity is below this
+// threshold. This one rule decides every glass-dependent branch in
+// the pipeline: the opaque mesh raster discards glass fragments, the
+// glass front/back pass keeps them, the shadow passes mirror the
+// split, and `arvx_glass` renormalises opacity over `[0, THRESHOLD)`.
+//
+// Do NOT hand-spell `opacity < 0.99` anywhere — call `is_glass`. The
+// one deliberate exception is the glass FS in `mesh_glass.wesl`, which
+// reads a debug-overridable *uniform* threshold (so
+// `ARVX_MESH_GLASS_DEBUG_FORCE=2` can force every fragment to glass);
+// that uniform's default is the CPU mirror of this constant.
+//
+// CPU mirror: `arvx_render::glass::{GLASS_OPACITY_THRESHOLD, is_glass}`.
+const GLASS_OPACITY_THRESHOLD: f32 = 0.99;
+
+fn is_glass(opacity: f32) -> bool {
+    return opacity < GLASS_OPACITY_THRESHOLD;
+}
+
 // Light record (64 bytes). CPU-side mirror is `arvx_shade::GpuLight`.
 //
 // `position.w`     light type — 0 = directional, 1 = point, 2 = spot.

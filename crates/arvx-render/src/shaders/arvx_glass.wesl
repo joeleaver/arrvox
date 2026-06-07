@@ -25,6 +25,7 @@ import package::lib::pbr::fresnel_schlick_f0;
 import package::lib::pbr::beer_absorption;
 import package::lib::types::GpuMaterial;
 import package::lib::types::mat_albedo;
+import package::lib::types::GLASS_OPACITY_THRESHOLD;
 import package::lib::types::CameraUniforms;
 import package::lib::types::GpuLight;
 import package::lib::types::ShadeParams;
@@ -135,10 +136,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // by zero.
     let glass_roughness = clamp(gm.roughness, 0.04, 1.0);
     let glass_metallic = clamp(gm.metallic, 0.0, 1.0);
-    // The march classifies anything with opacity < 0.99 as glass, so
-    // within the glass regime `opacity` lives on [0, 0.99). Renormalise
-    // to [0, 1] so the slider covers its full range visually.
-    let glass_opacity = clamp(gm.opacity / 0.99, 0.0, 1.0);
+    // Glass is `opacity < GLASS_OPACITY_THRESHOLD`, so within the
+    // glass regime `opacity` lives on [0, GLASS_OPACITY_THRESHOLD).
+    // Renormalise to [0, 1] so the slider covers its full range
+    // visually.
+    let glass_opacity = clamp(gm.opacity / GLASS_OPACITY_THRESHOLD, 0.0, 1.0);
 
     // Reconstruct this pixel's world-space ray direction.
     let uv = (vec2<f32>(gid.xy) + 0.5) / dims_f;

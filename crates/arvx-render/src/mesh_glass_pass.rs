@@ -11,7 +11,8 @@
 //! 1. **Front raster** (`MeshGlassPass::front_pipeline`) — `cull = Back`,
 //!    `depth_compare = Less`. One indexed draw per glass-bearing
 //!    instance. The FS reads `leaf_attr_pool[leaf_attr_id].material`
-//!    and `discard`s on `opacity ≥ 0.99`. Otherwise writes
+//!    and `discard`s opaque fragments (the non-`is_glass` complement).
+//!    Otherwise writes
 //!    `(oct_normal, material_id, bitcast<u32>(entry_dist), 0)` to
 //!    `glass_entry_packed` (Rgba32Uint).
 //!
@@ -76,7 +77,7 @@ pub struct CombineParams {
 const _: () = assert!(std::mem::size_of::<CombineParams>() == 16);
 
 /// CPU mirror of `mesh_glass.wesl`'s `GlassFsParams` uniform — the
-/// FS discard threshold. Production = 0.99 (matches the march).
+/// FS discard threshold. Production value = [`DEFAULT_OPACITY_THRESHOLD`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlassFsParams {
@@ -88,9 +89,11 @@ pub struct GlassFsParams {
 
 const _: () = assert!(std::mem::size_of::<GlassFsParams>() == 16);
 
-/// Default FS opacity threshold — same as the march's
-/// `m_opacity >= 0.99` glass classification.
-pub const DEFAULT_OPACITY_THRESHOLD: f32 = 0.99;
+/// Default FS opacity threshold — the production value the glass FS
+/// uses unless `ARVX_MESH_GLASS_DEBUG_FORCE=2` overrides it. Derived
+/// from the single glass-classification authority so it can never
+/// drift from [`crate::is_glass`].
+pub const DEFAULT_OPACITY_THRESHOLD: f32 = crate::glass::GLASS_OPACITY_THRESHOLD;
 
 pub struct MeshGlassPass {
     /// Front-face raster (entry packing).

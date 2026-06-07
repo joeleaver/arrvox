@@ -24,6 +24,7 @@ import package::lib::types::LeafAttr;
 import package::lib::types::GpuMaterial;
 import package::lib::types::ArvxInstance;
 import package::lib::types::OverlayEntry;
+import package::lib::types::is_glass;
 import package::lib::leaf_attr::fetch_leaf_attr_for;
 import package::lib::leaf_attr::is_leaf_removed;
 
@@ -196,7 +197,7 @@ fn frag_main(in: VsOut) {
     let mat_id_safe = select(
         mat_id, 0u, mat_id >= arrayLength(&materials),
     );
-    if materials[mat_id_safe].opacity < 0.99 {
+    if is_glass(materials[mat_id_safe].opacity) {
         discard;
     }
 }

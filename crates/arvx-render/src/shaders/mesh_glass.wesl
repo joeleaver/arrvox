@@ -14,10 +14,15 @@
 // `gbuf_glass` (Rg32Uint) with the same layout as the march writes.
 //
 // Both FSs read `leaf_attr_pool[leaf_attr_id]` for the cell's normal +
-// material, then `materials[material_id]` to gate `discard` on
-// `opacity >= 0.99`. This mirrors the march's classification and lets
-// the same shader run over every mesh instance — no per-instance
-// glass filter is required for correctness, only for perf.
+// material, then `materials[material_id]` to gate `discard` on the
+// glass classification (`opacity < threshold`, see
+// `lib/types.wesl::is_glass`). This pass reads the threshold from a
+// debug-overridable *uniform* (`fs_params.opacity_threshold`, default
+// = `GLASS_OPACITY_THRESHOLD`) rather than the const, so
+// `ARVX_MESH_GLASS_DEBUG_FORCE=2` can force every fragment to glass.
+// Running over every mesh instance is correct unconditionally — a
+// per-instance glass filter is a perf optimisation, not a correctness
+// requirement.
 
 import package::lib::types::CameraUniforms;
 import package::lib::types::LeafAttr;
@@ -121,7 +126,8 @@ fn bucket_lod_exit(level: u32) {}
 
 struct GlassFsParams {
     /// Opacity gate. A material with `opacity >= opacity_threshold`
-    /// is classified as opaque (FS discards). The march uses 0.99;
+    /// is classified as opaque (FS discards) — the inverse of
+    /// `is_glass`. Default = `GLASS_OPACITY_THRESHOLD`;
     /// `ARVX_MESH_GLASS_DEBUG_FORCE=2` raises this above 1.0 so every
     /// fragment classifies as glass — bisects "leaf lookup wrong"
     /// vs "discard threshold wrong" vs "FS never runs".
@@ -345,7 +351,8 @@ struct GlassClass {
 //      overlay first, falling back to `leaf_attr_pool[slot]` — the
 //      same path the march and shadow trace take, so painted-glass
 //      and asset-pool-glass both classify identically.
-//   2. `materials[material_primary].opacity < 0.99` ⇒ glass;
+//   2. `is_glass(materials[material_primary].opacity)` (evaluated
+//      against the overridable `fs_params.opacity_threshold`) ⇒ glass;
 //      otherwise return the discard sentinel.
 // `instance.object_id` doubles as the instance-array index — the
 // mesh raster writes the slot index into `object_id` and

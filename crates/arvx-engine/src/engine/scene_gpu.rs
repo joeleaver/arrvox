@@ -58,7 +58,7 @@ impl EngineState {
                 .map(|id| {
                     self.material_lib
                         .get_def(id as u16)
-                        .map(|d| d.opacity < 0.99)
+                        .map(|d| arvx_render::is_glass(d.opacity))
                         .unwrap_or(false)
                 })
                 .collect();

@@ -23,6 +23,7 @@ import package::lib::types::LeafAttr;
 import package::lib::types::GpuMaterial;
 import package::lib::types::ArvxInstance;
 import package::lib::types::OverlayEntry;
+import package::lib::types::is_glass;
 import package::lib::leaf_attr::fetch_leaf_attr_for;
 import package::lib::leaf_attr::is_leaf_removed;
 
@@ -175,13 +176,15 @@ fn frag_main(in: VsOut) {
     let attr = fetch_leaf_attr_for(inst, in.leaf_attr_id);
     let mat_id = attr.material_packed & 0xFFFFu;
     // OOB-safe lookup — same rationale as `mesh.wesl`. OOB reads
-    // produce a zero `GpuMaterial.opacity` which is `< 0.99`, so
-    // without the clamp those fragments would *survive* the
-    // glass-pass discard and pollute the glass shadow depth.
+    // produce a zero `GpuMaterial.opacity` (below the glass
+    // threshold), so without the clamp those fragments would
+    // *survive* the glass-pass discard and pollute the glass shadow
+    // depth. This pass keeps only glass, so it discards the opaque
+    // (non-`is_glass`) complement.
     let mat_id_safe = select(
         mat_id, 0u, mat_id >= arrayLength(&materials),
     );
-    if materials[mat_id_safe].opacity >= 0.99 {
+    if !is_glass(materials[mat_id_safe].opacity) {
         discard;
     }
 }

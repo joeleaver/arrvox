@@ -5,6 +5,10 @@
 //! PBR shading, CSM shadows, atmosphere/volumetrics, and post-process
 //! (bloom, tone mapping, glass composite, wireframe overlay).
 
+/// Glass classification authority (`is_glass` / `GLASS_OPACITY_THRESHOLD`).
+pub mod glass;
+pub use glass::{is_glass, GLASS_OPACITY_THRESHOLD};
+
 /// `0xFFFFFFFFu`-as-sentinel constants shared with WGSL.
 pub mod sentinels;
 /// GPU device/queue wrapper.

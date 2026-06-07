@@ -428,9 +428,10 @@ pub(crate) struct EngineState {
     pub(crate) sculpt_overlays:
         std::collections::HashMap<hecs::Entity, arvx_core::SculptOverlay>,
 
-    /// Per-material flag — `true` if the material's `opacity < 0.99`
-    /// (i.e., classified as glass by the march and the mesh-mode
-    /// glass passes). Indexed by material id. Rebuilt from the
+    /// Per-material flag — `true` if the material classifies as glass
+    /// per [`arvx_render::is_glass`] (the single glass authority, shared
+    /// with the mesh-mode glass passes). Indexed by material id.
+    /// Rebuilt from the
     /// material library at the start of `update_scene_gpu` whenever
     /// `material_glass_lib_epoch` doesn't match the library's
     /// current state. Used to compute `MeshDraw.has_glass`.
