@@ -294,8 +294,15 @@ impl EngineState {
                 self.scene_dirty.mark_entity(entity);
                 self.selected_entity = Some(entity);
                 self.init_terrain_runtime(entity);
+                let workers = self
+                    .terrain
+                    .as_ref()
+                    .map(|r| r.streamer.worker_count())
+                    .unwrap_or(0);
+                let radius = arvx_terrain::Terrain::default().render_radius_m;
                 self.console.info(format!(
-                    "Spawned '{name}' — streamer running with 2 workers, render radius 192 m"
+                    "Spawned '{name}' — streamer running with {workers} bake worker(s), \
+                     render radius {radius:.0} m"
                 ));
             }
 

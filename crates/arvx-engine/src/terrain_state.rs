@@ -78,12 +78,33 @@ pub struct TerrainRuntime {
 }
 
 impl TerrainRuntime {
-    /// Construct a fresh runtime with default worker pool sizing
-    /// (2 workers, 2 in-flight).
+    /// Bake-worker pool size for the terrain streamer, chosen to leave
+    /// the editor's main/present thread, the render worker, and the
+    /// engine sim with CPU headroom during a cold generation — when all
+    /// of them plus the bake workers compete, the present thread gets
+    /// starved, the Wayland surface goes Outdated, and (with rinch #42
+    /// unpatched) the viewport dies ("surface lost").
+    ///
+    /// Reserve 3 logical cores (present + render + sim) and cap at 2 so
+    /// this only ever *reduces* the pool on constrained machines (≤4
+    /// cores → 1); typical dev machines keep the historical 2. Bigger
+    /// pools aren't worth it now that bakes are cheap (analytic-slope +
+    /// O(1) face-links) — extra workers would only add per-tile integrate
+    /// pressure on the sim thread. Falls back to 1 if the core count is
+    /// unavailable.
+    pub fn bake_worker_count() -> usize {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        cores.saturating_sub(3).clamp(1, 2)
+    }
+
+    /// Construct a fresh runtime. Worker pool sized by
+    /// [`Self::bake_worker_count`]; 2 in-flight bakes.
     pub fn new(terrain_entity: hecs::Entity) -> Self {
         Self {
             terrain_entity,
-            streamer: TileStreamer::new(2, 2),
+            streamer: TileStreamer::new(Self::bake_worker_count(), 2),
             live_tiles: HashMap::new(),
             tile_keys: HashMap::new(),
             dirty_tiles: HashSet::new(),
@@ -138,6 +159,17 @@ mod tests {
         // Entity::DANGLING is fine for runtime state we don't tick;
         // these tests cover diff bookkeeping only.
         TerrainRuntime::new(hecs::Entity::DANGLING)
+    }
+
+    /// The adaptive bake-worker pool stays in `[1, 2]` regardless of core
+    /// count: it reserves cores for present/render/sim (so it can only
+    /// *reduce* on constrained machines) and never exceeds the historical
+    /// 2. A fresh runtime's streamer reflects it.
+    #[test]
+    fn bake_worker_count_is_clamped() {
+        let n = TerrainRuntime::bake_worker_count();
+        assert!((1..=2).contains(&n), "worker count {n} out of [1, 2]");
+        assert_eq!(make_runtime().streamer.worker_count(), n);
     }
 
     fn add(coord: UVec3) -> LeafEdit {
