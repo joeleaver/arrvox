@@ -610,6 +610,9 @@ pub fn build_mesh_sections_blob_density_haloed(
             halo,
             // Bake-time extract: no sculpt history yet.
             None,
+            // Distance pool wired in Stage 5 (terrain default flip); the
+            // binary import bake stays on legacy surface nets.
+            &[],
         );
     if vertices.is_empty() || indices_unclustered.is_empty() {
         return MeshSectionsBlob::default();

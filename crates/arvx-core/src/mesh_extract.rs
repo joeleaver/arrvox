@@ -29,6 +29,7 @@ pub type CellMap = FxHashMap<IVec3, u32>;
 use crate::brick_pool::{BRICK_CELLS, BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
 use crate::companion::BoneVoxel;
 use crate::leaf_attr::{pack_oct, unpack_oct, LeafAttr};
+use crate::leaf_attr_pool::LeafAttrPool;
 use crate::sparse_octree::{
     brick_id, is_branch, is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE,
 };
@@ -564,8 +565,8 @@ pub fn set_qef_hermite(on: bool) {
 }
 
 /// Whether the QEF-Hermite path is force-selected on this thread.
-// Wired into the extractor in Stage 2 — `allow` drops then.
-#[allow(dead_code)]
+/// Read by [`extract_surface_mesh_haloed_impl`]; combined with a non-empty
+/// distance pool it selects QEF-Hermite over the blur/binary placement.
 #[inline]
 pub(crate) fn qef_hermite_enabled() -> bool {
     QEF_HERMITE.with(|c| c.get())
@@ -841,6 +842,9 @@ pub fn extract_surface_mesh_haloed(
         // Binary path (imports): NO plane-fit (the blur rounds sharp
         // edges; imports need the binary surface nets unchanged).
         0.0,
+        // No per-leaf distance on the import path yet → legacy binary
+        // surface nets (Stage 2 gates QEF on the terrain bake only).
+        &[],
     )
 }
 
@@ -874,6 +878,11 @@ pub fn extract_surface_mesh_density_haloed(
     halo_cells: &[(IVec3, u32)],
     halo: u32,
     sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
+    // Per-slot signed-distance pool (voxel units), indexed like
+    // `leaf_attr_pool`. With the QEF toggle set + a non-empty slice, the
+    // tile meshes via QEF-Hermite (smooth-by-construction) instead of the
+    // blur path. `&[]` keeps the legacy blur behaviour bit-identical.
+    dists: &[i16],
 ) -> (Vec<MeshVertex>, Vec<u32>) {
     extract_surface_mesh_haloed_impl(
         octree_nodes,
@@ -892,6 +901,7 @@ pub fn extract_surface_mesh_density_haloed(
         // tiles stay watertight. A thread-local override (`set_wide_window
         // _project`) can force it off for the bench baseline.
         TERRAIN_PLANE_FIT_RADIUS,
+        dists,
     )
 }
 
@@ -927,9 +937,24 @@ fn extract_surface_mesh_haloed_impl(
     // ½ voxel of the nominal tile faces, derived from the octree extent)
     // is pinned so adjacent tiles stay watertight.
     plane_fit_default_radius: f32,
+    // Per-slot signed-distance pool (voxel units), indexed exactly like
+    // `leaf_attr_pool`. Non-empty + the thread-local QEF toggle selects
+    // the QEF-Hermite mesher (Stage 2 bench gate; Stage 5 makes presence
+    // alone the production gate). Empty keeps the legacy blur/binary path.
+    dists: &[i16],
 ) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
+
+    // **QEF-Hermite selection.** When enabled, the surface is meshed with
+    // BINARY topology (sign changes) + QEF-Hermite vertex placement — NOT
+    // the blurred-D topology/position. So the density precompute, the
+    // D-field owner expansion, and the wide-window plane fit are all
+    // bypassed (they exist only to recover the position the stored
+    // distance now carries exactly). `topo_blur` gates that legacy
+    // machinery; `use_qef` gates the placement.
+    let use_qef = qef_hermite_enabled() && !dists.is_empty();
+    let topo_blur = density_blur && !use_qef;
     if octree_nodes.is_empty() {
         return (vertices, indices);
     }
@@ -974,12 +999,12 @@ fn extract_surface_mesh_haloed_impl(
     // density (and vertices). The dense grid is laid out exactly like
     // [`CellGrid`]: `origin` lo-corner, `size` extent, flat
     // `x + sx*(y + sy*z)` indexing.
-    let (r_blur, sigma_blur, iso) = if density_blur {
+    let (r_blur, sigma_blur, iso) = if topo_blur {
         active_blur_params()
     } else {
         (DENSITY_KERNEL_R, DENSITY_KERNEL_SIGMA, DENSITY_ISO)
     };
-    let density_grids: Option<DensityGrids> = if density_blur {
+    let density_grids: Option<DensityGrids> = if topo_blur {
         // Bounding box of every cell in the map (interior + halo).
         let mut bb_min = IVec3::splat(i32::MAX);
         let mut bb_max = IVec3::splat(i32::MIN);
@@ -1166,6 +1191,10 @@ fn extract_surface_mesh_haloed_impl(
         }
     };
 
+    // Sign-based solidity for the QEF-Hermite topology (see
+    // [`qef_cell_inside`]): puts each active edge on the true crossing.
+    let qef_solid = |c: IVec3| -> bool { qef_cell_inside(cell_lookup(c), dists) };
+
     // **Owner candidate set.**
     //
     // * Binary path: owners are exactly the cells in `cells` that fall
@@ -1190,7 +1219,7 @@ fn extract_surface_mesh_haloed_impl(
                 && c.z < iter_hi)
     };
     let mut owners: Vec<IVec3> = Vec::new();
-    if density_blur {
+    if topo_blur {
         let mut seen: rustc_hash::FxHashSet<IVec3> = rustc_hash::FxHashSet::default();
         seen.reserve(cells.len() * 8);
         for &cell in cells.keys() {
@@ -1217,15 +1246,26 @@ fn extract_surface_mesh_haloed_impl(
     for &cell in &owners {
         // D-blur path skips non-D-solid owners (the candidate expansion
         // includes binary-empty cells that may or may not be D-solid).
-        if density_blur && !d_solid(cell) {
+        if topo_blur && !d_solid(cell) {
+            continue;
+        }
+        // QEF path skips owners that are sign-EMPTY surface leaves (a leaf
+        // whose center sits above the surface): they are not solid for the
+        // sign-based topology.
+        if use_qef && !qef_solid(cell) {
             continue;
         }
         for face in 0..6 {
             let dir = FACE_DIRS[face];
             let neighbor = cell + dir;
-            if density_blur {
+            if topo_blur {
                 // D-active face: this side D-solid, the other D-empty.
                 if d_solid(neighbor) {
+                    continue;
+                }
+            } else if use_qef {
+                // Sign-active face: this side inside, the other outside.
+                if qef_solid(neighbor) {
                     continue;
                 }
             } else {
@@ -1263,7 +1303,7 @@ fn extract_surface_mesh_haloed_impl(
                         // region — would misclassify them as empty
                         // and emit a spurious vertex with no match in
                         // the neighbouring tile.
-                        let vertex = if density_blur {
+                        let vertex = if topo_blur {
                             build_cube_vertex(
                                 cube,
                                 cell_lookup,
@@ -1277,8 +1317,14 @@ fn extract_surface_mesh_haloed_impl(
                                 Some(&density_grid_fn),
                                 Some(&gradient_grid_fn),
                                 iso,
+                                false,
+                                &[],
                             )
                         } else {
+                            // Binary topology. When `use_qef`, place the
+                            // vertex via QEF-Hermite from the stored
+                            // per-leaf distance; otherwise the legacy
+                            // edge-crossing centroid (imports).
                             build_cube_vertex(
                                 cube,
                                 cell_lookup,
@@ -1292,6 +1338,8 @@ fn extract_surface_mesh_haloed_impl(
                                 None::<&fn(Vec3) -> f32>,
                                 None::<&fn(Vec3) -> Vec3>,
                                 DENSITY_ISO,
+                                use_qef,
+                                dists,
                             )
                         };
                         let vid = vertices.len() as u32;
@@ -1310,10 +1358,11 @@ fn extract_surface_mesh_haloed_impl(
     // for the terrain density path (radius from `plane_fit_default_radius`,
     // typically `TERRAIN_PLANE_FIT_RADIUS`); a thread-local override can
     // force it off (the bench baseline). Only meaningful on the
-    // density-blur path. The shared seam ring — vertices within ½ voxel of
-    // any nominal tile face (derived from the octree extent) — is PINNED
-    // so adjacent tiles stay watertight under the fit.
-    if density_blur {
+    // density-blur path — the QEF-Hermite path has no ripple to recover, so
+    // `topo_blur` (not `density_blur`) gates it off there. The shared seam
+    // ring — vertices within ½ voxel of any nominal tile face (derived from
+    // the octree extent) — is PINNED so adjacent tiles stay watertight.
+    if topo_blur {
         let r = resolve_plane_fit_radius(plane_fit_default_radius);
         if r > 0.0 {
             let tile_lo = grid_origin;
@@ -1909,6 +1958,10 @@ where
                             Some(&density_grid_fn),
                             Some(&gradient_grid_fn),
                             iso,
+                            // Region/sculpt path keeps the blur placement for
+                            // now; Stage 6 wires QEF-Hermite here.
+                            false,
+                            &[],
                         );
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
@@ -2036,6 +2089,110 @@ fn solve_qef(planes: &[(Vec3, Vec3)], bias: Vec3) -> Vec3 {
     Vec3::new(x, y, z)
 }
 
+/// **QEF-Hermite vertex placement** for an SN cube — the smooth-by-
+/// construction alternative to the `blur→D` + Newton recovery.
+///
+/// Each *surface-leaf* corner of the cube (skip EMPTY and `CELL_INTERIOR`
+/// — they carry no prefiltered normal/distance and contribute no plane)
+/// gives an exact first-order Hermite sample of the surface: the
+/// prefiltered outward normal `n` and the surface point
+/// `p_surf = cell_center − d_vox · n`, where `d_vox` is the stored
+/// gradient-normalized signed distance (in voxel/grid units; the SDF is
+/// negative inside, so a cell just below the surface has `d_vox < 0` and
+/// `p_surf` moves outward onto the surface). The dual vertex is the
+/// regularized least-squares intersection of those tangent planes
+/// (`solve_qef`, bias = their centroid), clamped to the cube's
+/// cell-center AABB `[cube+½, cube+1½]` so a sharp-crease seam can never
+/// fold a vertex out of its cube.
+///
+/// On a flat/gently-sloped region every plane is (near-)coincident with
+/// the true surface, so the QEF nails the height (`residual → 0`) — no
+/// terracing, because both topology and position root in the SAME surface
+/// leaves (the old terracing was a binary-topology / blurred-D-position
+/// mismatch).
+///
+/// Returns `None` when no surface-leaf corner supplied a plane (a non-
+/// surface cube, or `dists` not populated) — the caller falls back to the
+/// edge-crossing centroid. Position is in grid (voxel) space.
+fn qef_hermite_placement<F>(
+    cube: IVec3,
+    cell_lookup: &F,
+    leaf_attr_pool: &[LeafAttr],
+    dists: &[i16],
+) -> Option<Vec3>
+where
+    F: Fn(IVec3) -> Option<u32>,
+{
+    let mut planes: Vec<(Vec3, Vec3)> = Vec::with_capacity(8);
+    let mut p_sum = Vec3::ZERO;
+    for i in 0u32..8 {
+        let c = cube + corner_offset(i);
+        let Some(slot) = cell_lookup(c) else { continue };
+        if slot == CELL_INTERIOR {
+            continue;
+        }
+        let Some(attr) = leaf_attr_pool.get(slot as usize) else {
+            continue;
+        };
+        let n = unpack_oct(attr.normal_oct);
+        if n.length_squared() <= 1e-12 {
+            continue;
+        }
+        let n = n.normalize();
+        // Gradient-normalized signed distance in voxel units (0 when the
+        // slot has no stored distance — branch-node LOD attrs, or a
+        // partially-populated pool; harmless, that plane just passes
+        // through the cell center).
+        let d_vox = dists
+            .get(slot as usize)
+            .copied()
+            .map(LeafAttrPool::dequantize_dist)
+            .unwrap_or(0.0);
+        let center = Vec3::new(c.x as f32 + 0.5, c.y as f32 + 0.5, c.z as f32 + 0.5);
+        let p_surf = center - d_vox * n;
+        planes.push((n, p_surf));
+        p_sum += p_surf;
+    }
+    if planes.is_empty() {
+        return None;
+    }
+    let bias = p_sum / planes.len() as f32;
+    let lo = Vec3::new(cube.x as f32 + 0.5, cube.y as f32 + 0.5, cube.z as f32 + 0.5);
+    Some(solve_qef(&planes, bias).clamp(lo, lo + Vec3::ONE))
+}
+
+/// Sign-based solidity for the QEF-Hermite topology. A cell is "inside"
+/// iff its stored per-leaf signed distance is `≤ 0` (center on/below the
+/// surface); deep INTERIOR-region cells (`CELL_INTERIOR`, no stored
+/// distance) are solid; absent cells are empty.
+///
+/// Why QEF mode needs *this* instead of surface-leaf membership: the
+/// voxelizer keeps a cell as a SURFACE leaf whenever the surface merely
+/// *passes through* its Lipschitz band — including cells whose center sits
+/// just **above** the surface. Treating every such leaf as solid (the
+/// import/binary rule) puts the occupancy boundary ~½ voxel above the true
+/// surface and staircases it; the cube-AABB clamp would then pin each
+/// vertex inside its offset cube and the QEF could never reach the true
+/// surface (the terracing returns). Classifying on the distance *sign*
+/// puts each active edge on the real crossing, so the cube straddles the
+/// surface and the tight clamp and the QEF agree. Deterministic (quantized
+/// distance) → seam-safe.
+#[inline]
+fn qef_cell_inside(slot_lookup: Option<u32>, dists: &[i16]) -> bool {
+    match slot_lookup {
+        None => false,
+        Some(s) if s == CELL_INTERIOR => true,
+        Some(s) => {
+            dists
+                .get(s as usize)
+                .copied()
+                .map(LeafAttrPool::dequantize_dist)
+                .unwrap_or(0.0)
+                <= 0.0
+        }
+    }
+}
+
 /// Build the [`MeshVertex`] for an SN cube whose lo corner is `cube`.
 /// The cube spans cells `cube..cube+1` along each axis (8 corner cells
 /// total).
@@ -2088,6 +2245,14 @@ fn build_cube_vertex<F, S, N, D, G>(
     gradient_grid_fn: Option<&G>,
     // Active iso threshold for the Newton target (0.5 in production).
     iso: f32,
+    // **QEF-Hermite placement** (smooth-by-construction). When `true`, the
+    // vertex is the regularized tangent-plane intersection of the cube's
+    // surface-leaf Hermite samples (`p_surf = center − dist·n`) clamped to
+    // the cube, replacing the edge-crossing centroid / Newton path. `dists`
+    // is the per-slot signed-distance pool (voxel units), indexed exactly
+    // like `leaf_attr_pool`. Off (or `dists` empty) keeps the legacy path.
+    qef_hermite: bool,
+    dists: &[i16],
 ) -> MeshVertex
 where
     F: Fn(IVec3) -> Option<u32>,
@@ -2111,12 +2276,19 @@ where
     for i in 0u32..8 {
         let oa = corner_offset(i);
         let c = cube + oa;
-        corner_solid[i as usize] = match density_grid_fn {
-            Some(dfn) => {
-                let center = Vec3::new(c.x as f32 + 0.5, c.y as f32 + 0.5, c.z as f32 + 0.5);
-                dfn(center) >= iso
+        corner_solid[i as usize] = if qef_hermite {
+            // Sign-based (see `qef_cell_inside`): the active edges sit on
+            // the true crossing so the cube straddles the surface.
+            qef_cell_inside(cell_lookup(c), dists)
+        } else {
+            match density_grid_fn {
+                Some(dfn) => {
+                    let center =
+                        Vec3::new(c.x as f32 + 0.5, c.y as f32 + 0.5, c.z as f32 + 0.5);
+                    dfn(center) >= iso
+                }
+                None => cell_lookup(c).is_some(),
             }
-            None => cell_lookup(c).is_some(),
         };
     }
 
@@ -2230,24 +2402,33 @@ where
     // per axis so a poorly-conditioned step (near-zero gradient, or a
     // crossing far from the surface) can never fling the vertex out of
     // its SN cube.
-    let local_centroid = match (density_grid_fn, gradient_grid_fn) {
-        (Some(dfn), Some(gfn)) if crossing_count > 0 => {
-            let mut p = centroid0;
-            for _ in 0..2 {
-                let d = dfn(p);
-                let g = gfn(p);
-                let gg = g.dot(g);
-                if gg < 1e-6 {
-                    break;
+    // **QEF-Hermite** (smooth-by-construction) takes precedence when
+    // enabled: place the vertex on the true surface from the cube's
+    // surface-leaf Hermite samples, NOT on the (rippling) blurred-D
+    // isosurface. Falls back to the edge-crossing centroid only for a
+    // degenerate cube that supplied no surface-leaf plane (defensive).
+    let local_centroid = if qef_hermite {
+        qef_hermite_placement(cube, &cell_lookup, leaf_attr_pool, dists).unwrap_or(centroid0)
+    } else {
+        match (density_grid_fn, gradient_grid_fn) {
+            (Some(dfn), Some(gfn)) if crossing_count > 0 => {
+                let mut p = centroid0;
+                for _ in 0..2 {
+                    let d = dfn(p);
+                    let g = gfn(p);
+                    let gg = g.dot(g);
+                    if gg < 1e-6 {
+                        break;
+                    }
+                    let step = ((d - iso) / gg) * g;
+                    p -= step;
+                    // Clamp total displacement to ±0.75 cell of the centroid.
+                    p = p.clamp(centroid0 - Vec3::splat(0.75), centroid0 + Vec3::splat(0.75));
                 }
-                let step = ((d - iso) / gg) * g;
-                p -= step;
-                // Clamp total displacement to ±0.75 cell of the centroid.
-                p = p.clamp(centroid0 - Vec3::splat(0.75), centroid0 + Vec3::splat(0.75));
+                p
             }
-            p
+            _ => centroid0,
         }
-        _ => centroid0,
     };
 
     let local_pos = grid_origin + local_centroid * voxel_size;
@@ -4225,6 +4406,8 @@ mod tests {
             None::<&fn(Vec3) -> f32>,
             None::<&fn(Vec3) -> Vec3>,
             DENSITY_ISO,
+            false,
+            &[],
         );
 
         // With naive SN, the vertex would sit at the centroid of

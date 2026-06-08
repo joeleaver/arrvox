@@ -197,6 +197,7 @@ pub fn bake_terrain_window(
         &artifact.halo_cells,
         REPRO_TILE_HALO,
         None,
+        &[],
     );
 
     let surface_cells =

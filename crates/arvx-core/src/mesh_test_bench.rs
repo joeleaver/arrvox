@@ -1485,7 +1485,10 @@ fn bresenham(
 // measure a LOW-FREQUENCY ripple metric (not just the existing
 // high-frequency `roughness`, which misses wide flat treads).
 
-use crate::mesh_extract::extract_surface_mesh_density_haloed;
+use crate::leaf_attr_pool::LeafAttrPool;
+use crate::mesh_extract::{
+    collect_cell_map, extract_surface_mesh_density_haloed, set_qef_hermite, CELL_INTERIOR,
+};
 use crate::voxelize_octree::voxelize_to_artifact;
 
 /// Terrain halo the real bake uses (`bake.rs::TILE_HALO_VOXELS`).
@@ -1679,6 +1682,7 @@ pub fn bake_heightfield(hf: &HeightField, half_world: f32, voxel_size: f32) -> H
         &artifact.halo_cells,
         REPRO_TILE_HALO,
         None,
+        &[],
     );
     let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
     HeightMesh {
@@ -1747,6 +1751,94 @@ pub fn bake_heightfield_blur(
     let out = bake_heightfield(hf, half_world, voxel_size);
     set_blur_override(None);
     out
+}
+
+/// Mesh a heightfield through the terrain bake path with **QEF-Hermite**
+/// placement (Stage 2), injecting the per-leaf signed distance the Stage-3
+/// voxelizer will store — computed HERE from the analytic height so the
+/// QEF mesher is validated in ISOLATION before the voxelizer write lands.
+///
+/// The injected distance replicates the voxelizer's exact arithmetic
+/// (`eps = vs/2` 6-tap central difference, `d_vox = d_center /
+/// grad.length()`, voxel units) so the asserts on this path survive Stage
+/// 3 unchanged once real baked distances replace the injection. Distances
+/// are written for every interior **and** halo surface leaf so boundary
+/// cubes get Hermite data on both sides.
+pub fn bake_heightfield_qef(hf: &HeightField, half_world: f32, voxel_size: f32) -> HeightMesh {
+    let aabb = heightfield_tile_aabb(half_world, voxel_size);
+    let h = &hf.h;
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+        positions
+            .iter()
+            .map(|p| (p.y - h(p.x, p.z), 1u16, 1u16, 0u8, 0u32))
+            .collect()
+    };
+    let artifact = voxelize_to_artifact(sdf_fn, &aabb, voxel_size, REPRO_TILE_HALO)
+        .expect("heightfield voxelize_to_artifact");
+    let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
+
+    // ── Inject per-leaf distance from the analytic height ──
+    let eps = voxel_size * 0.5;
+    let f = |p: Vec3| p.y - h(p.x, p.z);
+    let perp_dist_vox = |cell: IVec3| -> f32 {
+        let center = artifact.grid_origin
+            + (Vec3::new(cell.x as f32, cell.y as f32, cell.z as f32) + Vec3::splat(0.5))
+                * voxel_size;
+        let d_center = f(center);
+        let grad = Vec3::new(
+            f(center + Vec3::new(eps, 0.0, 0.0)) - f(center - Vec3::new(eps, 0.0, 0.0)),
+            f(center + Vec3::new(0.0, eps, 0.0)) - f(center - Vec3::new(0.0, eps, 0.0)),
+            f(center + Vec3::new(0.0, 0.0, eps)) - f(center - Vec3::new(0.0, 0.0, eps)),
+        );
+        let gl = grad.length();
+        if gl > 1e-6 {
+            d_center / gl
+        } else {
+            0.0
+        }
+    };
+    let mut dists = vec![0i16; artifact.leaf_attrs.len()];
+    let mut set = |cell: IVec3, slot: u32| {
+        if slot != CELL_INTERIOR && (slot as usize) < dists.len() {
+            dists[slot as usize] = LeafAttrPool::quantize_dist(perp_dist_vox(cell));
+        }
+    };
+    let cells = collect_cell_map(
+        artifact.octree.as_slice(),
+        artifact.octree.depth(),
+        &brick_pool_flat,
+    );
+    for (&cell, &slot) in cells.iter() {
+        set(cell, slot);
+    }
+    for &(cell, slot) in &artifact.halo_cells {
+        set(cell, slot);
+    }
+
+    set_qef_hermite(true);
+    let (verts, indices) = extract_surface_mesh_density_haloed(
+        artifact.octree.as_slice(),
+        artifact.octree.depth(),
+        voxel_size,
+        artifact.grid_origin,
+        &brick_pool_flat,
+        &artifact.leaf_attrs,
+        &[],
+        &artifact.halo_cells,
+        REPRO_TILE_HALO,
+        None,
+        &dists,
+    );
+    set_qef_hermite(false);
+
+    let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
+    HeightMesh {
+        verts,
+        indices,
+        grid_origin: artifact.grid_origin,
+        voxel_size,
+        surface_cells,
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2432,6 +2524,86 @@ mod tests {
             "fix inflated FBM residual too much ({:.3} → {:.3}) — rounding curvature",
             base.residual_rms_vox,
             fixed.residual_rms_vox
+        );
+    }
+
+    // ── Stage 2: QEF-Hermite mesher (behind the qef_hermite toggle) ──
+
+    /// QEF-Hermite places each vertex on the TRUE surface from the stored
+    /// per-leaf Hermite (distance + normal), so a gentle slope comes out
+    /// FLAT by construction — the residual RMS collapses to the
+    /// quantization floor, well under the `< 0.02 vox` target and far
+    /// below the blur path's `> 0.10` ripple (which the plane-fit only
+    /// claws back ~30%). No post-hoc recovery.
+    #[test]
+    fn qef_hermite_bake_path_is_flat_on_gentle_slope() {
+        let hf = HeightField::gentle_slope(0.10, 0.035);
+        for &vs in &[0.5f32, 1.0] {
+            let m = bake_heightfield_qef(&hf, 12.0, vs);
+            let r = measure_ripple(&hf, &m, Vec3::X);
+            assert!(
+                r.n_samples >= 16,
+                "vs={vs}: too few top-surface samples ({})",
+                r.n_samples
+            );
+            assert!(
+                r.residual_rms_vox < 0.02,
+                "vs={vs}: QEF-Hermite slope should be flat (residual_rms {:.4} ≥ 0.02)",
+                r.residual_rms_vox
+            );
+        }
+    }
+
+    /// Against the raw rippled blur baseline (fix OFF), QEF-Hermite is a
+    /// large improvement on the same gentle slope — not the ~30% the
+    /// plane-fit recovers, but ≥80%.
+    #[test]
+    fn qef_hermite_beats_blur_on_gentle_slope() {
+        let hf = HeightField::gentle_slope(0.10, 0.035);
+        let vs = 0.5f32;
+        let base = {
+            set_wide_window_project(Some(0.0)); // raw blur, plane-fit OFF
+            let m = bake_heightfield(&hf, 12.0, vs);
+            set_wide_window_project(None);
+            measure_ripple(&hf, &m, Vec3::X)
+        };
+        let qef = measure_ripple(&hf, &bake_heightfield_qef(&hf, 12.0, vs), Vec3::X);
+        assert!(
+            qef.residual_rms_vox < base.residual_rms_vox * 0.2,
+            "QEF should cut the blur ripple ≥80% ({:.3} → {:.4})",
+            base.residual_rms_vox,
+            qef.residual_rms_vox
+        );
+    }
+
+    /// On a curved (FBM) field QEF-Hermite tracks the true height: its
+    /// residual beats the raw-blur ripple and stays small — it places on
+    /// the real surface, it does not round curvature.
+    #[test]
+    fn qef_hermite_tracks_fbm_curvature() {
+        let hf = HeightField::fbm();
+        let vs = 0.5f32;
+        let base = {
+            set_wide_window_project(Some(0.0));
+            let m = bake_heightfield(&hf, 12.0, vs);
+            set_wide_window_project(None);
+            measure_ripple(&hf, &m, Vec3::X)
+        };
+        let qef = measure_ripple(&hf, &bake_heightfield_qef(&hf, 12.0, vs), Vec3::X);
+        // QEF cuts the FBM ripple ~83% (0.186 → 0.031); the residual that
+        // remains is genuine sub-voxel curvature the discrete mesh can't
+        // resolve, NOT terracing. Pin a comfortable margin on both the cut
+        // ratio and the absolute floor.
+        assert!(
+            qef.residual_rms_vox < base.residual_rms_vox * 0.3,
+            "QEF should cut the FBM ripple ≥70% ({:.3} → {:.4})",
+            base.residual_rms_vox,
+            qef.residual_rms_vox
+        );
+        assert!(
+            qef.residual_rms_vox < 0.05,
+            "QEF FBM residual floor should stay small ({:.4} ≥ 0.05)",
+            qef.residual_rms_vox
         );
     }
 }
