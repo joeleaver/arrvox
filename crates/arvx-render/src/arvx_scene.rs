@@ -243,6 +243,15 @@ pub struct ArvxScene {
     /// the epoch it built its bind group at; rebuilds when the scene's
     /// epoch moves ahead.
     buffers_epoch: u64,
+    /// Bytes of each delta-uploaded pool buffer that currently hold
+    /// valid data on the GPU (`= the last uploaded data.len()`). The
+    /// buffer is over-allocated 2× on growth, so its *capacity* exceeds
+    /// its *valid* extent — copy-on-grow must carry forward only the
+    /// valid prefix, not the padding. See [`Self::upload_pool_delta`].
+    brick_pool_valid: u64,
+    leaf_attr_pool_valid: u64,
+    color_pool_valid: u64,
+    bone_weights_valid: u64,
 }
 
 impl ArvxScene {
@@ -294,6 +303,10 @@ impl ArvxScene {
             instance_sculpt_buffer,
             bind_group_layout,
             buffers_epoch: 0,
+            brick_pool_valid: 0,
+            leaf_attr_pool_valid: 0,
+            color_pool_valid: 0,
+            bone_weights_valid: 0,
         }
     }
 
@@ -441,24 +454,24 @@ impl ArvxScene {
         range_count_total += octree_stats.range_count;
 
         let brick_stats = Self::upload_pool_delta(
-            device, queue, &mut self.brick_pool_buffer, "arvx_brick_pool",
-            data.brick_pool, &data.brick_dirty,
+            device, queue, &mut self.brick_pool_buffer, &mut self.brick_pool_valid,
+            "arvx_brick_pool", data.brick_pool, &data.brick_dirty,
         );
         needs_rebuild |= brick_stats.grew;
         total_uploaded += brick_stats.bytes_written;
         range_count_total += brick_stats.range_count;
 
         let leaf_stats = Self::upload_pool_delta(
-            device, queue, &mut self.leaf_attr_pool_buffer, "arvx_leaf_attr_pool",
-            data.leaf_attr_pool, &data.leaf_attr_dirty,
+            device, queue, &mut self.leaf_attr_pool_buffer, &mut self.leaf_attr_pool_valid,
+            "arvx_leaf_attr_pool", data.leaf_attr_pool, &data.leaf_attr_dirty,
         );
         needs_rebuild |= leaf_stats.grew;
         total_uploaded += leaf_stats.bytes_written;
         range_count_total += leaf_stats.range_count;
 
         let color_stats = Self::upload_pool_delta(
-            device, queue, &mut self.color_pool_buffer, "arvx_color_pool",
-            data.color_pool, &data.color_dirty,
+            device, queue, &mut self.color_pool_buffer, &mut self.color_pool_valid,
+            "arvx_color_pool", data.color_pool, &data.color_dirty,
         );
         needs_rebuild |= color_stats.grew;
         total_uploaded += color_stats.bytes_written;
@@ -466,8 +479,8 @@ impl ArvxScene {
 
         if !data.bone_weights.is_empty() {
             let bone_stats = Self::upload_pool_delta(
-                device, queue, &mut self.bone_weights_buffer, "arvx_bone_weights",
-                data.bone_weights, &data.bone_dirty,
+                device, queue, &mut self.bone_weights_buffer, &mut self.bone_weights_valid,
+                "arvx_bone_weights", data.bone_weights, &data.bone_dirty,
             );
             needs_rebuild |= bone_stats.grew;
             total_uploaded += bone_stats.bytes_written;
@@ -505,10 +518,21 @@ impl ArvxScene {
 
     /// Delta-aware upload for a homogeneous byte pool (brick_pool,
     /// leaf_attr_pool, color_pool, bone_weights). Returns telemetry +
-    /// whether the buffer was reallocated.
+    /// whether the buffer was reallocated. `valid_bytes` tracks how many
+    /// bytes of `buffer` currently hold valid data (always `=
+    /// data.len()` on return); the buffer is over-allocated 2× on
+    /// growth, so this is below its capacity.
     ///
-    /// Falls back to full pool upload when:
-    /// * Buffer needed to grow (no usable existing data on GPU).
+    /// **Growth = copy-on-grow, NOT a full CPU re-upload.** A naive
+    /// `queue.write_buffer(new, 0, data)` on every realloc re-sends the
+    /// ENTIRE growing pool from CPU — on a cold terrain generation that
+    /// climbs to ~100 ms in a single frame, long enough for the window
+    /// surface to go Outdated (rinch #42 then never recovers). Instead we
+    /// copy the previously-valid prefix GPU→GPU (VRAM-local, ~µs), then
+    /// write only the genuinely-new tail + any mutations inside the
+    /// prefix. Per-grow cost becomes O(new data), not O(total pool).
+    ///
+    /// The non-growth path still falls back to a full pool write when:
     /// * Tracker is in `mark_full` mode.
     /// * Total marked bytes exceed `data.len() / 2`.
     /// * Range count exceeds [`MAX_DELTA_RANGES`] — the per-call
@@ -522,6 +546,7 @@ impl ArvxScene {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         buffer: &mut wgpu::Buffer,
+        valid_bytes: &mut u64,
         label: &str,
         data: &[u8],
         dirty: &arvx_core::DirtyRanges,
@@ -530,11 +555,57 @@ impl ArvxScene {
             return UploadStats::default();
         }
         let needed = data.len() as u64;
+        // After any path below, `[0, data.len())` is resident on the GPU.
+        let prev_valid = (*valid_bytes).min(needed);
+        *valid_bytes = needed;
         if needed > buffer.size() {
-            let new_size = needed.max(buffer.size().saturating_mul(2)).max(64);
-            *buffer = Self::create_storage(device, label, new_size);
-            queue.write_buffer(buffer, 0, data);
-            return UploadStats { grew: true, bytes_written: data.len() as u64, range_count: 1 };
+            let old_buffer = std::mem::replace(
+                buffer,
+                Self::create_storage(device, label, needed.max(buffer.size().saturating_mul(2)).max(64)),
+            );
+            let mut bytes_written = 0u64;
+            let mut range_count = 0usize;
+            // 4-byte-aligned copy length (copy_buffer_to_buffer requires
+            // it); any unaligned remainder of the old valid prefix falls
+            // into the tail write below, so it's still re-sent.
+            let copy_len = prev_valid & !3u64;
+            // Carry the previously-resident prefix forward GPU→GPU. Must
+            // be SUBMITTED before the `write_buffer`s below, whose staged
+            // copies apply at the next submit (the frame's render pass) —
+            // i.e. AFTER this copy, so the fresh writes overlay it.
+            if copy_len > 0 {
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pool-grow-copy"),
+                });
+                enc.copy_buffer_to_buffer(&old_buffer, 0, buffer, 0, copy_len);
+                queue.submit(std::iter::once(enc.finish()));
+            }
+            // Everything not carried forward (the genuinely-new tail, plus
+            // any sub-4-byte remainder of the old prefix).
+            if needed > copy_len {
+                let tail = &data[copy_len as usize..];
+                queue.write_buffer(buffer, copy_len, tail);
+                bytes_written += tail.len() as u64;
+                range_count += 1;
+            }
+            // Re-apply mutations that landed inside the carried-forward
+            // prefix since the last upload (the GPU copy brought their
+            // STALE bytes forward). Ranges in the tail are already covered.
+            for (off, len) in dirty.iter() {
+                if off as u64 >= copy_len {
+                    continue;
+                }
+                let off_u = off as usize;
+                let end = ((off as u64 + len as u64).min(copy_len)) as usize;
+                if end <= off_u {
+                    continue;
+                }
+                let slice = &data[off_u..end];
+                queue.write_buffer(buffer, off as u64, slice);
+                bytes_written += slice.len() as u64;
+                range_count += 1;
+            }
+            return UploadStats { grew: true, bytes_written, range_count };
         }
         if dirty.is_empty() {
             return UploadStats::default();
@@ -857,7 +928,12 @@ impl ArvxScene {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: min_size.max(4),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            // COPY_SRC so a buffer can be the source of the GPU→GPU
+            // copy-on-grow in `upload_pool_delta` when it's superseded by
+            // a larger one.
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         })
     }
