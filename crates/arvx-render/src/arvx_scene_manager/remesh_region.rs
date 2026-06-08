@@ -30,12 +30,7 @@
 
 use glam::{IVec3, Vec3};
 
-use arvx_core::mesh_cluster::{
-    MeshletCluster, CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE, PARENT_GROUP_ERROR_ROOT,
-};
-
-use crate::mesh_pass::MeshVertex;
-
+use super::cluster_delta::ClusterFilterRewrite;
 use super::mesher::Mesher;
 use super::types::{MeshView, VoxelModel};
 
@@ -227,44 +222,44 @@ pub struct RemeshFilterStats {
 }
 
 impl Mesher {
-    /// Query the clusters overlapping `region.query_{lo,hi}` and drop the
-    /// stale triangles `region.filter` selects, in place. Returns the
-    /// dirty-cluster list (the caller still needs it to seed the
-    /// LOD-dirty CC walk) and filter telemetry.
+    /// **Pure compute half** of the filter executor. Queries the clusters
+    /// overlapping `region.query_{lo,hi}`, runs the rayon per-triangle
+    /// filter, and returns the dirty-cluster list, the owned
+    /// [`ClusterFilterRewrite`]s (in producer order — do not reorder), and
+    /// the filter telemetry. **Reads `&view`, mutates nothing** — the
+    /// in-place merge is [`MeshView::apply_cluster_delta`]'s job.
     ///
-    /// Phases 1–3 of the legacy re-extract functions, unified: dirty
-    /// query → rayon per-triangle filter → sequential in-place merge +
-    /// free-tail. `KeepAll` short-circuits after the query so additive
-    /// brushes do zero index-buffer writes. Pure over `(model, view)` —
-    /// no manager, no handle, no scene pools.
-    pub(super) fn remesh_filter_dirty_clusters(
+    /// `KeepAll` short-circuits after the dirty query (empty rewrite set),
+    /// so additive brushes do zero index-buffer work. `old_offset` /
+    /// `old_count` are snapshotted from each cluster here so apply needn't
+    /// re-read the (by-then-mutated) table.
+    pub(super) fn compute_filter_delta(
         &self,
         model: &VoxelModel,
-        view: &mut MeshView,
+        view: &MeshView,
         region: &RemeshRegion,
-    ) -> (Vec<u32>, RemeshFilterStats) {
+    ) -> (Vec<u32>, Vec<ClusterFilterRewrite>, RemeshFilterStats) {
         let dirty = view.clusters_in_grid_aabb(model, region.query_lo, region.query_hi);
         let mut stats = RemeshFilterStats::default();
         if dirty.is_empty() {
-            return (dirty, stats);
+            return (dirty, Vec::new(), stats);
         }
         if matches!(region.filter, RemeshFilter::KeepAll) {
             // Additive edit: existing tris stay valid → no filter, no IBO
             // writes. Report every dirty cluster as short-circuited to
             // mirror the legacy Raise/Inflate telemetry.
             stats.clusters_rejected = dirty.len();
-            return (dirty, stats);
+            return (dirty, Vec::new(), stats);
         }
 
         use rayon::prelude::*;
         let filter = region.filter;
 
-        // Phase 2 — rayon-parallel per-triangle filter. Each cluster's
-        // filter is independent (reads its own index slice + indexed
-        // vertices, produces a kept-index Vec). `par_iter().collect()`
-        // preserves input order so the sequential merge below is
-        // deterministic. Immutable reborrows of `*view` scoped so the
-        // sequential merge below can take `&mut view`.
+        // Rayon-parallel per-triangle filter. Each cluster's filter is
+        // independent (reads its own index slice + indexed vertices,
+        // produces a kept-index Vec). `par_iter().collect()` preserves
+        // input order so the rewrite Vec — and thus apply's dirty-mark
+        // sequence — is deterministic.
         let results: Vec<(u32, Vec<u32>)> = {
             let clusters = &view.meshlet_clusters;
             let indices = &view.mesh_indices;
@@ -306,105 +301,25 @@ impl Mesher {
         };
         stats.clusters_rejected = dirty.len() - results.len();
 
-        // Phase 3 — sequential merge. Write each cluster's kept indices
-        // BACK INTO its existing slot (the kept set is a strict subset,
-        // so it always fits) and return the freed tail to the slab
-        // allocator's free list. `index_offset` is unchanged; the
-        // cluster AABB stays at its pre-filter bounds (kept tris fit
-        // inside it).
-        {
-            for (cid, kept) in &results {
-                let old_offset = view.meshlet_clusters[*cid as usize].index_offset;
-                let old_count = view.meshlet_clusters[*cid as usize].index_count;
-                let new_count = kept.len() as u32;
-                stats.kept_tris += (new_count as usize) / 3;
-                stats.dropped_tris += ((old_count - new_count) as usize) / 3;
-                if new_count > 0 {
-                    view.mesh_indices_write_at(old_offset, kept);
-                }
-                if new_count < old_count {
-                    view.free_index_range(old_offset + new_count, old_count - new_count);
-                }
-                view.meshlet_clusters[*cid as usize].index_count = new_count;
-            }
+        // Build the rewrites in producer order, snapshotting each
+        // cluster's pre-merge `(index_offset, index_count)` and folding in
+        // the kept/dropped triangle telemetry. No view mutation here.
+        let mut rewrites = Vec::with_capacity(results.len());
+        for (cid, kept) in results {
+            let old_offset = view.meshlet_clusters[cid as usize].index_offset;
+            let old_count = view.meshlet_clusters[cid as usize].index_count;
+            let new_count = kept.len() as u32;
+            stats.kept_tris += (new_count as usize) / 3;
+            stats.dropped_tris += ((old_count - new_count) as usize) / 3;
+            rewrites.push(ClusterFilterRewrite {
+                cluster_id: cid,
+                kept_indices: kept,
+                old_offset,
+                old_count,
+            });
         }
 
-        (dirty, stats)
-    }
-
-    /// Append a freshly-extracted region as a standalone LOD-0 patch
-    /// cluster: extend the vertex buffer (marking the appended tail
-    /// dirty), slab-allocate + rebase the index range, push the cluster,
-    /// and insert it into the spatial index. Returns the new cluster id,
-    /// or `None` if `verts` is empty.
-    ///
-    /// The patch is born `LOD_DIRTY` with no DAG group on either side —
-    /// it sits outside the bake-time DAG, so the LOD selector
-    /// force-admits it unconditionally and CC walks never traverse
-    /// through it.
-    pub(super) fn append_remesh_patch(
-        &self,
-        view: &mut MeshView,
-        verts: &[MeshVertex],
-        indices: &[u32],
-        grid_origin: Vec3,
-        base_vs: f32,
-    ) -> Option<u32> {
-        if verts.is_empty() {
-            return None;
-        }
-        let mut patch_min = [f32::INFINITY; 3];
-        let mut patch_max = [f32::NEG_INFINITY; 3];
-        for v in verts {
-            for k in 0..3 {
-                if v.local_pos[k] < patch_min[k] {
-                    patch_min[k] = v.local_pos[k];
-                }
-                if v.local_pos[k] > patch_max[k] {
-                    patch_max[k] = v.local_pos[k];
-                }
-            }
-        }
-
-        let vertex_offset = view.mesh_vertices.len() as u32;
-        let append_start_bytes =
-            (vertex_offset as usize * std::mem::size_of::<MeshVertex>()) as u32;
-        view.mesh_vertices.extend_from_slice(verts);
-        let append_len_bytes = std::mem::size_of_val(verts) as u32;
-        if append_len_bytes > 0 {
-            view.mesh_vertices_dirty
-                .mark(append_start_bytes, append_len_bytes);
-        }
-
-        let patch_index_count = indices.len() as u32;
-        let new_index_offset = if patch_index_count > 0 {
-            let offset = view.alloc_index_range(patch_index_count);
-            let rebased: Vec<u32> = indices.iter().map(|&i| i + vertex_offset).collect();
-            view.mesh_indices_write_at(offset, &rebased);
-            offset
-        } else {
-            0
-        };
-
-        let patch_cluster = MeshletCluster {
-            aabb_min: patch_min,
-            _pad0: 0.0,
-            aabb_max: patch_max,
-            index_offset: new_index_offset,
-            index_count: patch_index_count,
-            lod_level: 0,
-            flags: CLUSTER_FLAG_LOD_DIRTY,
-            cluster_error: 0.0,
-            parent_group_error: PARENT_GROUP_ERROR_ROOT,
-            group_above_idx: DAG_GROUP_NONE,
-            group_below_idx: DAG_GROUP_NONE,
-            _pad3: 0,
-        };
-        let patch_cluster_id = view.meshlet_clusters.len() as u32;
-        view.meshlet_clusters.push(patch_cluster);
-        view.cluster_spatial_index
-            .insert(patch_cluster_id, &patch_cluster, grid_origin, base_vs);
-        Some(patch_cluster_id)
+        (dirty, rewrites, stats)
     }
 }
 

@@ -484,6 +484,95 @@ impl MeshView {
             .mark(offset * MESH_INDEX_STRIDE, (src.len() as u32) * MESH_INDEX_STRIDE);
     }
 
+    /// Fold an incremental re-extract's [`super::cluster_delta::ClusterDelta`]
+    /// into this view. Returns the appended patch cluster's id, or `None`
+    /// when the delta carried no patch.
+    ///
+    /// This is the single applier for the two mutation classes an
+    /// incremental re-extract performs, and is a **verbatim re-sequencing**
+    /// of the old inline mutations in `remesh_region`'s
+    /// `remesh_filter_dirty_clusters` (drop side) + `append_remesh_patch`
+    /// (add side) — bit-identical by construction.
+    ///
+    /// ## Ordering
+    ///
+    /// All filter frees happen **before** the patch alloc, so the patch's
+    /// first-fit `alloc_index_range` can reuse a range the filter just freed.
+    /// `filter_rewrites` is iterated in stored (producer) order: the final
+    /// buffer/free-list state is order-independent (disjoint ranges + a
+    /// sorted-coalescing free list), but the `mesh_indices_dirty` mark
+    /// *sequence* is not — preserving producer order keeps it bit-identical
+    /// to the old inline merge.
+    ///
+    /// `vertex_offset` for the VBO dirty-mark is read from the live
+    /// `mesh_vertices.len()` **here**, never cached in the delta — this is
+    /// the append-only mark the `feedback_vbo_tail_only_assumption` landmine
+    /// requires (`.mark(tail)`, not `mark_full`).
+    pub(super) fn apply_cluster_delta(
+        &mut self,
+        delta: &super::cluster_delta::ClusterDelta,
+        grid_origin: glam::Vec3,
+        base_vs: f32,
+    ) -> Option<u32> {
+        use arvx_core::mesh_cluster::{
+            MeshletCluster, CLUSTER_FLAG_LOD_DIRTY, DAG_GROUP_NONE, PARENT_GROUP_ERROR_ROOT,
+        };
+
+        // ── Drop side: kept-subset rewrite + free tail, in stored order. ──
+        for rw in &delta.filter_rewrites {
+            let new_count = rw.kept_indices.len() as u32;
+            if new_count > 0 {
+                self.mesh_indices_write_at(rw.old_offset, &rw.kept_indices);
+            }
+            if new_count < rw.old_count {
+                self.free_index_range(rw.old_offset + new_count, rw.old_count - new_count);
+            }
+            self.meshlet_clusters[rw.cluster_id as usize].index_count = new_count;
+        }
+
+        // ── Add side: append the patch as a standalone LOD-0 cluster. ──
+        let p = delta.patch.as_ref()?;
+        let vertex_offset = self.mesh_vertices.len() as u32;
+        let append_start_bytes =
+            (vertex_offset as usize * std::mem::size_of::<crate::mesh_pass::MeshVertex>()) as u32;
+        self.mesh_vertices.extend_from_slice(&p.verts);
+        let append_len_bytes = std::mem::size_of_val(&p.verts[..]) as u32;
+        if append_len_bytes > 0 {
+            self.mesh_vertices_dirty
+                .mark(append_start_bytes, append_len_bytes);
+        }
+
+        let patch_index_count = p.local_indices.len() as u32;
+        let new_index_offset = if patch_index_count > 0 {
+            let offset = self.alloc_index_range(patch_index_count);
+            let rebased: Vec<u32> = p.local_indices.iter().map(|&i| i + vertex_offset).collect();
+            self.mesh_indices_write_at(offset, &rebased);
+            offset
+        } else {
+            0
+        };
+
+        let patch_cluster = MeshletCluster {
+            aabb_min: p.aabb_min,
+            _pad0: 0.0,
+            aabb_max: p.aabb_max,
+            index_offset: new_index_offset,
+            index_count: patch_index_count,
+            lod_level: 0,
+            flags: CLUSTER_FLAG_LOD_DIRTY,
+            cluster_error: 0.0,
+            parent_group_error: PARENT_GROUP_ERROR_ROOT,
+            group_above_idx: DAG_GROUP_NONE,
+            group_below_idx: DAG_GROUP_NONE,
+            _pad3: 0,
+        };
+        let patch_cluster_id = self.meshlet_clusters.len() as u32;
+        self.meshlet_clusters.push(patch_cluster);
+        self.cluster_spatial_index
+            .insert(patch_cluster_id, &patch_cluster, grid_origin, base_vs);
+        Some(patch_cluster_id)
+    }
+
     /// Heuristic: does `mesh_indices` carry enough free-list fragments
     /// to make a `compact_mesh_indices` pass worth its O(N) cost?
     /// Returns true when free-list bytes exceed 30 % of the in-use
@@ -1528,5 +1617,272 @@ mod slab_tests {
         let off2 = entry.view.alloc_index_range(4);
         assert_eq!(off2, 20);
         assert_eq!(entry.view.mesh_indices_free_list, vec![(24, 4)]);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // `ClusterDelta` / `apply_cluster_delta` — the GPU-mesher seam (layer A).
+    //
+    // T1–T5 hand-compute the expected post-state (independent oracle).
+    // T6 cross-checks the add side against the existing `append_remesh_patch`
+    // executor. The full filter-compute oracle (compute_filter_delta vs the
+    // inline `remesh_filter_dirty_clusters`, which needs a real spatial-index
+    // + dirty-query setup) lands in Step 2 where the executor split exists.
+    // ──────────────────────────────────────────────────────────────────
+    use crate::arvx_scene_manager::cluster_delta::{
+        ClusterDelta, ClusterFilterRewrite, ClusterPatchAppend,
+    };
+    use bytemuck::Zeroable as _;
+
+    /// A `MeshVertex` at `pos` (rest zeroed). Patch-side tests only read
+    /// `local_pos` (for the AABB) and identity-compare the bytes.
+    fn pv(pos: [f32; 3]) -> crate::mesh_pass::MeshVertex {
+        let mut v = crate::mesh_pass::MeshVertex::zeroed();
+        v.local_pos = pos;
+        v
+    }
+
+    fn vbo_stride() -> u32 {
+        std::mem::size_of::<crate::mesh_pass::MeshVertex>() as u32
+    }
+
+    /// T1 — partial filter: drop the middle triangle of a 3-tri cluster.
+    /// Kept subset rewrites in place at the cluster's offset, the tail
+    /// frees (abuts next_free → pulled back), index_count updates.
+    #[test]
+    fn delta_filter_partial_rewrite() {
+        let mut entry = entry_with_indices(&[10, 11, 12, 13, 14, 15, 16, 17, 18]);
+        entry.view.meshlet_clusters.push(cluster([0.0; 3], [1.0; 3], 0, 9));
+        let delta = ClusterDelta {
+            filter_rewrites: vec![ClusterFilterRewrite {
+                cluster_id: 0,
+                kept_indices: vec![10, 11, 12, 16, 17, 18],
+                old_offset: 0,
+                old_count: 9,
+            }],
+            patch: None,
+        };
+        let go = entry.model.grid_origin();
+        let r = entry.view.apply_cluster_delta(&delta, go, 1.0);
+        assert_eq!(r, None, "no patch → returns None");
+        assert_eq!(&entry.view.mesh_indices[..6], &[10, 11, 12, 16, 17, 18]);
+        assert_eq!(entry.view.meshlet_clusters[0].index_count, 6);
+        assert_eq!(
+            entry.view.mesh_indices_next_free, 6,
+            "freed [6..9) abuts next_free → bump pulled back",
+        );
+        assert!(entry.view.mesh_indices_free_list.is_empty());
+        let dirty: Vec<_> = entry.view.mesh_indices_dirty.iter().collect();
+        assert_eq!(dirty, vec![(0, 24)], "wrote 6 indices @0 = 24 bytes");
+    }
+
+    /// T2 — full drop: kept set empty → no index write, whole range freed,
+    /// index_count zeroed, no dirty mark.
+    #[test]
+    fn delta_filter_full_drop() {
+        let mut entry = entry_with_indices(&[10, 11, 12, 13, 14, 15, 16, 17, 18]);
+        entry.view.meshlet_clusters.push(cluster([0.0; 3], [1.0; 3], 0, 9));
+        let delta = ClusterDelta {
+            filter_rewrites: vec![ClusterFilterRewrite {
+                cluster_id: 0,
+                kept_indices: vec![],
+                old_offset: 0,
+                old_count: 9,
+            }],
+            patch: None,
+        };
+        let go = entry.model.grid_origin();
+        entry.view.apply_cluster_delta(&delta, go, 1.0);
+        assert_eq!(entry.view.meshlet_clusters[0].index_count, 0);
+        assert_eq!(entry.view.mesh_indices_next_free, 0, "whole [0..9) freed → tail pullback");
+        assert!(entry.view.mesh_indices_free_list.is_empty());
+        assert!(
+            entry.view.mesh_indices_dirty.is_empty(),
+            "full drop writes nothing → no dirty mark",
+        );
+    }
+
+    /// T3 — patch-only: VBO extends (exact tail dirty range), index range
+    /// bump-allocated + rebased, born-LOD_DIRTY cluster pushed.
+    #[test]
+    fn delta_patch_only() {
+        use arvx_core::mesh_cluster::CLUSTER_FLAG_LOD_DIRTY;
+        let mut entry = entry_with_indices(&[]);
+        let verts = vec![
+            pv([0.0, 0.0, 0.0]),
+            pv([2.0, 0.0, 0.0]),
+            pv([0.0, 3.0, 0.0]),
+            pv([2.0, 3.0, 1.0]),
+        ];
+        let delta = ClusterDelta {
+            filter_rewrites: vec![],
+            patch: ClusterPatchAppend::from_extract(verts, vec![0, 1, 2, 1, 3, 2]),
+        };
+        let go = entry.model.grid_origin();
+        let id = entry.view.apply_cluster_delta(&delta, go, 1.0).expect("patch id");
+        assert_eq!(id, 0);
+        assert_eq!(entry.view.mesh_vertices.len(), 4);
+        let vdirty: Vec<_> = entry.view.mesh_vertices_dirty.iter().collect();
+        assert_eq!(vdirty, vec![(0, 4 * vbo_stride())], "exact appended-tail VBO mark");
+        // vertex_offset == 0 (empty VBO) → rebased == local indices.
+        assert_eq!(&entry.view.mesh_indices[..6], &[0, 1, 2, 1, 3, 2]);
+        assert_eq!(entry.view.mesh_indices_next_free, 6);
+        assert!(entry.view.mesh_indices_free_list.is_empty());
+        let c = entry.view.meshlet_clusters.last().unwrap();
+        assert_eq!(c.flags, CLUSTER_FLAG_LOD_DIRTY);
+        assert_eq!(c.lod_level, 0);
+        assert_eq!(c.index_offset, 0);
+        assert_eq!(c.index_count, 6);
+        assert_eq!(c.aabb_min, [0.0, 0.0, 0.0]);
+        assert_eq!(c.aabb_max, [2.0, 3.0, 1.0]);
+    }
+
+    /// T4 — free-then-reuse + order observability. Two clusters; one is
+    /// fully dropped, freeing an INTERIOR range the patch then reuses via
+    /// first-fit. Separately: reversing `filter_rewrites` leaves the buffer
+    /// + free-list IDENTICAL (disjoint ranges, sorted-coalescing list) but
+    /// REORDERS the `mesh_indices_dirty` mark sequence.
+    #[test]
+    fn delta_free_then_reuse_and_order() {
+        // Cluster A [0..6), B [6..12), next_free=12.
+        let mut entry = entry_with_indices(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        entry.view.meshlet_clusters.push(cluster([0.0; 3], [1.0; 3], 0, 6));
+        entry.view.meshlet_clusters.push(cluster([0.0; 3], [1.0; 3], 6, 6));
+        // Drop all of A → free interior [0..6); patch (6 idx) first-fits it.
+        let verts = vec![pv([0.0; 3]), pv([1.0, 0.0, 0.0]), pv([0.0, 1.0, 0.0])];
+        let delta = ClusterDelta {
+            filter_rewrites: vec![ClusterFilterRewrite {
+                cluster_id: 0,
+                kept_indices: vec![],
+                old_offset: 0,
+                old_count: 6,
+            }],
+            patch: ClusterPatchAppend::from_extract(verts, vec![0, 1, 2, 0, 1, 2]),
+        };
+        let go = entry.model.grid_origin();
+        entry.view.apply_cluster_delta(&delta, go, 1.0);
+        let patch_off = entry.view.meshlet_clusters.last().unwrap().index_offset;
+        assert_eq!(patch_off, 0, "patch reuses A's freed interior range");
+        assert_eq!(entry.view.mesh_indices.len(), 12, "no slab growth — reused the hole");
+
+        // Order observability: two partial rewrites, applied [A,B] vs [B,A].
+        let mk = || {
+            let mut e = entry_with_indices(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            e.view.meshlet_clusters.push(cluster([0.0; 3], [1.0; 3], 0, 6));
+            e.view.meshlet_clusters.push(cluster([0.0; 3], [1.0; 3], 6, 6));
+            e
+        };
+        let rw_a = ClusterFilterRewrite { cluster_id: 0, kept_indices: vec![0, 1, 2], old_offset: 0, old_count: 6 };
+        let rw_b = ClusterFilterRewrite { cluster_id: 1, kept_indices: vec![6, 7, 8], old_offset: 6, old_count: 6 };
+
+        let mut ea = mk();
+        ea.view.apply_cluster_delta(
+            &ClusterDelta { filter_rewrites: vec![rw_a.clone(), rw_b.clone()], patch: None },
+            go, 1.0,
+        );
+        let mut eb = mk();
+        eb.view.apply_cluster_delta(
+            &ClusterDelta { filter_rewrites: vec![rw_b, rw_a], patch: None },
+            go, 1.0,
+        );
+
+        // State identical regardless of order …
+        assert_eq!(ea.view.mesh_indices, eb.view.mesh_indices);
+        assert_eq!(ea.view.mesh_indices_free_list, eb.view.mesh_indices_free_list);
+        assert_eq!(ea.view.mesh_indices_next_free, eb.view.mesh_indices_next_free);
+        // … but the dirty-mark SEQUENCE is reversed (order-observable).
+        let da: Vec<_> = ea.view.mesh_indices_dirty.iter().collect();
+        let db: Vec<_> = eb.view.mesh_indices_dirty.iter().collect();
+        assert_ne!(da, db, "rewrite order is observable in the dirty-mark sequence");
+        assert_eq!(da, vec![(0, 12), (24, 12)]);
+        assert_eq!(db, vec![(24, 12), (0, 12)]);
+    }
+
+    /// T5 — KeepAll-equivalent: empty filter, patch present → slab untouched
+    /// except the patch's own bump alloc.
+    #[test]
+    fn delta_keep_all_then_patch() {
+        let mut entry = entry_with_indices(&[]);
+        let verts = vec![pv([0.0; 3]), pv([1.0, 0.0, 0.0]), pv([0.0, 1.0, 0.0])];
+        let delta = ClusterDelta {
+            filter_rewrites: vec![],
+            patch: ClusterPatchAppend::from_extract(verts, vec![0, 1, 2]),
+        };
+        let go = entry.model.grid_origin();
+        entry.view.apply_cluster_delta(&delta, go, 1.0);
+        assert!(entry.view.mesh_indices_free_list.is_empty());
+        assert_eq!(entry.view.mesh_indices_next_free, 3);
+        assert_eq!(entry.view.meshlet_clusters.len(), 1);
+    }
+
+    /// T7 — the Step-4 consolidation invariant, on which all three
+    /// incremental orchestrators rely: applying a COMBINED delta
+    /// (`{filter + patch}`) in one call is bit-identical to applying the
+    /// filter-only delta then the patch-only delta in two calls (the old
+    /// `remesh_filter_dirty_clusters` wrapper, then `append_remesh_patch`).
+    /// `apply_cluster_delta` orders filter-before-patch internally and
+    /// nothing mutates the view between the two old calls (the extract is
+    /// view-independent), so the two forms must agree across every field.
+    #[test]
+    fn delta_combined_equals_filter_then_patch() {
+        let mk = || {
+            // Two bake-time clusters A [0..6), B [6..12).
+            let mut e = entry_with_indices(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            e.view.meshlet_clusters.push(cluster([0.0; 3], [1.0; 3], 0, 6));
+            e.view.meshlet_clusters.push(cluster([0.0; 3], [1.0; 3], 6, 6));
+            e
+        };
+        let rewrites = vec![ClusterFilterRewrite {
+            cluster_id: 0,
+            kept_indices: vec![0, 1, 2],
+            old_offset: 0,
+            old_count: 6,
+        }];
+        let verts = vec![pv([0.0; 3]), pv([1.0, 0.0, 0.0]), pv([0.0, 1.0, 0.0])];
+        let patch = ClusterPatchAppend::from_extract(verts, vec![0, 1, 2]);
+
+        // A: one combined apply.
+        let mut a = mk();
+        let go = a.model.grid_origin();
+        a.view.apply_cluster_delta(
+            &ClusterDelta {
+                filter_rewrites: rewrites.clone(),
+                patch: patch.clone(),
+            },
+            go,
+            1.0,
+        );
+
+        // B: filter-only apply, then patch-only apply (the old two-call shape).
+        let mut b = mk();
+        b.view.apply_cluster_delta(
+            &ClusterDelta {
+                filter_rewrites: rewrites,
+                patch: None,
+            },
+            go,
+            1.0,
+        );
+        b.view.apply_cluster_delta(
+            &ClusterDelta {
+                filter_rewrites: vec![],
+                patch,
+            },
+            go,
+            1.0,
+        );
+
+        assert_eq!(a.view.mesh_vertices, b.view.mesh_vertices);
+        assert_eq!(a.view.mesh_indices, b.view.mesh_indices);
+        assert_eq!(a.view.meshlet_clusters, b.view.meshlet_clusters);
+        assert_eq!(a.view.mesh_indices_free_list, b.view.mesh_indices_free_list);
+        assert_eq!(a.view.mesh_indices_next_free, b.view.mesh_indices_next_free);
+        assert_eq!(
+            a.view.mesh_indices_dirty.iter().collect::<Vec<_>>(),
+            b.view.mesh_indices_dirty.iter().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            a.view.mesh_vertices_dirty.iter().collect::<Vec<_>>(),
+            b.view.mesh_vertices_dirty.iter().collect::<Vec<_>>(),
+        );
     }
 }

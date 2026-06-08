@@ -18,10 +18,10 @@ use std::collections::HashSet;
 use glam::{IVec3, UVec3, Vec3};
 
 use arvx_core::brick_pool::{BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
-use arvx_core::mesh_extract::{
-    collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
-    extract_surface_mesh_haloed, CELL_INTERIOR,
-};
+use arvx_core::mesh_extract::{collect_cell_map_in_region, CELL_INTERIOR};
+
+use super::cluster_delta::{ClusterDelta, ClusterPatchAppend};
+use super::mesher::{FullExtractArgs, RegionExtractArgs};
 use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sparse_octree::{brick_id, is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE};
 use arvx_core::LeafAttr;
@@ -489,9 +489,9 @@ impl super::mesher::Mesher {
         };
 
         // Phases 1–3: query the dirty clusters overlapping the slab and
-        // drop the stale boundary triangles (`BoxTouch` predicate), all
-        // in the shared executor.
-        let (dirty, stats) = self.remesh_filter_dirty_clusters(model, view, &region);
+        // compute the boundary-triangle drops (`BoxTouch` predicate). The
+        // rewrites are applied together with the slab patch below.
+        let (dirty, filter_rewrites, stats) = self.compute_filter_delta(model, view, &region);
 
         // Phase 4: re-extract the slab region. (Terrain does NOT splat
         // ∇D normals into the pool — the band refresh only welds the
@@ -511,29 +511,33 @@ impl super::mesher::Mesher {
                 cells_hi,
             );
             let cells_count = cells.len();
-            let (verts, indices) = extract_mesh_region_from_cells_pooled_haloed(
-                &mut self.scratch,
-                &cells,
-                region.extract_lo,
-                region.extract_hi,
-                model.cpu_octree.as_slice(),
-                depth,
-                base_vs,
+            let (verts, indices) = self.surface_mesher.extract_region(&RegionExtractArgs {
+                cells: &cells,
+                region_min: region.extract_lo,
+                region_max: region.extract_hi,
+                octree_nodes: model.cpu_octree.as_slice(),
+                octree_depth: depth,
+                base_voxel_size: base_vs,
                 grid_origin,
-                brick_pool.as_slice(),
-                leaf_attr_pool.as_slice(),
-                leaf_attr_pool.bones_as_slice(),
-                &model.halo_cells,
-                Some(&model.sculpt_owned_slots),
-                None::<&fn(glam::Vec3) -> f32>,
-            );
+                brick_cells: brick_pool.as_slice(),
+                leaf_attr_pool: leaf_attr_pool.as_slice(),
+                bone_voxel_pool: leaf_attr_pool.bones_as_slice(),
+                halo_cells: &model.halo_cells,
+                sculpt_slots: Some(&model.sculpt_owned_slots),
+            });
             (verts, indices, cells_count)
         };
 
-        // Phase 5: append the slab as a fresh LOD-0 patch cluster.
+        // Phase 5: apply the combined cluster delta — drop the filtered
+        // boundary tris (computed above) then append the slab as a fresh
+        // born-dirty LOD-0 patch cluster. No splat (see Phase 4).
         let patch_verts_count = slab_verts.len();
         let patch_indices_count = slab_indices.len();
-        self.append_remesh_patch(view, &slab_verts, &slab_indices, grid_origin, base_vs);
+        let delta = ClusterDelta {
+            filter_rewrites,
+            patch: ClusterPatchAppend::from_extract(slab_verts, slab_indices),
+        };
+        view.apply_cluster_delta(&delta, grid_origin, base_vs);
 
         // Phase 6: CC-walk LOD_DIRTY marking over slab AABB. Forces
         // the LOD selector to drop dirty ancestors and admit dirty
@@ -580,7 +584,7 @@ impl super::mesher::Mesher {
     /// Called from `apply_halo_refresh` after the halo cells are
     /// updated.
     fn rebuild_asset_mesh_haloed(
-        &self,
+        &mut self,
         model: &VoxelModel,
         view: &mut MeshView,
         brick_pool: &BrickPool,
@@ -597,27 +601,23 @@ impl super::mesher::Mesher {
             (depth, voxel_size, grid_origin, model.halo_cells.clone())
         };
 
-        let (vertices, indices_unc) = {
-            let nodes = model.cpu_octree.as_slice();
-            extract_surface_mesh_haloed(
-                nodes,
-                depth,
-                voxel_size,
-                grid_origin,
-                brick_pool.as_slice(),
-                leaf_attr_pool.as_slice(),
-                leaf_attr_pool.bones_as_slice(),
-                &halo_cells,
-                TILE_HALO_VOXELS as u32,
-                // Halo refresh re-extracts the whole target tile —
-                // bias the SN tie-break toward sculpt-allocated
-                // slots so brush-added cells along the boundary
-                // keep their material/colour against neighbour
-                // halo cells (which always carry the procedural
-                // material).
-                Some(&model.sculpt_owned_slots),
-            )
-        };
+        let (vertices, indices_unc) = self.surface_mesher.extract_full(&FullExtractArgs {
+            octree_nodes: model.cpu_octree.as_slice(),
+            octree_depth: depth,
+            base_voxel_size: voxel_size,
+            grid_origin,
+            brick_cells: brick_pool.as_slice(),
+            leaf_attr_pool: leaf_attr_pool.as_slice(),
+            bone_voxel_pool: leaf_attr_pool.bones_as_slice(),
+            halo_cells: &halo_cells,
+            halo: TILE_HALO_VOXELS as u32,
+            // Halo refresh re-extracts the whole target tile — bias the SN
+            // tie-break toward sculpt-allocated slots so brush-added cells
+            // along the boundary keep their material/colour against
+            // neighbour halo cells (which always carry the procedural
+            // material).
+            sculpt_slots: Some(&model.sculpt_owned_slots),
+        });
 
         if vertices.is_empty() {
             view.mesh_vertices.clear();

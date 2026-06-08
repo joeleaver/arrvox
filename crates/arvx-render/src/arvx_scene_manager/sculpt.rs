@@ -28,10 +28,10 @@ use glam::{Affine3A, IVec3, Vec3};
 
 
 use super::remesh_region::{RemeshFilter, RemeshRegion};
-use arvx_core::mesh_extract::{
-    collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
-    extract_surface_mesh, MeshVertex,
-};
+use arvx_core::mesh_extract::{collect_cell_map_in_region, MeshVertex};
+
+use super::cluster_delta::{ClusterDelta, ClusterPatchAppend};
+use super::mesher::{FullExtractArgs, RegionExtractArgs};
 use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sculpt::{
     apply_delta, brush_cell_range, compute_brush_edits_in_stroke, BrushMode, BrushOp,
@@ -1051,7 +1051,10 @@ impl super::mesher::Mesher {
             RemeshFilter::KeepAll
         };
         let region = RemeshRegion::brush(brush_lo, brush_hi, filter);
-        let (dirty, filter_stats) = self.remesh_filter_dirty_clusters(model, view, &region);
+        // Compute the filter rewrites now (reads the pre-edit view); they're
+        // applied together with the patch in one `apply_cluster_delta` below.
+        let (dirty, filter_rewrites, filter_stats) =
+            self.compute_filter_delta(model, view, &region);
         if dirty.is_empty() {
             return false;
         }
@@ -1088,26 +1091,20 @@ impl super::mesher::Mesher {
         let _ph_t3b = std::time::Instant::now();
 
         let (brush_verts, brush_indices) = {
-            extract_mesh_region_from_cells_pooled_haloed(
-                &mut self.scratch,
-                &cells,
-                brush_lo,
-                brush_hi,
-                model.cpu_octree.as_slice(),
-                depth,
-                base_vs,
+            self.surface_mesher.extract_region(&RegionExtractArgs {
+                cells: &cells,
+                region_min: brush_lo,
+                region_max: brush_hi,
+                octree_nodes: model.cpu_octree.as_slice(),
+                octree_depth: depth,
+                base_voxel_size: base_vs,
                 grid_origin,
-                brick_pool.as_slice(),
-                leaf_attr_pool.as_slice(),
-                leaf_attr_pool.bones_as_slice(),
-                &model.halo_cells,
-                Some(&model.sculpt_owned_slots),
-                // TODO(stage-b): sdf_fn param now always None on the
-                // sculpt path (brush projection deleted in A4); remove
-                // the generic sdf_fn thread from the extract fns in
-                // cleanup.
-                None::<&fn(Vec3) -> f32>,
-            )
+                brick_cells: brick_pool.as_slice(),
+                leaf_attr_pool: leaf_attr_pool.as_slice(),
+                bone_voxel_pool: leaf_attr_pool.bones_as_slice(),
+                halo_cells: &model.halo_cells,
+                sculpt_slots: Some(&model.sculpt_owned_slots),
+            })
         };
         let _p_extract_mesh_ms = _ph_t3b.elapsed().as_secs_f64() * 1000.0;
 
@@ -1129,14 +1126,21 @@ impl super::mesher::Mesher {
         _p_extract_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
         let _ph_t4 = std::time::Instant::now();
 
-        // ── Phase 3: append brush region as a new LOD-0 patch cluster ─
-        // Shared with the stroke + terrain-band paths via
-        // `append_remesh_patch`: extend the VBO (marking the appended
-        // tail dirty), slab-allocate + rebase the IBO range, push the
-        // born-dirty standalone patch cluster, and index it spatially so
-        // the next stamp's dirty query finds it. No-op when the extract
-        // produced no verts.
-        self.append_remesh_patch(view, &brush_verts, &brush_indices, grid_origin, base_vs);
+        // ── Phase 3: apply the combined cluster delta ─────────────────
+        // One `apply_cluster_delta`: drop the filtered tris (computed
+        // above) then append the brush region as a new born-dirty LOD-0
+        // patch cluster (extend the VBO marking the appended tail dirty,
+        // slab-allocate + rebase the IBO range, push the cluster, index it
+        // spatially so the next stamp's dirty query finds it). The patch is
+        // `None` when the extract produced no verts. `brush_verts` is moved
+        // in here, so the splat above reads it first.
+        let brush_patch_verts = brush_verts.len();
+        let brush_patch_tris = brush_indices.len() / 3;
+        let delta = ClusterDelta {
+            filter_rewrites,
+            patch: ClusterPatchAppend::from_extract(brush_verts, brush_indices),
+        };
+        view.apply_cluster_delta(&delta, grid_origin, base_vs);
 
         _p_append_patch_ms = _ph_t4.elapsed().as_secs_f64() * 1000.0;
         let _ph_t5 = std::time::Instant::now();
@@ -1275,8 +1279,8 @@ impl super::mesher::Mesher {
             d1_clusters_sphere_outside,
             total_kept_tris,
             total_dropped_tris,
-            brush_verts.len(),
-            brush_indices.len() / 3,
+            brush_patch_verts,
+            brush_patch_tris,
             view.mesh_vertices.len(),
             view.mesh_indices.len(),
             walk_visited_count,
@@ -1309,7 +1313,7 @@ impl super::mesher::Mesher {
     /// R4 covers; for now the cost is bounded by surface area + DAG
     /// build at `LOD_LEVELS=1` (no multi-level simplify).
     fn rebuild_asset_mesh(
-        &self,
+        &mut self,
         model: &VoxelModel,
         view: &mut MeshView,
         brick_pool: &BrickPool,
@@ -1327,20 +1331,22 @@ impl super::mesher::Mesher {
         let aabb_center = (model.aabb.min + model.aabb.max) * 0.5;
         let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
 
-        let (vertices, indices_unc) = extract_surface_mesh(
-            model.cpu_octree.as_slice(),
-            depth,
-            voxel_size,
+        let (vertices, indices_unc) = self.surface_mesher.extract_full(&FullExtractArgs {
+            octree_nodes: model.cpu_octree.as_slice(),
+            octree_depth: depth,
+            base_voxel_size: voxel_size,
             grid_origin,
-            brick_pool.as_slice(),
-            leaf_attr_pool.as_slice(),
-            leaf_attr_pool.bones_as_slice(),
+            brick_cells: brick_pool.as_slice(),
+            leaf_attr_pool: leaf_attr_pool.as_slice(),
+            bone_voxel_pool: leaf_attr_pool.bones_as_slice(),
+            halo_cells: &[],
+            halo: 0,
             // Sculpt full re-extract — bias the SN tie-break toward
             // sculpt-allocated slots so brush-added cells keep their
             // material/colour at vertices shared with procedural
             // neighbours.
-            Some(&model.sculpt_owned_slots),
-        );
+            sculpt_slots: Some(&model.sculpt_owned_slots),
+        });
 
         if vertices.is_empty() {
             // Asset carved away to nothing — clear mesh state. The
@@ -1474,7 +1480,10 @@ impl super::mesher::Mesher {
                 max: filter_max,
             },
         );
-        let (dirty, _filter_stats) = self.remesh_filter_dirty_clusters(model, view, &region);
+        // Compute the filter rewrites against the post-compaction table
+        // (Step 2 above renumbered clusters); applied with the patch below.
+        let (dirty, filter_rewrites, _filter_stats) =
+            self.compute_filter_delta(model, view, &region);
 
         // ── Step 4: extract mesh over the union AABB ──
         let cells_min = union_lo - IVec3::splat(3);
@@ -1489,26 +1498,20 @@ impl super::mesher::Mesher {
             )
         };
         let (stroke_verts, stroke_indices) = {
-            extract_mesh_region_from_cells_pooled_haloed(
-                &mut self.scratch,
-                &cells,
-                union_lo,
-                union_hi,
-                model.cpu_octree.as_slice(),
-                depth,
-                base_vs,
+            self.surface_mesher.extract_region(&RegionExtractArgs {
+                cells: &cells,
+                region_min: union_lo,
+                region_max: union_hi,
+                octree_nodes: model.cpu_octree.as_slice(),
+                octree_depth: depth,
+                base_voxel_size: base_vs,
                 grid_origin,
-                brick_pool.as_slice(),
-                leaf_attr_pool.as_slice(),
-                leaf_attr_pool.bones_as_slice(),
-                &model.halo_cells,
-                Some(&model.sculpt_owned_slots),
-                // TODO(stage-b): sdf_fn param now always None on the
-                // sculpt path (stroke projection deleted in A4); remove
-                // the generic sdf_fn thread from the extract fns in
-                // cleanup.
-                None::<&fn(Vec3) -> f32>,
-            )
+                brick_cells: brick_pool.as_slice(),
+                leaf_attr_pool: leaf_attr_pool.as_slice(),
+                bone_voxel_pool: leaf_attr_pool.bones_as_slice(),
+                halo_cells: &model.halo_cells,
+                sculpt_slots: Some(&model.sculpt_owned_slots),
+            })
         };
 
         // ── Step 5: smoothing is done in the extract ──
@@ -1526,14 +1529,21 @@ impl super::mesher::Mesher {
         // per-leaf normal, not the mesh vertex normal.
         splat_relaxed_normals(&stroke_verts, leaf_attr_pool);
 
-        // ── Step 6: append as unified patch cluster ──
-        // Shared `append_remesh_patch` builds the born-dirty standalone
-        // patch cluster (VBO extend + dirty-mark, slab IBO alloc +
-        // rebase, spatial insert). The returned id is handed back to the
-        // wrapper, which records it in the per-handle stroke state so the
-        // next stamp in this stroke replaces it (Step 2).
-        let new_patch_id =
-            self.append_remesh_patch(view, &stroke_verts, &stroke_indices, grid_origin, base_vs);
+        // ── Step 6: apply the combined cluster delta ──
+        // One `apply_cluster_delta`: drop the filtered bake-time tris then
+        // append the union region as a born-dirty standalone patch cluster
+        // (VBO extend + dirty-mark, slab IBO alloc + rebase, spatial
+        // insert). The returned id is handed back to the wrapper, which
+        // records it in the per-handle stroke state so the next stamp in
+        // this stroke replaces it (Step 2). `stroke_verts` is moved in, so
+        // the splat above reads it first.
+        let stroke_patch_verts = stroke_verts.len();
+        let stroke_patch_tris = stroke_indices.len() / 3;
+        let delta = ClusterDelta {
+            filter_rewrites,
+            patch: ClusterPatchAppend::from_extract(stroke_verts, stroke_indices),
+        };
+        let new_patch_id = view.apply_cluster_delta(&delta, grid_origin, base_vs);
 
         // ── Step 7: LOD dirty + cleanup ──
         let union_aabb_min_local = grid_origin + union_lo.as_vec3() * base_vs - Vec3::splat(base_vs);
@@ -1555,8 +1565,8 @@ impl super::mesher::Mesher {
             "[sculpt] stroke-extract: union=[{},{},{}→{},{},{}] verts={} tris={} ({:.2}ms)",
             union_lo.x, union_lo.y, union_lo.z,
             union_hi.x, union_hi.y, union_hi.z,
-            stroke_verts.len(),
-            stroke_indices.len() / 3,
+            stroke_patch_verts,
+            stroke_patch_tris,
             t0.elapsed().as_secs_f64() * 1000.0,
         );
 
