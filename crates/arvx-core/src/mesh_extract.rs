@@ -857,6 +857,8 @@ pub fn extract_surface_mesh_haloed(
         // No per-leaf distance on the import path yet → legacy binary
         // surface nets (Stage 2 gates QEF on the terrain bake only).
         &[],
+        // Binary imports have no procedural source → no analytic normal.
+        None,
     )
 }
 
@@ -895,6 +897,15 @@ pub fn extract_surface_mesh_density_haloed(
     // tile meshes via QEF-Hermite (smooth-by-construction) instead of the
     // blur path. `&[]` keeps the legacy blur behaviour bit-identical.
     dists: &[i16],
+    // Optional analytic SHADING NORMAL: world position → outward
+    // `∇sd` (un-normalized). When supplied AND in QEF mode, the vertex
+    // normal is this evaluated AT THE VERTEX — the EXACT surface normal,
+    // no grid reconstruction. The terrain bake passes
+    // `terrain_fn.sample_grad`-at-world on pure-procedural tiles; `None`
+    // falls back to the interpolated `∇D` field. Generalizes to 3D SDF
+    // terrain unchanged (`∇sd` is the normal whether `sd` is a
+    // heightfield gap or a true 3D field).
+    surface_normal_fn: Option<&dyn Fn(Vec3) -> Vec3>,
 ) -> (Vec<MeshVertex>, Vec<u32>) {
     extract_surface_mesh_haloed_impl(
         octree_nodes,
@@ -914,6 +925,7 @@ pub fn extract_surface_mesh_density_haloed(
         // _project`) can force it off for the bench baseline.
         TERRAIN_PLANE_FIT_RADIUS,
         dists,
+        surface_normal_fn,
     )
 }
 
@@ -954,6 +966,11 @@ fn extract_surface_mesh_haloed_impl(
     // the QEF-Hermite mesher (Stage 2 bench gate; Stage 5 makes presence
     // alone the production gate). Empty keeps the legacy blur/binary path.
     dists: &[i16],
+    // Optional analytic shading-normal callback (world → outward `∇sd`).
+    // QEF mode shades from this evaluated at the vertex when supplied
+    // (exact normal); otherwise from the interpolated `∇D` field. See
+    // [`extract_surface_mesh_density_haloed`].
+    surface_normal_fn: Option<&dyn Fn(Vec3) -> Vec3>,
 ) -> (Vec<MeshVertex>, Vec<u32>) {
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
@@ -1341,10 +1358,14 @@ fn extract_surface_mesh_haloed_impl(
                             )
                         } else if use_qef {
                             // Sign topology + QEF-Hermite position from the
-                            // stored distance, but the smooth interpolated
-                            // `∇D` SHADING NORMAL (`density_grid_fn = None`
-                            // keeps corner classification + position on the
-                            // sign/QEF path; only the normal comes from `∇D`).
+                            // stored distance. SHADING NORMAL: the caller's
+                            // analytic `∇sd` evaluated AT THE VERTEX (exact —
+                            // no grid reconstruction) when supplied, else the
+                            // smooth interpolated `∇D` field. `density_grid_fn
+                            // = None` keeps corner classification + position
+                            // on the sign/QEF path; only the normal differs.
+                            let qef_normal: &dyn Fn(Vec3) -> Vec3 =
+                                surface_normal_fn.unwrap_or(&outward_normal);
                             build_cube_vertex(
                                 cube,
                                 cell_lookup,
@@ -1354,7 +1375,7 @@ fn extract_surface_mesh_haloed_impl(
                                 bone_voxel_pool,
                                 sculpt_slots,
                                 None::<&fn(Vec3) -> f32>,
-                                Some(&outward_normal),
+                                Some(qef_normal),
                                 None::<&fn(Vec3) -> f32>,
                                 None::<&fn(Vec3) -> Vec3>,
                                 DENSITY_ISO,
@@ -2353,7 +2374,10 @@ fn build_cube_vertex<F, S, N, D, G>(
 where
     F: Fn(IVec3) -> Option<u32>,
     S: Fn(Vec3) -> f32,
-    N: Fn(Vec3) -> Vec3,
+    // `?Sized` so the caller can pass a `&dyn Fn` normal callback (the
+    // analytic shading normal threaded through the terrain bake) as well
+    // as a concrete closure (the `∇D` / corner-average paths).
+    N: Fn(Vec3) -> Vec3 + ?Sized,
     D: Fn(Vec3) -> f32,
     G: Fn(Vec3) -> Vec3,
 {

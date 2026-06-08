@@ -404,6 +404,10 @@ pub fn write_artifact_rkp(
             halo_width,
             // Terrain bake → QEF-Hermite when the artifact carries distances.
             &artifact.leaf_attr_dists,
+            // No procedural source here (artifact write / import) → `∇D`
+            // shading. Live terrain bakes supply the analytic normal in
+            // `bake_tile`; this path re-extracts a stored artifact.
+            None,
         )
     };
     let mesh_sections = if !mesh_blob.vertices.is_empty() {
@@ -599,6 +603,12 @@ pub fn build_mesh_sections_blob_density_haloed(
     // Non-empty selects the QEF-Hermite mesher (the terrain bake passes the
     // artifact's `leaf_attr_dists`); `&[]` keeps the blur fallback.
     dists: &[i16],
+    // Optional analytic shading-normal callback (world → outward `∇sd`).
+    // In QEF mode the vertex normal is this evaluated at the vertex (the
+    // EXACT surface normal) when supplied; `None` falls back to the
+    // interpolated `∇D` field. The terrain bake passes
+    // `terrain_fn.sample_grad`-at-world on pure-procedural tiles.
+    surface_normal_fn: Option<&dyn Fn(glam::Vec3) -> glam::Vec3>,
 ) -> MeshSectionsBlob {
     if octree_nodes.is_empty() || leaf_attrs.is_empty() {
         return MeshSectionsBlob::default();
@@ -617,6 +627,7 @@ pub fn build_mesh_sections_blob_density_haloed(
             // Bake-time extract: no sculpt history yet.
             None,
             dists,
+            surface_normal_fn,
         );
     if vertices.is_empty() || indices_unclustered.is_empty() {
         return MeshSectionsBlob::default();

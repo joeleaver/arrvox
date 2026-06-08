@@ -1681,6 +1681,7 @@ pub fn bake_heightfield(hf: &HeightField, half_world: f32, voxel_size: f32) -> H
         REPRO_TILE_HALO,
         None,
         &[],
+        None,
     );
     let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
     HeightMesh {
@@ -1787,6 +1788,7 @@ pub fn bake_heightfield_blur_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32)
         REPRO_TILE_HALO,
         None,
         &[],
+        None,
     );
     let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
     HeightMesh {
@@ -1826,8 +1828,72 @@ pub fn bake_heightfield_qef_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32) 
         REPRO_TILE_HALO,
         None,
         &artifact.leaf_attr_dists,
+        None,
     );
 
+    let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
+    HeightMesh {
+        verts,
+        indices,
+        grid_origin: artifact.grid_origin,
+        voxel_size,
+        surface_cells,
+    }
+}
+
+/// QEF bake with an ANALYTIC gradient handed to the voxelizer, so the
+/// per-leaf normals are exact (zero finite-difference error). `grad`
+/// returns `(∂h/∂x, ∂h/∂z)`; the closure passes the voxelizer
+/// `∇sd = (−h_x, 1, −h_z)`. After the M1 mesher change the QEF path
+/// shades from the stored-normal field these seed — this is the
+/// accuracy-tracking variant `qef_hermite_normals_track_analytic` uses.
+pub fn bake_heightfield_qef_analytic_aabb(
+    hf: &HeightField,
+    grad: impl Fn(f32, f32) -> (f32, f32),
+    aabb: Aabb,
+    voxel_size: f32,
+) -> HeightMesh {
+    let h = &hf.h;
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
+        positions
+            .iter()
+            .map(|p| {
+                let (hx, hz) = grad(p.x, p.z);
+                (
+                    p.y - h(p.x, p.z),
+                    1u16,
+                    1u16,
+                    0u8,
+                    0u32,
+                    Some(Vec3::new(-hx, 1.0, -hz)),
+                )
+            })
+            .collect()
+    };
+    let artifact = voxelize_to_artifact(sdf_fn, &aabb, voxel_size, REPRO_TILE_HALO)
+        .expect("heightfield voxelize_to_artifact");
+    let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
+    // Exact analytic shading normal at the vertex: `∇sd = (−h_x, 1, −h_z)`
+    // evaluated at the vertex's (x, z) — the production terrain bake's
+    // `terrain_fn.sample_grad`-at-world equivalent.
+    let normal_fn = |p: Vec3| -> Vec3 {
+        let (hx, hz) = grad(p.x, p.z);
+        Vec3::new(-hx, 1.0, -hz)
+    };
+    let (verts, indices) = extract_surface_mesh_density_haloed(
+        artifact.octree.as_slice(),
+        artifact.octree.depth(),
+        voxel_size,
+        artifact.grid_origin,
+        &brick_pool_flat,
+        &artifact.leaf_attrs,
+        &[],
+        &artifact.halo_cells,
+        REPRO_TILE_HALO,
+        None,
+        &artifact.leaf_attr_dists,
+        Some(&normal_fn),
+    );
     let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
     HeightMesh {
         verts,
@@ -2707,6 +2773,90 @@ mod tests {
         assert!(
             qef <= blur * 1.5 + 0.15,
             "QEF normals speckle: max adjacent-vertex angle {qef:.3} rad vs blur {blur:.3}"
+        );
+    }
+
+    /// **M1 — QEF shades from the analytic field callback, giving the
+    /// EXACT surface normal at each vertex.** A rippled surface baked
+    /// with analytic gradients + an analytic shading-normal callback:
+    /// the vertex normal is `∇sd` evaluated at the vertex (the "derive
+    /// the normal from the field" approach), so it matches the analytic
+    /// surface normal to near the octahedral-pack floor — markedly
+    /// tighter than the blur path's `∇D`, which reconstructs the normal
+    /// from blurred occupancy and rounds the relief off. Both meshes are
+    /// scored at their own vertices against the same closed-form truth.
+    #[test]
+    fn qef_hermite_normals_track_analytic() {
+        let amp = 0.16f32;
+        // Wavelength 2 world units = 8 voxels at vs = 0.25 — relief at the
+        // scale the R=2 occupancy blur (∇D) rounds off, but the analytic
+        // callback captures exactly.
+        let k = 2.0 * std::f32::consts::PI / 2.0;
+        let hf = HeightField {
+            name: "ripple".into(),
+            h: Box::new(move |x: f32, z: f32| amp * (k * x).sin() * (k * z).cos()),
+        };
+        let grad = move |x: f32, z: f32| -> (f32, f32) {
+            let hx = amp * k * (k * x).cos() * (k * z).cos();
+            let hz = -amp * k * (k * x).sin() * (k * z).sin();
+            (hx, hz)
+        };
+        let truth = move |x: f32, z: f32| -> Vec3 {
+            let (hx, hz) = grad(x, z);
+            Vec3::new(-hx, 1.0, -hz).normalize()
+        };
+        let vs = 0.25f32;
+        let aabb = heightfield_tile_aabb(6.0, vs);
+
+        let qef = bake_heightfield_qef_analytic_aabb(&hf, grad, aabb, vs);
+        let blur = bake_heightfield_blur_aabb(&hf, aabb, vs);
+
+        // Mean shading-normal error (radians) over up-facing interior
+        // vertices, vs the analytic surface normal at the vertex (x, z).
+        let mean_err = |m: &HeightMesh| -> (f32, usize) {
+            let lim = aabb.max.x - 6.0 * vs; // skip the outer halo/edge ring
+            let mut sum = 0.0f32;
+            let mut n = 0usize;
+            for v in &m.verts {
+                let nrm = unpack_oct(v.normal_oct).normalize_or_zero();
+                if nrm.length_squared() < 0.5 || nrm.y < 0.3 {
+                    continue;
+                }
+                let p = Vec3::from(v.local_pos);
+                if p.x.abs() > lim || p.z.abs() > lim {
+                    continue;
+                }
+                sum += nrm.dot(truth(p.x, p.z)).clamp(-1.0, 1.0).acos();
+                n += 1;
+            }
+            (if n > 0 { sum / n as f32 } else { 0.0 }, n)
+        };
+
+        let (qef_err, qef_n) = mean_err(&qef);
+        let (blur_err, blur_n) = mean_err(&blur);
+        assert!(qef_n > 200 && blur_n > 200, "need a dense surface (qef {qef_n}, blur {blur_n})");
+
+        eprintln!(
+            "[M1] mean shading-normal error vs analytic ripple: \
+             qef(analytic callback)={:.3}°  blur(∇D)={:.3}°  (ratio {:.3})",
+            qef_err.to_degrees(),
+            blur_err.to_degrees(),
+            qef_err / blur_err.max(1e-9),
+        );
+
+        // The analytic callback gives the EXACT normal at the vertex —
+        // error near the octahedral-pack floor, and a large multiple
+        // tighter than the relief-losing ∇D.
+        assert!(
+            qef_err.to_degrees() < 0.5,
+            "QEF analytic-callback normal should be near-exact; got {:.3}°",
+            qef_err.to_degrees(),
+        );
+        assert!(
+            qef_err < blur_err * 0.25,
+            "analytic callback ({:.3}°) should be ≥4× tighter than ∇D ({:.3}°)",
+            qef_err.to_degrees(),
+            blur_err.to_degrees(),
         );
     }
 

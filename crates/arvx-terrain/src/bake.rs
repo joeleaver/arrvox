@@ -232,13 +232,30 @@ pub fn bake_tile_with_skirts(
     // it as `brick_id * BRICK_CELLS + flat`.
     let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
 
-    // Mesh the tile through the blurred-occupancy → D-topology + ∇D
-    // path (the same one the sculpt re-extract uses). The blur
-    // de-staircases directly from occupancy, so the surface is smooth
-    // without any post-hoc heightfield Y-projection. Watertight across
-    // tile seams: the blurred density is a pure local function of
-    // occupancy within ±(R+1) ≤ TILE_HALO_VOXELS, so adjacent tiles
-    // sharing the halo compute bit-identical seam vertices.
+    // Exact analytic SHADING NORMAL: evaluate the TerrainFn's `∇sd` AT
+    // THE VERTEX (the "derive the normal from the field" approach), so
+    // the per-leaf accuracy from the analytic gradient actually reaches
+    // shading — no grid reconstruction, no `∇D` relief loss. Only on
+    // pure-procedural tiles (`use_analytic_grad`): stamps / regions /
+    // the world-envelope clamp warp the height, so the base gradient no
+    // longer describes the surface there and the mesher falls back to
+    // its interpolated `∇D`. Generalizes to 3D-SDF terrain unchanged
+    // (`sample_grad` returns `∇sd` either way). Pure function of world
+    // position ⇒ adjacent tiles agree at the seam.
+    let analytic_normal = |p_world: Vec3| -> Vec3 {
+        let local = p_world - tile_origin_world;
+        terrain_fn.sample_grad(key, local, voxel_size_m).unwrap_or(Vec3::Y)
+    };
+    let surface_normal_fn: Option<&dyn Fn(Vec3) -> Vec3> = if use_analytic_grad {
+        Some(&analytic_normal)
+    } else {
+        None
+    };
+
+    // Mesh the tile through the QEF-Hermite path. Watertight across tile
+    // seams: the per-leaf distance + the analytic normal are pure local
+    // functions of the shared halo, so adjacent tiles compute matching
+    // seam vertices.
     let mut mesh = build_mesh_sections_blob_density_haloed(
         artifact.octree.as_slice(),
         artifact.octree.depth(),
@@ -253,6 +270,8 @@ pub fn bake_tile_with_skirts(
         // artifact, so the tile meshes smooth-by-construction (no terracing)
         // instead of blur→D. `&[]` would keep the legacy blur path.
         &artifact.leaf_attr_dists,
+        // Exact analytic normal on pure-procedural tiles; `None` → `∇D`.
+        surface_normal_fn,
     );
 
     // V2 LOD pyramid: append lateral skirts so LOD-band cracks aren't

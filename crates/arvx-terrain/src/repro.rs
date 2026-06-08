@@ -198,6 +198,7 @@ pub fn bake_terrain_window(
         REPRO_TILE_HALO,
         None,
         &[],
+        None,
     );
 
     let surface_cells =
