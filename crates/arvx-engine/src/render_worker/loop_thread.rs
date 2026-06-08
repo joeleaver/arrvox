@@ -177,7 +177,18 @@ pub(super) fn run_render_thread(
             use std::sync::atomic::{AtomicU32, Ordering};
             static FRAME_LOG_COUNTER: AtomicU32 = AtomicU32::new(0);
             let n = FRAME_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-            if n % 60 == 0 {
+            // Always surface a STALL frame (>100ms = <10fps). The
+            // 60-frame cadence below would otherwise miss the single long
+            // frame during a cold terrain generation that lets the window
+            // surface go Outdated — the trigger for rinch #42's permanent
+            // "surface lost". This is the frame to correlate with the
+            // sim-side `[terrain-tick]` / `[geo-epoch]` lines.
+            if dt > 100.0 {
+                eprintln!(
+                    "[render-frame] STALL dt={dt:.1}ms (~{:.1} fps) — surface may go Outdated",
+                    1000.0 / dt.max(0.1)
+                );
+            } else if n % 60 == 0 {
                 eprintln!("[render-frame] dt={dt:.1}ms (~{:.1} fps)", 1000.0 / dt.max(0.1));
             }
         }

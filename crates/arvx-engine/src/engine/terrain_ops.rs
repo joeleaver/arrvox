@@ -72,11 +72,26 @@ impl super::state::EngineState {
         // Inspector edit re-queued an already-live tile). The
         // deferred eviction releases the old entity / asset *after*
         // the new one is in place so the renderer never sees a gap.
+        // Diagnostic: `ARVX_TERRAIN_PROFILE=1` logs the per-tick
+        // breakdown (how many tiles integrated this tick + the integrate
+        // cost). This is the unpaced main-thread cost suspected of
+        // stalling presentation long enough to trip the surface-Outdated
+        // path (rinch #42) on a cold terrain generation — correlate the
+        // `[terrain-tick]` line with `[render-frame] STALL` / `[geo-epoch]`.
+        let prof = std::env::var("ARVX_TERRAIN_PROFILE").is_ok();
+        let t_tick = std::time::Instant::now();
         let completed = runtime.streamer.drain_completed();
+        let n_completed = completed.len();
         let integrated_any = !completed.is_empty();
         let debug_hotswap = std::env::var("ARVX_TERRAIN_DEBUG").is_ok();
+        let mut integ_sum = std::time::Duration::ZERO;
+        let mut integ_max = std::time::Duration::ZERO;
         for (key, baked) in completed {
+            let t_i = std::time::Instant::now();
             let token = self.integrate_terrain_tile(&mut runtime, key, baked);
+            let dt_i = t_i.elapsed();
+            integ_sum += dt_i;
+            integ_max = integ_max.max(dt_i);
             match token {
                 Some(tok) => {
                     let prev = runtime.streamer.record_integrated(key, tok);
@@ -111,6 +126,7 @@ impl super::state::EngineState {
             }
         }
 
+        let t_p2 = std::time::Instant::now();
         // Phase 2 — residency + eviction. The dirty-tile set keeps
         // sculpted level-0 tiles pinned at fine LOD regardless of
         // distance, suppressing coarse tiles that would otherwise
@@ -122,15 +138,31 @@ impl super::state::EngineState {
         );
         let evicted_any = !evictions.is_empty();
         self.evict_terrain_tiles(&mut runtime, &evictions);
+        let p2 = t_p2.elapsed();
 
         // Phase 3 — nearest-first submission.
+        let t_p3 = std::time::Instant::now();
         runtime.streamer.submit_pending(&terrain);
+        let p3 = t_p3.elapsed();
 
         if integrated_any || evicted_any {
             // Defeat the transform-only fast path so the next
             // render-frame build picks up the new / removed tile
             // entities.
             self.gpu_objects_dirty.mark_all();
+        }
+
+        if prof && (integrated_any || evicted_any) {
+            eprintln!(
+                "[terrain-tick] integrated={n_completed} (integrate {:.1}ms, max_tile {:.1}ms) \
+                 evicted={} residency+evict={:.1}ms submit={:.1}ms tick_total={:.1}ms",
+                integ_sum.as_secs_f64() * 1000.0,
+                integ_max.as_secs_f64() * 1000.0,
+                evictions.len(),
+                p2.as_secs_f64() * 1000.0,
+                p3.as_secs_f64() * 1000.0,
+                t_tick.elapsed().as_secs_f64() * 1000.0,
+            );
         }
 
         self.terrain = Some(runtime);
