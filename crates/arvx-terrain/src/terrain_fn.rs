@@ -50,6 +50,26 @@ pub trait TerrainFn: Send + Sync {
     ///   voxelization, in metres. Implementations can use it to pick
     ///   an appropriate noise frequency for the resolution.
     fn sample(&self, tile: TileKey, local: Vec3, voxel_size_m: f32) -> TerrainSample;
+
+    /// Optional analytic gradient of the signed-distance field —
+    /// `∇sd = (∂sd/∂x, ∂sd/∂y, ∂sd/∂z)` in world units — at the same
+    /// point [`Self::sample`] evaluates.
+    ///
+    /// When `Some`, the voxelizer derives the per-leaf surface normal
+    /// (`∇sd.normalize()`) and the exact perpendicular distance directly
+    /// from this, skipping its 6-tap finite difference: exact normals,
+    /// faster bakes. When `None` (the default), the voxelizer falls back
+    /// to the finite difference. Implementations whose field is not
+    /// cheaply differentiable should leave this `None`.
+    ///
+    /// MUST be consistent with `sample` at the same `(tile, local,
+    /// voxel_size_m)` — same coordinate transform, same LOD octave
+    /// clamp. The bake path only consults it where the height is the
+    /// raw procedural value (no stamp / region / world-envelope warp),
+    /// since those post-modifications invalidate the analytic gradient.
+    fn sample_grad(&self, _tile: TileKey, _local: Vec3, _voxel_size_m: f32) -> Option<Vec3> {
+        None
+    }
 }
 
 #[cfg(test)]

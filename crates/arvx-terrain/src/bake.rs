@@ -129,6 +129,15 @@ pub fn bake_tile_with_skirts(
     // it even at the coarsest voxel size in a tile.
     let envelope_floor = world_floor_y.map(|f| f + 2.0 * voxel_size_m);
 
+    // Analytic gradient is only valid where the emitted height is the
+    // RAW TerrainFn value. Stamps, biome regions, and the world-envelope
+    // clamp all post-modify `h`, so the base-FBM gradient would no longer
+    // describe the surface — fall back to the voxelizer's 6-tap finite
+    // difference for any tile that has them. Pure-FBM tiles (the common
+    // case) get exact analytic normals + distances and skip the taps.
+    let use_analytic_grad =
+        stamps.is_empty() && regions.is_empty() && envelope_floor.is_none();
+
     // SDF callback: receives a batch of absolute-world positions from
     // the voxelizer, translates each to tile-local, asks the TerrainFn,
     // and folds Layer-2 stamps over the heightmap before repacking.
@@ -204,9 +213,14 @@ pub fn bake_tile_with_skirts(
                 }
 
                 let blend_u4 = (s.blend.clamp(0.0, 1.0) * 15.0).round() as u8;
-                // G2: no analytic gradient yet (None → 6-tap FD). G3
-                // wires `Some(∇sd)` here for unmodified-height positions.
-                (s.sd, s.primary_mat, s.secondary_mat, blend_u4, 0, None)
+                // Exact analytic ∇sd on pure-FBM tiles; `None` (6-tap FD)
+                // when stamps/regions/envelope warped the height above.
+                let grad = if use_analytic_grad {
+                    terrain_fn.sample_grad(key, local, voxel_size_m)
+                } else {
+                    None
+                };
+                (s.sd, s.primary_mat, s.secondary_mat, blend_u4, 0, grad)
             })
             .collect()
     };
@@ -887,6 +901,139 @@ mod tests {
         );
         assert!(baked.cluster_count() > 0, "should produce at least one cluster");
         assert!(baked.bake_time_ms > 0.0);
+    }
+
+    /// Mean angular error (radians) between each halo surface leaf's
+    /// STORED normal and the analytic FBM surface normal at that leaf's
+    /// **cell center**. The halo ring carries `(cell_coord, slot)` pairs
+    /// directly in the artifact, so the cell center is exact — the metric
+    /// isolates per-leaf gradient quality (analytic vs finite difference)
+    /// with no sub-voxel position confound. Returns `(mean_radians, n)`.
+    fn mean_halo_leaf_normal_error(
+        baked: &BakedTile,
+        fbm: &crate::fbm::FbmTerrainFnResolved,
+        octaves: u8,
+    ) -> (f32, usize) {
+        let attrs = &baked.artifact.leaf_attrs;
+        let go = baked.artifact.grid_origin;
+        let vs = baked.voxel_size_m;
+        let mut sum = 0.0f32;
+        let mut n = 0usize;
+        for &(coord, slot) in &baked.artifact.halo_cells {
+            // CELL_INTERIOR (and any sentinel) is out of the leaf range —
+            // only real surface leaves index into `leaf_attrs`.
+            let si = slot as usize;
+            if si >= attrs.len() {
+                continue;
+            }
+            let stored = attrs[si].normal().normalize_or_zero();
+            if stored.length_squared() < 0.5 {
+                continue;
+            }
+            let center = go
+                + Vec3::new(
+                    coord.x as f32 + 0.5,
+                    coord.y as f32 + 0.5,
+                    coord.z as f32 + 0.5,
+                ) * vs;
+            let (_, h_x, h_z) = fbm.height_grad_at_with_octaves(center.x, center.z, octaves);
+            let truth = Vec3::new(-h_x, 1.0, -h_z).normalize();
+            sum += stored.dot(truth).clamp(-1.0, 1.0).acos();
+            n += 1;
+        }
+        (if n > 0 { sum / n as f32 } else { 0.0 }, n)
+    }
+
+    /// **G3 — pure-FBM tiles bake EXACT per-leaf normals via the analytic
+    /// gradient, and beat the finite-difference path.** Bake the same
+    /// steep-FBM surface two ways: pure (`stamps`/`regions`/envelope all
+    /// empty → analytic gradient) and with a world floor far below the
+    /// tile (never clamps the height, so the surface is identical, but
+    /// trips the envelope gate → 6-tap finite difference). The analytic
+    /// bake's stored normals track the true surface markedly better.
+    #[test]
+    fn analytic_gradient_makes_leaf_normals_track_the_fbm_surface() {
+        use crate::fbm::FbmTerrainFnResolved;
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0); // 0.25 m
+        let key = TileKey::level0(0, 0, 0);
+        // Steep FBM (amp/scale ≈ 0.67) → high curvature, so the FD bias
+        // is unambiguous; base 32 keeps the surface inside the tile's y.
+        let fbm = FbmTerrainFnResolved {
+            scale_m: 30.0,
+            amplitude_m: 20.0,
+            base_height_m: 32.0,
+            ..FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup)
+        };
+        let octs = fbm.octaves_for_voxel(vs);
+
+        // Analytic (pure FBM → use_analytic_grad = true).
+        let analytic = bake_tile(key, vs, &fbm, &[], &empty_regions()).expect("analytic bake");
+        // Identical surface, but the envelope gate forces the FD path.
+        let fd =
+            bake_tile_with_skirts(key, vs, &fbm, &[], &empty_regions(), 0.0, Some(-1.0e6))
+                .expect("fd bake");
+
+        let (an_err, an_n) = mean_halo_leaf_normal_error(&analytic, &fbm, octs);
+        let (fd_err, fd_n) = mean_halo_leaf_normal_error(&fd, &fbm, octs);
+        assert!(an_n > 50 && fd_n > 50, "need enough halo surface leaves (an {an_n}, fd {fd_n})");
+
+        eprintln!(
+            "[G3] mean per-leaf normal error vs analytic surface (at cell center): \
+             analytic={:.4}°  fd={:.4}°  (ratio {:.2})",
+            an_err.to_degrees(),
+            fd_err.to_degrees(),
+            an_err / fd_err.max(1e-9),
+        );
+
+        // Analytic normals are far closer to the true surface than FD.
+        assert!(
+            an_err < fd_err * 0.7,
+            "analytic ({:.4}°) should beat FD ({:.4}°) by ≥30%",
+            an_err.to_degrees(),
+            fd_err.to_degrees(),
+        );
+        // And accurate in absolute terms: at the cell center the only
+        // residual is octahedral packing (<0.05°) plus the FBM's own
+        // sub-cell curvature.
+        assert!(
+            an_err.to_degrees() < 0.5,
+            "analytic mean per-leaf normal error should be near the pack floor; got {:.4}°",
+            an_err.to_degrees(),
+        );
+    }
+
+    /// A stamped tile (or any post-modified height) must NOT use the
+    /// analytic gradient — the base-FBM gradient no longer describes the
+    /// warped surface. We can't observe the gate directly, but the FD
+    /// path is what keeps stamped/region/envelope tiles correct, and the
+    /// bake must still succeed and produce a smooth surface. The
+    /// envelope variant (identical surface, FD path) is the proxy: it
+    /// bakes a valid mesh whose stored normals are sign-correct (point
+    /// generally upward on this above-sea surface).
+    #[test]
+    fn envelope_tile_falls_back_to_finite_difference_and_still_bakes() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+        let key = TileKey::level0(0, 0, 0);
+        let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
+        // Floor far below the tile → never clamps → identical surface,
+        // but `envelope_floor.is_some()` forces the FD path.
+        let baked =
+            bake_tile_with_skirts(key, vs, &fbm, &[], &empty_regions(), 0.0, Some(-1.0e6))
+                .expect("fd bake");
+        assert!(baked.vertex_count() > 100, "FD bake should still produce a surface");
+        // Up-facing sanity: most LOD-0 leaf normals point above horizontal.
+        let attrs = &baked.artifact.leaf_attrs;
+        let up = attrs
+            .iter()
+            .filter(|a| a.normal().normalize_or_zero().y > 0.0)
+            .count();
+        assert!(
+            up * 2 > attrs.len(),
+            "most leaf normals should point upward on an above-sea surface ({up}/{})",
+            attrs.len(),
+        );
     }
 
     /// Phase 3 watertightness — bake two adjacent tiles whose

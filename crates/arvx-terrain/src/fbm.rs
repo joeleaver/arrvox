@@ -410,6 +410,19 @@ impl TerrainFn for FbmTerrainFnResolved {
             blend: 0.0,
         }
     }
+
+    fn sample_grad(&self, tile: TileKey, local: Vec3, voxel_size_m: f32) -> Option<Vec3> {
+        // Mirror `sample`'s world transform + LOD octave clamp exactly so
+        // the gradient is consistent with the sd that bake emits.
+        let world_origin = tile.origin_world().to_vec3();
+        let wx = world_origin.x + local.x;
+        let wz = world_origin.z + local.z;
+        let octaves = self.octaves_for_voxel(voxel_size_m);
+        // sd = wy − h(wx, wz) ⇒ ∇sd = (−∂h/∂x, 1, −∂h/∂z). Independent of
+        // the sample's y (the surface is a heightfield in this V1 form).
+        let (_, h_x, h_z) = self.height_grad_at_with_octaves(wx, wz, octaves);
+        Some(Vec3::new(-h_x, 1.0, -h_z))
+    }
 }
 
 // FBM primitives (hash2 / value_noise_2d / fbm_2d) live in
@@ -653,6 +666,48 @@ mod tests {
         let f = flat_fbm(); // amplitude_m = 0
         let (_, gx, gz) = f.height_grad_at(13.7, -42.1);
         assert!(gx.abs() < 1e-6 && gz.abs() < 1e-6, "expected flat gradient, got ({gx},{gz})");
+    }
+
+    /// `sample_grad` is the analytic ∇sd that the voxelizer consumes. It
+    /// must equal the central difference of the SAME `sample().sd` the
+    /// bake emits (the field the 6-tap FD would have differenced),
+    /// confirming the world transform, sign, and octave clamp all line
+    /// up. The y-component is exactly 1 (`sd = wy − h`).
+    #[test]
+    fn sample_grad_matches_finite_difference_of_sample_sd() {
+        let f = FbmTerrainFnResolved { scale_m: 35.0, amplitude_m: 30.0, ..resolved_default() };
+        let k = TileKey::level0(2, 0, -1);
+        let vs = 0.25f32;
+        let h = 0.02f32;
+        let sd = |lx: f32, lz: f32| f.sample(k, Vec3::new(lx, 0.0, lz), vs).sd;
+        // Off-lattice probe points inside the tile.
+        for &(lx, lz) in &[(11.3, 7.7), (28.4, 42.1), (5.0, 60.0), (47.6, 19.2)] {
+            let g = f.sample_grad(k, Vec3::new(lx, 0.0, lz), vs).expect("FBM supplies a gradient");
+            assert_eq!(g.y, 1.0, "sd = wy − h ⇒ ∂sd/∂y = 1");
+            let fd_x = (sd(lx + h, lz) - sd(lx - h, lz)) / (2.0 * h);
+            let fd_z = (sd(lx, lz + h) - sd(lx, lz - h)) / (2.0 * h);
+            assert!(
+                (g.x - fd_x).abs() < 5e-2 && (g.z - fd_z).abs() < 5e-2,
+                "at ({lx},{lz}): analytic ∇sd ({:.4},{:.4}) vs FD ({fd_x:.4},{fd_z:.4})",
+                g.x,
+                g.z,
+            );
+        }
+    }
+
+    /// The default trait impl returns `None`; a struct that doesn't
+    /// override `sample_grad` drives the voxelizer's finite-difference
+    /// path. (FbmTerrainFnResolved overrides it; this pins the contract
+    /// for the test/stub TerrainFns that don't.)
+    #[test]
+    fn default_terrain_fn_has_no_analytic_gradient() {
+        struct Flat;
+        impl TerrainFn for Flat {
+            fn sample(&self, _t: TileKey, l: Vec3, _v: f32) -> TerrainSample {
+                TerrainSample { sd: l.y - 1.0, primary_mat: 0, secondary_mat: 0, blend: 0.0 }
+            }
+        }
+        assert!(Flat.sample_grad(TileKey::level0(0, 0, 0), Vec3::ZERO, 0.25).is_none());
     }
 
     #[test]
