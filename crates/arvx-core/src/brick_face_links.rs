@@ -120,6 +120,27 @@ pub fn compute_brick_face_links(octree: &SparseOctree, max_brick_id: u32) -> Vec
         &mut found,
     );
 
+    // Brick-coord → brick_id map. The common case — a neighbour that is
+    // itself a surface brick (~4 of the 6 faces on a heightfield shell) —
+    // then resolves in O(1) instead of a root-to-brick_depth octree
+    // descent; only non-brick neighbours (empty / interior, which
+    // terminate high in the tree) fall back to `lookup_with_depth`. This
+    // is OUTPUT-IDENTICAL to the all-descent path: a map hit returns the
+    // exact brick id `classify_neighbor` would (each brick's recorded
+    // min-corner maps to its own id), and any coord that is NOT some
+    // brick's recorded min-corner misses → takes the original lookup
+    // (so coarser-level bricks covering multiple coords still resolve
+    // correctly via the descent). Cuts this pass's dominant cost: the
+    // ~6 deep descents/brick drop to ~2 shallow ones (empty/interior).
+    let mut coord_to_brick: rustc_hash::FxHashMap<UVec3, u32> =
+        rustc_hash::FxHashMap::default();
+    coord_to_brick.reserve(cap);
+    for (brick_id, &is_found) in found.iter().enumerate() {
+        if is_found {
+            coord_to_brick.insert(brick_coord[brick_id], brick_id as u32);
+        }
+    }
+
     // Pass 2: for each found brick, look up each of 6 neighbor bricks.
     let mut links: Vec<[u32; 6]> = vec![[FACE_EMPTY; 6]; cap];
     for brick_id in 0..cap {
@@ -142,13 +163,21 @@ pub fn compute_brick_face_links(octree: &SparseOctree, max_brick_id: u32) -> Vec
                 links[brick_id][face] = FACE_EMPTY;
                 continue;
             }
-            // Neighbor's minimum-corner voxel coord. lookup_with_depth
-            // returns whatever node covers that point, at whatever
-            // level the tree actually terminates.
+            let ncoord = UVec3::new(nx as u32, ny as u32, nz as u32);
+            // Fast path: the neighbour is a known surface brick. A map hit
+            // returns the same id `classify_neighbor` would for that brick.
+            if let Some(&nid) = coord_to_brick.get(&ncoord) {
+                links[brick_id][face] = nid;
+                continue;
+            }
+            // Slow path: empty / interior / coarser-level brick — descend
+            // to classify. lookup_with_depth returns whatever node covers
+            // the neighbour's minimum-corner voxel, at whatever level the
+            // tree actually terminates.
             let neighbor_voxel = UVec3::new(
-                nx as u32 * cells_per_brick,
-                ny as u32 * cells_per_brick,
-                nz as u32 * cells_per_brick,
+                ncoord.x * cells_per_brick,
+                ncoord.y * cells_per_brick,
+                ncoord.z * cells_per_brick,
             );
             let (value, _d) = match octree.lookup_with_depth(neighbor_voxel) {
                 Some(v) => v,
