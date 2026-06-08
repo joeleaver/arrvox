@@ -1528,7 +1528,8 @@ pub fn extract_mesh_region_from_cells_pooled(
         &[],
         sculpt_slots,
         None::<&fn(Vec3) -> f32>,
-    )
+    &[],
+        )
 }
 
 /// Halo-aware variant of [`extract_mesh_region_from_cells_pooled`].
@@ -1566,6 +1567,11 @@ pub fn extract_mesh_region_from_cells_pooled_haloed<S>(
     halo_cells: &[(IVec3, u32)],
     sculpt_slots: Option<&rustc_hash::FxHashSet<u32>>,
     sdf_fn: Option<&S>,
+    // Per-slot signed-distance pool (voxel units), indexed by the same
+    // global slot ids the cells carry. Non-empty selects QEF-Hermite (the
+    // render sculpt re-extract passes the scene pool's `dists_as_slice()`);
+    // `&[]` keeps the blur path. Mirrors the full-asset extract gate.
+    dists: &[i16],
 ) -> (Vec<MeshVertex>, Vec<u32>)
 where
     S: Fn(Vec3) -> f32,
@@ -1575,6 +1581,8 @@ where
     if cells.is_empty() {
         return (vertices, indices);
     }
+    // QEF-Hermite selection (Stage 6) — same gate as the full-asset path.
+    let use_qef = !dists.is_empty() && !qef_hermite_force_off() && !qef_force_off_thread();
     // Empty-region guard (no cells to iterate).
     if region_min.x >= region_max.x
         || region_min.y >= region_max.y
@@ -1702,12 +1710,24 @@ where
     // Blur kernel: const `R = 2` / `σ = 1.0` in production; the bench
     // can override per-thread via `set_blur_override` to sweep R.
     let (r, kern_sigma, iso) = active_blur_params();
-    let kern = density_kernel_weights_1d_for(r, kern_sigma);
 
-    // Resize the reusable density buffer (grows, never shrinks).
+    // The density / gradient SLICES are borrowed below even in QEF mode
+    // (where the closures that read them are never called), so the buffers
+    // must be `≥ total`. Resize unconditionally; only the expensive
+    // blur+gradient COMPUTE is skipped for QEF.
     if scratch.density.len() < total {
         scratch.density.resize(total, 0.0);
     }
+    if scratch.gradient.len() < total {
+        scratch.gradient.resize(total, [0.0; 3]);
+    }
+
+    // ── blur→D + ∇D precompute (BLUR path only) ──
+    // QEF-Hermite places vertices from the stored per-leaf distance, so it
+    // needs neither the blurred-occupancy field nor its gradient — skip the
+    // whole (sub-ms but non-trivial) separable blur + central-difference.
+    if !use_qef {
+    let kern = density_kernel_weights_1d_for(r, kern_sigma);
     // Pass 0: seed `density` with raw binary occupancy.
     {
         let cells_grid = &scratch.cells_grid;
@@ -1800,9 +1820,6 @@ where
     // dependency is `± (R + 1)` — the same reach as the position
     // crossings — so two tiles sharing the halo compute the identical
     // `G` (and identical normals) at the seam.
-    if scratch.gradient.len() < total {
-        scratch.gradient.resize(total, [0.0; 3]);
-    }
     {
         let density = &scratch.density;
         let gradient = &mut scratch.gradient;
@@ -1831,6 +1848,7 @@ where
             }
         }
     }
+    } // end `if !use_qef` blur→D + ∇D precompute
 
     // ── Split borrows for the cube loop ──
     // `cells_grid` + `density` + `gradient` are read-only;
@@ -1914,6 +1932,19 @@ where
             }
         }
     };
+    // Sign-based solidity for the QEF-Hermite topology (see
+    // [`qef_cell_inside`]) — the active edges sit on the true crossing.
+    let qef_solid = |c: IVec3| -> bool { qef_cell_inside(cell_lookup(c), dists) };
+    // Unified solidity for the cube loop: distance-sign in QEF mode, blurred
+    // `D = iso` otherwise. Keeping one closure keeps the owner / face /
+    // emit logic shared.
+    let solid = |c: IVec3| -> bool {
+        if use_qef {
+            qef_solid(c)
+        } else {
+            d_solid(c)
+        }
+    };
 
     // **Iteration / owner set.** A D-surface face is emitted by its
     // D-SOLID side. The owner cell can be a cell whose binary occupancy
@@ -1942,14 +1973,15 @@ where
     }
 
     for &cell in &candidates {
-        if !d_solid(cell) {
+        // Owner is solid on the active field (sign for QEF, `D` for blur).
+        if !solid(cell) {
             continue;
         }
         for face in 0..6 {
             let dir = FACE_DIRS[face];
             let neighbor = cell + dir;
-            // D-active face: this side D-solid, the other D-empty.
-            if d_solid(neighbor) {
+            // Active face: this side solid, the other empty.
+            if solid(neighbor) {
                 continue;
             }
             let cube_offsets = CUBE_OFFSETS_PER_FACE[face];
@@ -1959,24 +1991,44 @@ where
                 quad[i] = match cube_vertex_grid.get(cube) {
                     Some(v) => v,
                     None => {
-                        let vertex = build_cube_vertex(
-                            cube,
-                            cell_lookup,
-                            base_voxel_size,
-                            grid_origin,
-                            leaf_attr_pool,
-                            bone_voxel_pool,
-                            sculpt_slots,
-                            Some(&smooth_sdf),
-                            Some(&outward_normal),
-                            Some(&density_grid_fn),
-                            Some(&gradient_grid_fn),
-                            iso,
-                            // Region/sculpt path keeps the blur placement for
-                            // now; Stage 6 wires QEF-Hermite here.
-                            false,
-                            &[],
-                        );
+                        let vertex = if use_qef {
+                            // QEF-Hermite: binary corner classification (via
+                            // the sign in `build_cube_vertex`) + placement
+                            // from the stored per-leaf distance.
+                            build_cube_vertex(
+                                cube,
+                                cell_lookup,
+                                base_voxel_size,
+                                grid_origin,
+                                leaf_attr_pool,
+                                bone_voxel_pool,
+                                sculpt_slots,
+                                None::<&fn(Vec3) -> f32>,
+                                None::<&fn(Vec3) -> Vec3>,
+                                None::<&fn(Vec3) -> f32>,
+                                None::<&fn(Vec3) -> Vec3>,
+                                iso,
+                                true,
+                                dists,
+                            )
+                        } else {
+                            build_cube_vertex(
+                                cube,
+                                cell_lookup,
+                                base_voxel_size,
+                                grid_origin,
+                                leaf_attr_pool,
+                                bone_voxel_pool,
+                                sculpt_slots,
+                                Some(&smooth_sdf),
+                                Some(&outward_normal),
+                                Some(&density_grid_fn),
+                                Some(&gradient_grid_fn),
+                                iso,
+                                false,
+                                &[],
+                            )
+                        };
                         let vid = vertices.len() as u32;
                         vertices.push(vertex);
                         cube_vertex_grid.set(cube, vid);
@@ -1994,9 +2046,10 @@ where
     // fix targets the terrain BAKE path; sculpt has its own smoothing and
     // a different (overlay-based) seam model. The bench can still force it
     // on via the thread-local override to compare paths. No tile-boundary
-    // AABB here (single-region extract), so `None` (no pinning).
+    // AABB here (single-region extract), so `None` (no pinning). QEF has no
+    // ripple to recover, so it is skipped there.
     {
-        let r = resolve_plane_fit_radius(0.0);
+        let r = if use_qef { 0.0 } else { resolve_plane_fit_radius(0.0) };
         if r > 0.0 {
             wide_window_plane_project(&mut vertices, &indices, base_voxel_size, r, None);
         }
@@ -3927,6 +3980,7 @@ mod tests {
         let (v, i) = extract_mesh_region_from_cells_pooled_haloed(
             &mut scratch, &cells, lo - IVec3::ONE, hi + IVec3::ONE, &nodes, 5, 1.0,
             Vec3::ZERO, &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
+        &[],
         );
         assert!(!v.is_empty() && !i.is_empty(), "block produced no surface");
         // Manifold: every undirected edge shared by exactly 2 triangles.
@@ -4006,6 +4060,7 @@ mod tests {
         let (v_a, i_a) = extract_mesh_region_from_cells_pooled_haloed(
             &mut scratch, &cells, IVec3::new(3, 5, 3), IVec3::new(5, 7, 5), &nodes,
             depth, 1.0, Vec3::ZERO, &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
+        &[],
         );
         assert!(
             !v_a.is_empty() && !i_a.is_empty(),
@@ -4017,6 +4072,7 @@ mod tests {
         let (v_b, i_b) = extract_mesh_region_from_cells_pooled_haloed(
             &mut scratch, &cells, IVec3::splat(20), IVec3::splat(24), &nodes,
             depth, 1.0, Vec3::ZERO, &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
+        &[],
         );
         assert!(
             v_b.is_empty() && i_b.is_empty(),
@@ -4142,10 +4198,12 @@ mod tests {
         let (va, ia) = extract_mesh_region_from_cells_pooled_haloed(
             &mut sa, &cells_a, lo - IVec3::ONE, hi + IVec3::ONE, &nodes, depth, 1.0,
             Vec3::ZERO, &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
+        &[],
         );
         let (vb, ib) = extract_mesh_region_from_cells_pooled_haloed(
             &mut sb, &cells_b, lo - IVec3::ONE, hi + IVec3::ONE, &nodes, depth, 1.0,
             Vec3::ZERO, &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
+        &[],
         );
         assert_eq!(
             va.len(), vb.len(),
@@ -4824,6 +4882,7 @@ mod tests {
             &halo_a,
             None,
             None::<&fn(Vec3) -> f32>,
+        &[],
         );
 
         // ── Extract B: owns x ≥ seam; window reaches seam-OVERLAP. ──
@@ -4854,6 +4913,7 @@ mod tests {
             &halo_b,
             None,
             None::<&fn(Vec3) -> f32>,
+        &[],
         );
 
         // Collect vertices of the SHARED seam cube — the one whose
@@ -4968,6 +5028,7 @@ mod tests {
             &[],
             None,
             None::<&fn(Vec3) -> f32>,
+        &[],
         );
         assert!(!verts.is_empty(), "slope produced no surface vertices");
 
@@ -5142,6 +5203,7 @@ mod tests {
         let (verts, _indices) = extract_mesh_region_from_cells_pooled_haloed(
             &mut scratch, &cells, region_lo, region_hi, &nodes, depth, vs, origin,
             &[], &[], &[], &[], None, None::<&fn(Vec3) -> f32>,
+        &[],
         );
         assert!(!verts.is_empty());
 
@@ -5286,6 +5348,7 @@ mod tests {
             &[],
             None,
             None::<&fn(Vec3) -> f32>,
+        &[],
         );
         assert!(!verts.is_empty(), "slope produced no surface vertices");
 
@@ -5417,6 +5480,7 @@ mod tests {
             &[],
             None,
             None::<&fn(Vec3) -> f32>,
+        &[],
         );
         assert!(!verts.is_empty(), "slope produced no surface vertices");
         assert!(!indices.is_empty(), "slope produced no triangles");

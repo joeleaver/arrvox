@@ -522,6 +522,11 @@ impl super::mesher::Mesher {
                 brick_cells: brick_pool.as_slice(),
                 leaf_attr_pool: leaf_attr_pool.as_slice(),
                 bone_voxel_pool: leaf_attr_pool.bones_as_slice(),
+                dists: if model.has_distances {
+                    leaf_attr_pool.dists_as_slice()
+                } else {
+                    &[]
+                },
                 halo_cells: &model.halo_cells,
                 sculpt_slots: Some(&model.sculpt_owned_slots),
             });
@@ -1081,6 +1086,7 @@ mod tests {
                 halo_extra_slots: std::collections::HashSet::new(),
                 halo_cells: Vec::new(),
                 distinct_materials: None,
+                has_distances: false,
             },
             view: MeshView {
                 mesh_vertices: Vec::new(),

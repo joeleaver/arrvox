@@ -234,7 +234,7 @@ fn write_edit<W: Write>(w: &mut W, edit: &LeafEdit) -> std::io::Result<()> {
     w.write_all(&edit.coord.z.to_le_bytes())?;
     match edit.op {
         LeafEditOp::Remove => w.write_all(&[0u8])?,
-        LeafEditOp::Add { material, normal } => {
+        LeafEditOp::Add { material, normal, .. } => {
             w.write_all(&[1u8])?;
             w.write_all(&material.to_le_bytes())?;
             w.write_all(&normal.x.to_le_bytes())?;
@@ -280,7 +280,7 @@ fn read_edit<R: Read>(r: &mut R) -> std::io::Result<LeafEdit> {
                 f32::from_le_bytes(nrm_buf[4..8].try_into().unwrap()),
                 f32::from_le_bytes(nrm_buf[8..12].try_into().unwrap()),
             );
-            LeafEditOp::Add { material, normal }
+            LeafEditOp::Add { material, normal, dist: 0.0 }
         }
         2 => LeafEditOp::Empty,
         3 => LeafEditOp::SetInterior,
@@ -306,6 +306,7 @@ mod tests {
                     op: LeafEditOp::Add {
                         material: 42,
                         normal: Vec3::new(0.0, 1.0, 0.0),
+                        dist: 0.0,
                     },
                 },
                 LeafEdit {
@@ -368,8 +369,8 @@ mod tests {
             match (a.op, b.op) {
                 (LeafEditOp::Remove, LeafEditOp::Remove) => {}
                 (
-                    LeafEditOp::Add { material: m1, normal: n1 },
-                    LeafEditOp::Add { material: m2, normal: n2 },
+                    LeafEditOp::Add { material: m1, normal: n1, .. },
+                    LeafEditOp::Add { material: m2, normal: n2, .. },
                 ) => {
                     assert_eq!(m1, m2);
                     assert!((n1 - n2).length() < 1e-6);

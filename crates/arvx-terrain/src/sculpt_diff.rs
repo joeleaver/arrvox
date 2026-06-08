@@ -181,7 +181,7 @@ enum AggOp {
 impl AggOp {
     fn from_leaf_op(op: LeafEditOp) -> Option<Self> {
         match op {
-            LeafEditOp::Add { material, normal } => Some(AggOp::Add { material, normal }),
+            LeafEditOp::Add { material, normal, .. } => Some(AggOp::Add { material, normal }),
             LeafEditOp::SetInterior => Some(AggOp::Interior),
             LeafEditOp::Remove | LeafEditOp::Empty => Some(AggOp::Empty),
             LeafEditOp::SetNormal { .. } => None,
@@ -206,7 +206,7 @@ impl AggOp {
 
     fn into_leaf_op(self) -> LeafEditOp {
         match self {
-            AggOp::Add { material, normal } => LeafEditOp::Add { material, normal },
+            AggOp::Add { material, normal } => LeafEditOp::Add { material, normal, dist: 0.0 },
             AggOp::Interior => LeafEditOp::SetInterior,
             AggOp::Empty => LeafEditOp::Remove,
         }
@@ -224,6 +224,7 @@ mod tests {
             op: LeafEditOp::Add {
                 material,
                 normal: Vec3::Y,
+                dist: 0.0,
             },
         }
     }

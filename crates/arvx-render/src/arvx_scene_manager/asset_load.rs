@@ -1061,6 +1061,7 @@ impl ArvxSceneManager {
                 // populate this through `integrate_baked_tile`.
                 halo_cells: Vec::new(),
                 distinct_materials: Some(distinct_materials),
+                has_distances: false,
             },
             view: MeshView {
                 mesh_vertices,

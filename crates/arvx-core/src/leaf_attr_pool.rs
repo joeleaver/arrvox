@@ -392,6 +392,15 @@ impl LeafAttrPool {
         self.dists[slot as usize] = Self::quantize_dist(d_vox);
     }
 
+    /// Store an already-quantized distance at `slot` verbatim — for the
+    /// integrate / `.arvx`-load paths that relocate a `BakeArtifact`'s
+    /// `leaf_attr_dists` (already `i16`) into the scene pool without a
+    /// dequantize→requantize round-trip.
+    #[inline]
+    pub fn set_dist_quantized(&mut self, slot: u32, q: i16) {
+        self.dists[slot as usize] = q;
+    }
+
     /// Typed slice of the allocated quantized distances. Indexed by the
     /// same slot id as [`as_slice`]; consumed by the surface-mesh extractor.
     #[inline]

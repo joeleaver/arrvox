@@ -73,12 +73,20 @@ impl ArvxSceneManager {
         let leaf_attr_slot_start = self
             .leaf_attr_pool
             .allocate_contiguous_bump(n_attrs)?;
+        let has_distances = !artifact.leaf_attr_dists.is_empty();
         for (i, attr) in artifact.leaf_attrs.iter().enumerate() {
             let scene_id = leaf_attr_slot_start + i as u32;
             *self.leaf_attr_pool.get_mut(scene_id) = *attr;
             let color = artifact.leaf_attr_colors[i];
             if color != 0 {
                 self.leaf_attr_pool.set_color(scene_id, color);
+            }
+            // Relocate the baked per-leaf QEF distance into the scene pool
+            // so the sculpt / halo-refresh region re-extract meshes this
+            // tile QEF (matching its baked surface) instead of blur.
+            if has_distances {
+                self.leaf_attr_pool
+                    .set_dist_quantized(scene_id, artifact.leaf_attr_dists[i]);
             }
         }
 
@@ -335,6 +343,7 @@ impl ArvxSceneManager {
                 // so the engine falls back to the per-leaf walk for them
                 // (they're opaque, so that correctly reports no glass).
                 distinct_materials: None,
+                has_distances,
             },
             view: MeshView {
                 mesh_vertices,

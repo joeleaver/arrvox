@@ -205,6 +205,14 @@ pub(super) struct VoxelModel {
     /// Only the off-thread `.arvx` load populates `Some`; terrain-tile and
     /// halo-refresh entries leave it `None` and walk.
     pub(super) distinct_materials: Option<Vec<u16>>,
+    /// `true` when this asset's leaves carry per-leaf QEF-Hermite distances
+    /// in the scene `LeafAttrPool` — i.e. a terrain tile baked with the
+    /// distance pool. The sculpt / halo-refresh **region re-extract** gates
+    /// the QEF path on this: passing the pool's distances only when they are
+    /// real keeps imports / old assets (whose slots are zero-distance) on
+    /// the blur/binary path instead of meshing QEF-on-zeros (flat mush).
+    /// Set by `integrate_baked_tile`; `false` everywhere else.
+    pub(super) has_distances: bool,
 }
 
 /// The derived surface-mesh view for one cached asset: the vertex / index
@@ -1020,6 +1028,7 @@ mod slab_tests {
                 halo_extra_slots: std::collections::HashSet::new(),
                 halo_cells: Vec::new(),
                 distinct_materials: None,
+                has_distances: false,
             },
             view: MeshView {
                 mesh_vertices: Vec::new(),
@@ -1230,6 +1239,7 @@ mod slab_tests {
                 halo_extra_slots: std::collections::HashSet::new(),
                 halo_cells: Vec::new(),
                 distinct_materials: None,
+                has_distances: false,
             },
             view: MeshView {
                 mesh_vertices: Vec::new(),

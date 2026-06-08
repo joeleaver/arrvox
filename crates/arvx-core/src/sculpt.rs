@@ -268,7 +268,17 @@ pub enum LeafEditOp {
     /// away from solid bulk, into empty space): for Raise dome cells
     /// this points away from the brush center; for Carve cavity walls
     /// it points toward the brush center (into the carved cavity).
-    Add { material: u16, normal: Vec3 },
+    /// **`dist`** is the brush-SDF signed distance from this cell's center
+    /// to the new (brush) surface, in VOXEL units, sign-matched to `normal`
+    /// (negative inside the new solid). It is the QEF-Hermite companion to
+    /// `normal` — together they place the dual vertex exactly on the brush
+    /// surface (`p_surf = center − dist·normal`) so a carved/raised face is
+    /// smooth, not staircased to the cell center. Euclidean (`|∇|=1`) so it
+    /// is stored raw (the terrain/sculpt asymmetry — terrain re-normalizes,
+    /// sculpt does not). `0.0` for replayed-from-disk edits (the
+    /// `.arvxsculpt` sidecar does not persist it; they re-extract at the
+    /// cell center until re-sculpted).
+    Add { material: u16, normal: Vec3, dist: f32 },
     /// Rewrite an existing surface cell's `LeafAttr.normal_oct`
     /// without touching its occupancy or material. The Smooth brush
     /// emits these to nudge surface normals toward the local
@@ -352,6 +362,10 @@ pub struct ComputeBrushEditsTiming {
 pub struct LeafEditAttrs {
     pub material: u16,
     pub normal: Vec3,
+    /// Brush-SDF signed distance (voxel units) for the QEF-Hermite
+    /// re-extract; the render consumer writes it via `LeafAttrPool::set_dist`
+    /// alongside `to_leaf_attr()`. See [`LeafEditOp::Add`]'s `dist`.
+    pub dist: f32,
 }
 
 impl LeafEditAttrs {
@@ -929,7 +943,7 @@ fn compute_inflate_edits(
                     };
                     edits.push(LeafEdit {
                         coord: c,
-                        op: LeafEditOp::Add { material: op.material, normal },
+                        op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(c, op) },
                     });
                 }
             }
@@ -1131,7 +1145,7 @@ fn compute_clay_strip_edits(
                     let normal = clay_strip_normal(horiz_dist, diff, op);
                     edits.push(LeafEdit {
                         coord: c,
-                        op: LeafEditOp::Add { material: op.material, normal },
+                        op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(c, op) },
                     });
                 }
             }
@@ -1542,7 +1556,7 @@ fn compute_deflate_edits(
                     };
                     edits.push(LeafEdit {
                         coord: c,
-                        op: LeafEditOp::Add { material: op.material, normal },
+                        op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(c, op) },
                     });
                 }
             }
@@ -1772,7 +1786,7 @@ fn compute_smooth_edits(
                         };
                         edits.push(LeafEdit {
                             coord: c,
-                            op: LeafEditOp::Add { material: op.material, normal },
+                            op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(c, op) },
                         });
                     }
                     continue;
@@ -1878,7 +1892,7 @@ fn compute_smooth_edits(
                 };
                 edits.push(LeafEdit {
                     coord: c,
-                    op: LeafEditOp::Add { material: op.material, normal },
+                    op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(c, op) },
                 });
             }
         }
@@ -1930,7 +1944,7 @@ fn emit_carve_outside_rim(
         |s| matches!(s, CellState::Solid(_) | CellState::Interior),
     ) {
         let normal = brush_add_normal(coord, op);
-        edits.push(LeafEdit { coord, op: LeafEditOp::Add { material: op.material, normal } });
+        edits.push(LeafEdit { coord, op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(coord, op) } });
     }
 }
 
@@ -1966,7 +1980,7 @@ fn emit_raise_outside_rim(
         |s| matches!(s, CellState::Empty),
     ) {
         let normal = brush_add_normal(coord, op);
-        edits.push(LeafEdit { coord, op: LeafEditOp::Add { material: op.material, normal } });
+        edits.push(LeafEdit { coord, op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(coord, op) } });
     }
 }
 
@@ -1999,6 +2013,33 @@ fn emit_raise_outside_rim(
 /// dispatches on the primitive shape — same pattern the bake-time
 /// procedural pipeline already uses.
 #[inline]
+/// Brush-SDF signed distance from the cell center to the new surface, in
+/// voxel units, sign-matched to [`brush_add_normal`] (negative inside the
+/// new solid). The QEF-Hermite companion to the Add normal.
+///
+/// `brush_sdf = axis_distance − radius` is negative inside the brush and
+/// `|∇| = 1` (Euclidean), so for **Raise/Inflate/ClayStrip** (new solid =
+/// inside the brush) it is already the new-surface SDF. For **Carve/Deflate**
+/// the new solid is OUTSIDE the brush (the wall around the cavity), so the
+/// SDF flips sign — exactly as the normal flips to point into the cavity.
+/// `p_surf = center − dist·normal` then lands on the brush surface in both
+/// cases.
+fn brush_add_dist(coord: UVec3, op: &BrushOp) -> f32 {
+    let cell_center = Vec3::new(
+        coord.x as f32 + 0.5,
+        coord.y as f32 + 0.5,
+        coord.z as f32 + 0.5,
+    );
+    let sdf = brush_sdf(cell_center, op);
+    match op.mode {
+        BrushMode::Raise | BrushMode::Inflate | BrushMode::ClayStrip => sdf,
+        BrushMode::Carve | BrushMode::Deflate => -sdf,
+        // Smooth computes its own Add normals/positions; the brush SDF is
+        // not the governing surface there, so leave it cell-centered.
+        BrushMode::Smooth => 0.0,
+    }
+}
+
 fn brush_add_normal(coord: UVec3, op: &BrushOp) -> Vec3 {
     let cell_center = Vec3::new(
         coord.x as f32 + 0.5,
@@ -2182,7 +2223,7 @@ pub fn apply_delta(
     {
         let mut cache = BrickPathCache::new();
         for edit in &delta.edits {
-            if let LeafEditOp::Add { material, normal } = edit.op {
+            if let LeafEditOp::Add { material, normal, dist } = edit.op {
                 n_add += 1;
                 let slot = alloc_slot();
                 // The normal carried on the Add op is the analytical
@@ -2195,7 +2236,7 @@ pub fn apply_delta(
                 // is real-valued and continuous across the brush
                 // footprint, eliminating the lattice quantization a
                 // stencil over binary occupancy used to introduce.
-                allocated_slots.push((slot, LeafEditAttrs { material, normal }));
+                allocated_slots.push((slot, LeafEditAttrs { material, normal, dist }));
                 if let Some(prev) =
                     octree.set_cell_solid_cached(edit.coord, slot, brick_pool, &mut cache)
                 {
@@ -2254,6 +2295,40 @@ pub fn apply_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Stage 6 — sculpt distance sign/magnitude.** `brush_add_dist` must
+    /// be negative inside the NEW solid (the QEF/SDF convention) for BOTH
+    /// brush polarities, with magnitude = the perpendicular distance from the
+    /// cell center to the brush (sphere) surface. Raise's new solid is INSIDE
+    /// the brush; Carve's is OUTSIDE (the cavity wall) — so the sign flips
+    /// with the brush mode exactly as the Add normal does.
+    #[test]
+    fn brush_add_dist_sign_and_magnitude() {
+        let mk = |mode| BrushOp {
+            center: Vec3::new(8.0, 8.0, 8.0),
+            segment_start: Vec3::new(8.0, 8.0, 8.0),
+            radius: 4.0,
+            falloff_curve: FalloffCurve::Constant,
+            strength: 1.0,
+            mode,
+            material: 1,
+        };
+        // Raise dome cell INSIDE the sphere → dist = brush_sdf < 0.
+        let d_raise = brush_add_dist(UVec3::new(8, 10, 8), &mk(BrushMode::Raise));
+        let p_in = Vec3::new(8.5, 10.5, 8.5);
+        let sdf_in = p_in.distance(Vec3::splat(8.0)) - 4.0; // < 0 inside
+        assert!(sdf_in < 0.0);
+        assert!(d_raise < 0.0, "raise dome cell must be inside the new solid");
+        assert!((d_raise - sdf_in).abs() < 1e-4, "raise dist = brush_sdf");
+
+        // Carve cavity-wall cell OUTSIDE the sphere → dist = −brush_sdf < 0.
+        let d_carve = brush_add_dist(UVec3::new(8, 13, 8), &mk(BrushMode::Carve));
+        let p_out = Vec3::new(8.5, 13.5, 8.5);
+        let sdf_out = p_out.distance(Vec3::splat(8.0)) - 4.0; // > 0 outside
+        assert!(sdf_out > 0.0);
+        assert!(d_carve < 0.0, "carve wall cell must be inside the new solid");
+        assert!((d_carve + sdf_out).abs() < 1e-4, "carve dist = −brush_sdf");
+    }
 
     /// Helper: build a single-leaf octree at the given coord with a
     /// known slot id, on a tree of the given depth. Everything else
@@ -2578,8 +2653,8 @@ mod tests {
         let delta = SculptDelta { timing: Default::default(), edits: vec![
             LeafEdit { coord: UVec3::new(0, 0, 0), op: LeafEditOp::Remove },
             LeafEdit { coord: UVec3::new(1, 0, 0), op: LeafEditOp::Remove },
-            LeafEdit { coord: UVec3::new(0, 1, 0), op: LeafEditOp::Add { material: 5, normal: Vec3::Y } },
-            LeafEdit { coord: UVec3::new(1, 1, 0), op: LeafEditOp::Add { material: 5, normal: Vec3::Y } },
+            LeafEdit { coord: UVec3::new(0, 1, 0), op: LeafEditOp::Add { material: 5, normal: Vec3::Y, dist: 0.0 } },
+            LeafEdit { coord: UVec3::new(1, 1, 0), op: LeafEditOp::Add { material: 5, normal: Vec3::Y, dist: 0.0 } },
         ]};
         assert_eq!(delta.count_removed(), 2);
         assert_eq!(delta.count_added(), 2);
@@ -2710,7 +2785,7 @@ mod tests {
 
         let delta = SculptDelta { timing: Default::default(), edits: vec![
             LeafEdit { coord: UVec3::new(0, 0, 0), op: LeafEditOp::Remove },
-            LeafEdit { coord: UVec3::new(1, 0, 0), op: LeafEditOp::Add { material: 7, normal: Vec3::Y } },
+            LeafEdit { coord: UVec3::new(1, 0, 0), op: LeafEditOp::Add { material: 7, normal: Vec3::Y, dist: 0.0 } },
         ]};
         let applied = apply_delta(&mut t, &mut pool, &delta, || 99);
         // Either path mutated nodes — log must have writes.
@@ -2730,7 +2805,7 @@ mod tests {
         let mut pool = fresh_pool();
         let initial = t.node_count();
         let delta = SculptDelta { timing: Default::default(), edits: vec![
-            LeafEdit { coord: UVec3::new(2, 2, 2), op: LeafEditOp::Add { material: 1, normal: Vec3::Y } },
+            LeafEdit { coord: UVec3::new(2, 2, 2), op: LeafEditOp::Add { material: 1, normal: Vec3::Y, dist: 0.0 } },
         ]};
         let applied = apply_delta(&mut t, &mut pool, &delta, || 0);
         assert_eq!(applied.octree_log.initial_node_count as usize, initial);
@@ -3673,7 +3748,7 @@ mod tests {
         let delta = compute_brush_edits(&t, &pool, &pool_data, op);
         let fill = delta.edits.iter().find_map(|e| {
             if e.coord == UVec3::new(8, 8, 8) {
-                if let LeafEditOp::Add { material, normal } = e.op {
+                if let LeafEditOp::Add { material, normal, .. } = e.op {
                     return Some((material, normal));
                 }
             }
@@ -3714,7 +3789,7 @@ mod tests {
 
         let wall = delta.edits.iter().find_map(|e| {
             if e.coord == UVec3::new(8, 8, 8) {
-                if let LeafEditOp::Add { normal, material } = e.op {
+                if let LeafEditOp::Add { normal, material, .. } = e.op {
                     return Some((normal, material));
                 }
             }

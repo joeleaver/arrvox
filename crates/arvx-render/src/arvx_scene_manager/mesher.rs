@@ -58,6 +58,11 @@ pub(super) struct RegionExtractArgs<'a> {
     pub(super) brick_cells: &'a [u32],
     pub(super) leaf_attr_pool: &'a [LeafAttr],
     pub(super) bone_voxel_pool: &'a [BoneVoxel],
+    /// Per-slot signed distances (voxel units), parallel to `leaf_attr_pool`
+    /// (`LeafAttrPool::dists_as_slice()`). Non-empty selects the QEF-Hermite
+    /// re-extract so a sculpted/refreshed region matches the QEF base; `&[]`
+    /// keeps the blur path.
+    pub(super) dists: &'a [i16],
     pub(super) halo_cells: &'a [(IVec3, u32)],
     pub(super) sculpt_slots: Option<&'a rustc_hash::FxHashSet<u32>>,
 }
@@ -132,6 +137,7 @@ impl SurfaceMesher for CpuSurfaceNets {
             // The brush-projection `sdf_fn` path was deleted in A4; always
             // `None` now.
             None::<&fn(Vec3) -> f32>,
+            a.dists,
         )
     }
 

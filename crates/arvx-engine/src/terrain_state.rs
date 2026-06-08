@@ -146,6 +146,7 @@ mod tests {
             op: LeafEditOp::Add {
                 material: 1,
                 normal: Vec3::Y,
+                dist: 0.0,
             },
         }
     }

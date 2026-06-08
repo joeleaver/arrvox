@@ -574,6 +574,12 @@ impl ArvxSceneManager {
         // deallocates the contiguous bake range.
         for (slot, attrs) in &applied.allocated_slots {
             *self.leaf_attr_pool.get_mut(*slot) = attrs.to_leaf_attr();
+            // Per-leaf brush-SDF distance for the QEF-Hermite re-extract:
+            // the carved/raised cell's dual vertex lands on the brush
+            // surface (`p_surf = center − dist·normal`) instead of the cell
+            // center. Written BEFORE the re-extract below reads the pool, so
+            // fresh-stroke cells mesh smooth this same apply.
+            self.leaf_attr_pool.set_dist(*slot, attrs.dist);
             // Default color (0) — sculpt-added cells fall back to the
             // material's base_color, same convention as paint's "no
             // override".
@@ -1102,6 +1108,11 @@ impl super::mesher::Mesher {
                 brick_cells: brick_pool.as_slice(),
                 leaf_attr_pool: leaf_attr_pool.as_slice(),
                 bone_voxel_pool: leaf_attr_pool.bones_as_slice(),
+                dists: if model.has_distances {
+                    leaf_attr_pool.dists_as_slice()
+                } else {
+                    &[]
+                },
                 halo_cells: &model.halo_cells,
                 sculpt_slots: Some(&model.sculpt_owned_slots),
             })
@@ -1509,6 +1520,11 @@ impl super::mesher::Mesher {
                 brick_cells: brick_pool.as_slice(),
                 leaf_attr_pool: leaf_attr_pool.as_slice(),
                 bone_voxel_pool: leaf_attr_pool.bones_as_slice(),
+                dists: if model.has_distances {
+                    leaf_attr_pool.dists_as_slice()
+                } else {
+                    &[]
+                },
                 halo_cells: &model.halo_cells,
                 sculpt_slots: Some(&model.sculpt_owned_slots),
             })
@@ -1760,6 +1776,7 @@ mod tests {
                 halo_extra_slots: std::collections::HashSet::new(),
                 halo_cells: Vec::new(),
                 distinct_materials: None,
+                has_distances: false,
             },
             view: MeshView {
                 mesh_vertices: Vec::new(),
@@ -2231,6 +2248,7 @@ mod tests {
             op: LeafEditOp::Add {
                 material: 7,
                 normal: Vec3::Y,
+                dist: 0.0,
             },
         }];
         let result = sm
@@ -2266,6 +2284,7 @@ mod tests {
                 op: LeafEditOp::Add {
                     material: 1,
                     normal: Vec3::Y,
+                    dist: 0.0,
                 },
             }],
         )

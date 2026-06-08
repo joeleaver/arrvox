@@ -645,7 +645,8 @@ pub fn mesh_occupancy(occ: &Occupancy) -> (Vec<MeshVertex>, Vec<u32>) {
         &[],   // halo
         None,  // sculpt_slots
         None::<&fn(Vec3) -> f32>,
-    )
+    &[],
+        )
 }
 
 /// Blur-kernel parameters for the R-sweep: radius (cells), sigma
@@ -1485,7 +1486,7 @@ fn bresenham(
 // measure a LOW-FREQUENCY ripple metric (not just the existing
 // high-frequency `roughness`, which misses wide flat treads).
 
-use crate::mesh_extract::extract_surface_mesh_density_haloed;
+use crate::mesh_extract::{collect_cell_map, extract_surface_mesh_density_haloed};
 use crate::voxelize_octree::voxelize_to_artifact;
 
 /// Terrain halo the real bake uses (`bake.rs::TILE_HALO_VOXELS`).
@@ -1827,6 +1828,58 @@ pub fn bake_heightfield_qef_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32) 
         &artifact.leaf_attr_dists,
     );
 
+    let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
+    HeightMesh {
+        verts,
+        indices,
+        grid_origin: artifact.grid_origin,
+        voxel_size,
+        surface_cells,
+    }
+}
+
+/// Mesh a heightfield through the **REGION / SCULPT re-extract path**
+/// (`extract_mesh_region_from_cells_pooled_haloed`, Stage 6) with QEF-Hermite
+/// — the path a sculpt brush / halo refresh runs. Uses the REAL voxelized
+/// octree (so `is_solid_lookup` resolves interior bulk correctly) + the
+/// artifact's baked per-leaf distances. Validates that a sculpt re-extract
+/// matches the QEF bake instead of falling back to blur.
+pub fn region_mesh_heightfield_qef(hf: &HeightField, half_world: f32, voxel_size: f32) -> HeightMesh {
+    let aabb = heightfield_tile_aabb(half_world, voxel_size);
+    let h = &hf.h;
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+        positions
+            .iter()
+            .map(|p| (p.y - h(p.x, p.z), 1u16, 1u16, 0u8, 0u32))
+            .collect()
+    };
+    let artifact = voxelize_to_artifact(sdf_fn, &aabb, voxel_size, REPRO_TILE_HALO)
+        .expect("heightfield voxelize_to_artifact");
+    let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
+    let cells = collect_cell_map(
+        artifact.octree.as_slice(),
+        artifact.octree.depth(),
+        &brick_pool_flat,
+    );
+    let extent = 1i32 << artifact.octree.depth();
+    let mut scratch = SculptExtractScratch::new();
+    let (verts, indices) = extract_mesh_region_from_cells_pooled_haloed(
+        &mut scratch,
+        &cells,
+        IVec3::ZERO,
+        IVec3::splat(extent),
+        artifact.octree.as_slice(),
+        artifact.octree.depth(),
+        voxel_size,
+        artifact.grid_origin,
+        &brick_pool_flat,
+        &artifact.leaf_attrs,
+        &[],
+        &artifact.halo_cells,
+        None,
+        None::<&fn(Vec3) -> f32>,
+        &artifact.leaf_attr_dists,
+    );
     let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
     HeightMesh {
         verts,
@@ -2601,6 +2654,26 @@ mod tests {
             "QEF FBM residual floor should stay small ({:.4} ≥ 0.05)",
             qef.residual_rms_vox
         );
+    }
+
+    /// **Stage 6 — the sculpt/halo REGION re-extract is flat too.** The same
+    /// gentle slope, meshed through `extract_mesh_region_from_cells_pooled_haloed`
+    /// (the path a sculpt brush / halo refresh runs) with the baked per-leaf
+    /// distances, comes out flat — so a sculpted/refreshed region matches the
+    /// QEF bake instead of falling back to the rippled blur path.
+    #[test]
+    fn qef_region_reextract_slope_is_flat() {
+        let hf = HeightField::gentle_slope(0.10, 0.035);
+        for &vs in &[0.5f32, 1.0] {
+            let m = region_mesh_heightfield_qef(&hf, 12.0, vs);
+            let r = measure_ripple(&hf, &m, Vec3::X);
+            assert!(r.n_samples >= 16, "vs={vs}: too few region samples");
+            assert!(
+                r.residual_rms_vox < 0.03,
+                "vs={vs}: QEF region re-extract should be flat (residual {:.4} ≥ 0.03)",
+                r.residual_rms_vox
+            );
+        }
     }
 
     /// **Watertight seam across adjacent tiles.** Two independently
