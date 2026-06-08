@@ -1013,12 +1013,17 @@ fn extract_surface_mesh_haloed_impl(
     // density (and vertices). The dense grid is laid out exactly like
     // [`CellGrid`]: `origin` lo-corner, `size` extent, flat
     // `x + sx*(y + sy*z)` indexing.
-    let (r_blur, sigma_blur, iso) = if topo_blur {
+    // NB: the `∇D` field is precomputed whenever `density_blur` — NOT only
+    // when `topo_blur`. The QEF path uses binary-SIGN topology + Hermite
+    // POSITION, but still takes its smooth SHADING NORMAL from the
+    // interpolated `∇D` (a C0-continuous field); the per-leaf corner-average
+    // normal facets at the voxel scale (visible speckle on smooth terrain).
+    let (r_blur, sigma_blur, iso) = if density_blur {
         active_blur_params()
     } else {
         (DENSITY_KERNEL_R, DENSITY_KERNEL_SIGMA, DENSITY_ISO)
     };
-    let density_grids: Option<DensityGrids> = if topo_blur {
+    let density_grids: Option<DensityGrids> = if density_blur {
         // Bounding box of every cell in the map (interior + halo).
         let mut bb_min = IVec3::splat(i32::MAX);
         let mut bb_max = IVec3::splat(i32::MIN);
@@ -1334,11 +1339,31 @@ fn extract_surface_mesh_haloed_impl(
                                 false,
                                 &[],
                             )
+                        } else if use_qef {
+                            // Sign topology + QEF-Hermite position from the
+                            // stored distance, but the smooth interpolated
+                            // `∇D` SHADING NORMAL (`density_grid_fn = None`
+                            // keeps corner classification + position on the
+                            // sign/QEF path; only the normal comes from `∇D`).
+                            build_cube_vertex(
+                                cube,
+                                cell_lookup,
+                                base_voxel_size,
+                                grid_origin,
+                                leaf_attr_pool,
+                                bone_voxel_pool,
+                                sculpt_slots,
+                                None::<&fn(Vec3) -> f32>,
+                                Some(&outward_normal),
+                                None::<&fn(Vec3) -> f32>,
+                                None::<&fn(Vec3) -> Vec3>,
+                                DENSITY_ISO,
+                                true,
+                                dists,
+                            )
                         } else {
-                            // Binary topology. When `use_qef`, place the
-                            // vertex via QEF-Hermite from the stored
-                            // per-leaf distance; otherwise the legacy
-                            // edge-crossing centroid (imports).
+                            // Pure binary (imports): edge-crossing centroid +
+                            // averaged per-leaf normal.
                             build_cube_vertex(
                                 cube,
                                 cell_lookup,
@@ -1352,8 +1377,8 @@ fn extract_surface_mesh_haloed_impl(
                                 None::<&fn(Vec3) -> f32>,
                                 None::<&fn(Vec3) -> Vec3>,
                                 DENSITY_ISO,
-                                use_qef,
-                                dists,
+                                false,
+                                &[],
                             )
                         };
                         let vid = vertices.len() as u32;
@@ -1722,11 +1747,12 @@ where
         scratch.gradient.resize(total, [0.0; 3]);
     }
 
-    // ── blur→D + ∇D precompute (BLUR path only) ──
-    // QEF-Hermite places vertices from the stored per-leaf distance, so it
-    // needs neither the blurred-occupancy field nor its gradient — skip the
-    // whole (sub-ms but non-trivial) separable blur + central-difference.
-    if !use_qef {
+    // ── blur→D + ∇D precompute ──
+    // Always computed (not skipped for QEF): QEF places vertices from the
+    // stored per-leaf distance, but still takes its smooth SHADING NORMAL
+    // from the interpolated `∇D` field (the per-leaf corner average facets
+    // at the voxel scale → speckle). The blur is sub-ms.
+    {
     let kern = density_kernel_weights_1d_for(r, kern_sigma);
     // Pass 0: seed `density` with raw binary occupancy.
     {
@@ -1848,7 +1874,7 @@ where
             }
         }
     }
-    } // end `if !use_qef` blur→D + ∇D precompute
+    } // end blur→D + ∇D precompute
 
     // ── Split borrows for the cube loop ──
     // `cells_grid` + `density` + `gradient` are read-only;
@@ -1992,9 +2018,12 @@ where
                     Some(v) => v,
                     None => {
                         let vertex = if use_qef {
-                            // QEF-Hermite: binary corner classification (via
-                            // the sign in `build_cube_vertex`) + placement
-                            // from the stored per-leaf distance.
+                            // Sign topology + QEF-Hermite position from the
+                            // stored distance, but the smooth interpolated
+                            // `∇D` SHADING NORMAL (the per-leaf corner average
+                            // facets → speckle). `density_grid_fn = None`
+                            // keeps classification + position on the sign/QEF
+                            // path; only the normal comes from `∇D`.
                             build_cube_vertex(
                                 cube,
                                 cell_lookup,
@@ -2004,7 +2033,7 @@ where
                                 bone_voxel_pool,
                                 sculpt_slots,
                                 None::<&fn(Vec3) -> f32>,
-                                None::<&fn(Vec3) -> Vec3>,
+                                Some(&outward_normal),
                                 None::<&fn(Vec3) -> f32>,
                                 None::<&fn(Vec3) -> Vec3>,
                                 iso,

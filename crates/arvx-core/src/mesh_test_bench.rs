@@ -2676,6 +2676,40 @@ mod tests {
         }
     }
 
+    /// **QEF shading normals are smooth, not speckled.** The mesh-resolve
+    /// gbuffer shades from the interpolated per-vertex normal, so a faceted
+    /// per-leaf corner-average normal speckles at the voxel scale. QEF takes
+    /// its normal from the SAME smooth `∇D` field the blur path does, so the
+    /// max adjacent-vertex normal angle is comparable to blur — NOT the much
+    /// larger faceting the corner-average produced.
+    #[test]
+    fn qef_hermite_normals_are_smooth() {
+        let hf = HeightField::fbm();
+        let vs = 0.5f32;
+        let max_edge_angle = |m: &HeightMesh| -> f32 {
+            let mut mx = 0.0f32;
+            for t in m.indices.chunks_exact(3) {
+                for k in 0..3 {
+                    let a = unpack_oct(m.verts[t[k] as usize].normal_oct).normalize_or_zero();
+                    let b = unpack_oct(m.verts[t[(k + 1) % 3] as usize].normal_oct)
+                        .normalize_or_zero();
+                    if a.length_squared() > 0.5 && b.length_squared() > 0.5 {
+                        mx = mx.max(a.dot(b).clamp(-1.0, 1.0).acos());
+                    }
+                }
+            }
+            mx
+        };
+        let qef = max_edge_angle(&bake_heightfield_qef(&hf, 12.0, vs));
+        let blur = max_edge_angle(&bake_heightfield(&hf, 12.0, vs));
+        // Same ∇D normal source → QEF tracks blur (small slack for the
+        // sign-vs-D topology placing a few boundary verts differently).
+        assert!(
+            qef <= blur * 1.5 + 0.15,
+            "QEF normals speckle: max adjacent-vertex angle {qef:.3} rad vs blur {blur:.3}"
+        );
+    }
+
     /// **Watertight seam across adjacent tiles.** Two independently
     /// voxelized tiles share the `x = 0` face. Each emits the boundary
     /// cubes that straddle the seam (the tile owns them on one side and
