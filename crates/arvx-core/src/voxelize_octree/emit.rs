@@ -11,6 +11,25 @@ use crate::sparse_octree::SparseOctree;
 
 use super::{BakeStats, BrickJob, LeafJob};
 
+/// Gradient-normalized signed distance in voxel units for QEF-Hermite
+/// meshing. `grad = (d_xp−d_xm, d_yp−d_ym, d_zp−d_zm)` is the voxelizer's
+/// `eps = cell_size/2` 6-tap central difference, so
+/// `grad.length() = 2·eps·|∇f| = cell_size·|∇f|` and `d_center /
+/// grad.length()` is the perpendicular distance from the cell center to
+/// the surface in voxel (grid) units — exactly the Hermite offset the
+/// mesher consumes (`p_surf = center − d_vox·n`, same `n = grad.normalize()`
+/// stored in the leaf). Guarded so a degenerate (locally-flat) gradient
+/// yields 0; the leaf then meshes through its cell center (harmless).
+#[inline]
+pub(crate) fn grad_normalized_distance(d_center: f32, grad: Vec3) -> f32 {
+    let len = grad.length();
+    if len > 1e-6 {
+        d_center / len
+    } else {
+        0.0
+    }
+}
+
 /// Two-phase brick emission.
 ///
 /// **Phase 1**: sample only `d_center` per cell (one sample per cell,
@@ -248,6 +267,9 @@ where
             // to free everything.
             let leaf_attr_id = leaf_attr_pool.allocate_contiguous_bump(1)?;
             *leaf_attr_pool.get_mut(leaf_attr_id) = attr;
+            // Per-leaf signed distance for QEF-Hermite meshing (voxel units;
+            // same `grad` whose normalization is the stored normal).
+            leaf_attr_pool.set_dist(leaf_attr_id, grad_normalized_distance(sc.d_center, grad));
             if sc.color != 0 {
                 leaf_attr_pool.set_color(leaf_attr_id, sc.color);
             }
@@ -332,6 +354,8 @@ where
         // so this path is rare in practice.
         let leaf_attr_id = leaf_attr_pool.allocate()?;
         *leaf_attr_pool.get_mut(leaf_attr_id) = attr;
+        // Per-leaf signed distance for QEF-Hermite meshing (voxel units).
+        leaf_attr_pool.set_dist(leaf_attr_id, grad_normalized_distance(d_center, grad));
         if color != 0 {
             leaf_attr_pool.set_color(leaf_attr_id, color);
         }
@@ -345,4 +369,66 @@ where
 
     stats.brick_cpu += t_prep + t_cpu_start.elapsed();
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grad_normalized_distance;
+    use glam::Vec3;
+
+    /// The stored distance is the true PERPENDICULAR distance from the
+    /// cell center to the surface, in VOXEL units — even for a non-unit
+    /// gradient field (the terrain vertical-gap SDF `f = y − m·x`, whose
+    /// `|∇f| = √(m²+1) ≠ 1`). Pins both the gradient normalization and the
+    /// voxel-unit conversion against the 6-tap central-difference the
+    /// voxelizer uses (`grad.length() = 2·eps·|∇f| = cell_size·|∇f|`).
+    #[test]
+    fn distance_is_perpendicular_in_voxel_units() {
+        let m = 0.5f32;
+        let eps = 0.5f32; // cell_size = 2·eps = 1
+        let cell_size = 2.0 * eps;
+        let f = |p: Vec3| p.y - m * p.x;
+        for &center in &[
+            Vec3::new(1.0, 0.7, 0.3),
+            Vec3::new(-2.0, 0.1, 4.0),
+            Vec3::new(0.0, -0.4, 0.0),
+        ] {
+            let d_center = f(center);
+            let grad = Vec3::new(
+                f(center + Vec3::new(eps, 0.0, 0.0)) - f(center - Vec3::new(eps, 0.0, 0.0)),
+                f(center + Vec3::new(0.0, eps, 0.0)) - f(center - Vec3::new(0.0, eps, 0.0)),
+                f(center + Vec3::new(0.0, 0.0, eps)) - f(center - Vec3::new(0.0, 0.0, eps)),
+            );
+            let d_vox = grad_normalized_distance(d_center, grad);
+            // Analytic perpendicular distance to the plane, in voxel units.
+            let perp_vox = (d_center / (m * m + 1.0).sqrt()) / cell_size;
+            assert!(
+                (d_vox - perp_vox).abs() < 1e-5,
+                "center={center:?}: d_vox {d_vox} vs analytic {perp_vox}"
+            );
+        }
+    }
+
+    /// 45° plane (unit-gradient SDF): at cell_size = 1 the voxel-unit
+    /// perpendicular distance equals `d_center` exactly.
+    #[test]
+    fn distance_unit_gradient_equals_d_center() {
+        let eps = 0.5f32;
+        let f = |p: Vec3| (p.y - p.x) / 2.0_f32.sqrt(); // |∇f| = 1
+        let center = Vec3::new(0.3, 0.9, 0.0);
+        let d_center = f(center);
+        let grad = Vec3::new(
+            f(center + Vec3::new(eps, 0.0, 0.0)) - f(center - Vec3::new(eps, 0.0, 0.0)),
+            f(center + Vec3::new(0.0, eps, 0.0)) - f(center - Vec3::new(0.0, eps, 0.0)),
+            f(center + Vec3::new(0.0, 0.0, eps)) - f(center - Vec3::new(0.0, 0.0, eps)),
+        );
+        assert!((grad_normalized_distance(d_center, grad) - d_center).abs() < 1e-5);
+    }
+
+    /// Degenerate (locally-flat) gradient → 0, not NaN/inf.
+    #[test]
+    fn distance_degenerate_gradient_is_zero() {
+        assert_eq!(grad_normalized_distance(0.5, Vec3::ZERO), 0.0);
+        assert_eq!(grad_normalized_distance(-3.0, Vec3::ZERO), 0.0);
+    }
 }

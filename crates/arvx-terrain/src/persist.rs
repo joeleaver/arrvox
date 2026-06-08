@@ -218,6 +218,9 @@ pub fn read_baked_tile(
         grid_origin: glam::Vec3::from(header.aabb_min),
         leaf_attrs,
         leaf_attr_colors,
+        // Loaded-tile distance section wired in Stage 5; empty → the
+        // loaded tile falls back to the blur mesher (no QEF) for now.
+        leaf_attr_dists: Vec::new(),
         brick_cells,
         brick_face_links,
         halo_cells: Vec::new(),

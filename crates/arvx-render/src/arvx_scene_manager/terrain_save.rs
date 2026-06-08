@@ -158,6 +158,8 @@ impl ArvxSceneManager {
             grid_origin,
             leaf_attrs,
             leaf_attr_colors,
+            // Saved-tile distance section wired in Stage 5; empty for now.
+            leaf_attr_dists: Vec::new(),
             brick_cells: brick_cells_out,
             brick_face_links: brick_face_links_out,
             halo_cells,

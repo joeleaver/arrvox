@@ -1485,10 +1485,7 @@ fn bresenham(
 // measure a LOW-FREQUENCY ripple metric (not just the existing
 // high-frequency `roughness`, which misses wide flat treads).
 
-use crate::leaf_attr_pool::LeafAttrPool;
-use crate::mesh_extract::{
-    collect_cell_map, extract_surface_mesh_density_haloed, set_qef_hermite, CELL_INTERIOR,
-};
+use crate::mesh_extract::{extract_surface_mesh_density_haloed, set_qef_hermite};
 use crate::voxelize_octree::voxelize_to_artifact;
 
 /// Terrain halo the real bake uses (`bake.rs::TILE_HALO_VOXELS`).
@@ -1754,16 +1751,12 @@ pub fn bake_heightfield_blur(
 }
 
 /// Mesh a heightfield through the terrain bake path with **QEF-Hermite**
-/// placement (Stage 2), injecting the per-leaf signed distance the Stage-3
-/// voxelizer will store — computed HERE from the analytic height so the
-/// QEF mesher is validated in ISOLATION before the voxelizer write lands.
-///
-/// The injected distance replicates the voxelizer's exact arithmetic
-/// (`eps = vs/2` 6-tap central difference, `d_vox = d_center /
-/// grad.length()`, voxel units) so the asserts on this path survive Stage
-/// 3 unchanged once real baked distances replace the injection. Distances
-/// are written for every interior **and** halo surface leaf so boundary
-/// cubes get Hermite data on both sides.
+/// placement, reading the per-leaf signed distance the **voxelizer** baked
+/// into the artifact (Stage 3). Identical to [`bake_heightfield`] except it
+/// sets the QEF toggle and hands the artifact's `leaf_attr_dists` to the
+/// mesher — the real production data path, end to end. (The Stage-2
+/// analytic-distance injection it replaced has been dropped; the asserts
+/// are unchanged, now validating the voxelizer's distance write too.)
 pub fn bake_heightfield_qef(hf: &HeightField, half_world: f32, voxel_size: f32) -> HeightMesh {
     let aabb = heightfield_tile_aabb(half_world, voxel_size);
     let h = &hf.h;
@@ -1777,44 +1770,6 @@ pub fn bake_heightfield_qef(hf: &HeightField, half_world: f32, voxel_size: f32) 
         .expect("heightfield voxelize_to_artifact");
     let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
 
-    // ── Inject per-leaf distance from the analytic height ──
-    let eps = voxel_size * 0.5;
-    let f = |p: Vec3| p.y - h(p.x, p.z);
-    let perp_dist_vox = |cell: IVec3| -> f32 {
-        let center = artifact.grid_origin
-            + (Vec3::new(cell.x as f32, cell.y as f32, cell.z as f32) + Vec3::splat(0.5))
-                * voxel_size;
-        let d_center = f(center);
-        let grad = Vec3::new(
-            f(center + Vec3::new(eps, 0.0, 0.0)) - f(center - Vec3::new(eps, 0.0, 0.0)),
-            f(center + Vec3::new(0.0, eps, 0.0)) - f(center - Vec3::new(0.0, eps, 0.0)),
-            f(center + Vec3::new(0.0, 0.0, eps)) - f(center - Vec3::new(0.0, 0.0, eps)),
-        );
-        let gl = grad.length();
-        if gl > 1e-6 {
-            d_center / gl
-        } else {
-            0.0
-        }
-    };
-    let mut dists = vec![0i16; artifact.leaf_attrs.len()];
-    let mut set = |cell: IVec3, slot: u32| {
-        if slot != CELL_INTERIOR && (slot as usize) < dists.len() {
-            dists[slot as usize] = LeafAttrPool::quantize_dist(perp_dist_vox(cell));
-        }
-    };
-    let cells = collect_cell_map(
-        artifact.octree.as_slice(),
-        artifact.octree.depth(),
-        &brick_pool_flat,
-    );
-    for (&cell, &slot) in cells.iter() {
-        set(cell, slot);
-    }
-    for &(cell, slot) in &artifact.halo_cells {
-        set(cell, slot);
-    }
-
     set_qef_hermite(true);
     let (verts, indices) = extract_surface_mesh_density_haloed(
         artifact.octree.as_slice(),
@@ -1827,7 +1782,7 @@ pub fn bake_heightfield_qef(hf: &HeightField, half_world: f32, voxel_size: f32) 
         &artifact.halo_cells,
         REPRO_TILE_HALO,
         None,
-        &dists,
+        &artifact.leaf_attr_dists,
     );
     set_qef_hermite(false);
 

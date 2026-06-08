@@ -491,6 +491,7 @@ where
     // ── Decide per brick: Empty (skip), Interior (mark all), Mixed (queue). ──
     struct HaloSurface {
         coord: IVec3,
+        d_center: f32,
         primary: u16,
         secondary: u16,
         blend: u8,
@@ -551,6 +552,10 @@ where
         }
         surface_queue.push(HaloSurface {
             coord,
+            // Phase-1 center sample — the SAME value the neighbour tile's
+            // interior emit uses for this cell, so the QEF-Hermite distance
+            // is bit-identical across the seam (Stage 4 invariant).
+            d_center: d,
             primary,
             secondary,
             blend,
@@ -607,6 +612,10 @@ where
             let attr = LeafAttr::new_blended(normal, hs.primary, hs.secondary, hs.blend);
             let leaf_attr_id = leaf_attr_pool.allocate_contiguous_bump(1)?;
             *leaf_attr_pool.get_mut(leaf_attr_id) = attr;
+            // Per-leaf distance for the halo surface leaf — same formula as
+            // the interior emit so the shared seam cube is bit-identical.
+            leaf_attr_pool
+                .set_dist(leaf_attr_id, emit::grad_normalized_distance(hs.d_center, grad));
             if hs.color != 0 {
                 leaf_attr_pool.set_color(leaf_attr_id, hs.color);
             }
@@ -763,6 +772,10 @@ pub struct BakeArtifact {
     pub leaf_attrs: Vec<LeafAttr>,
     /// Parallel per-attr color overrides (0 = no override).
     pub leaf_attr_colors: Vec<u32>,
+    /// Parallel per-attr quantized signed distances (voxel units; see
+    /// [`LeafAttrPool::dequantize_dist`]). Fed to the QEF-Hermite mesher
+    /// as `dists: &[i16]`; persisted into `.arvx` v7.
+    pub leaf_attr_dists: Vec<i16>,
     /// Per-brick cell payloads (worker-local brick ID = outer index).
     /// Each `[u32; BRICK_CELLS]` entry's cells are worker-local
     /// leaf_attr IDs, or `BRICK_EMPTY`/`BRICK_INTERIOR` sentinels.
@@ -813,9 +826,12 @@ where
     let n_attrs = result.leaf_attr_unique_count as usize;
     let mut leaf_attrs: Vec<LeafAttr> = Vec::with_capacity(n_attrs);
     let mut leaf_attr_colors: Vec<u32> = Vec::with_capacity(n_attrs);
+    let mut leaf_attr_dists: Vec<i16> = Vec::with_capacity(n_attrs);
+    let dist_slice = leaf_attr_pool.dists_as_slice();
     for i in 0..n_attrs as u32 {
         leaf_attrs.push(*leaf_attr_pool.get(i));
         leaf_attr_colors.push(leaf_attr_pool.color(i));
+        leaf_attr_dists.push(dist_slice.get(i as usize).copied().unwrap_or(0));
     }
 
     let brick_cells: Vec<[u32; BC as usize]> = result
@@ -835,6 +851,7 @@ where
         grid_origin: result.grid_origin,
         leaf_attrs,
         leaf_attr_colors,
+        leaf_attr_dists,
         brick_cells,
         brick_face_links: result.brick_face_links,
         halo_cells: result.halo_cells,
