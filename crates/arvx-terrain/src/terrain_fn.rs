@@ -70,6 +70,26 @@ pub trait TerrainFn: Send + Sync {
     fn sample_grad(&self, _tile: TileKey, _local: Vec3, _voxel_size_m: f32) -> Option<Vec3> {
         None
     }
+
+    /// Combined [`Self::sample`] + [`Self::sample_grad`] in one call.
+    ///
+    /// The default just forwards to both, but heightfield impls can
+    /// override it to compute height, gradient, slope, AND material in a
+    /// single noise walk — the gradient *is* the slope (`atan(|∇h|)`), so
+    /// a separate finite-difference slope probe for material assignment
+    /// is redundant. The bake path calls this once per sample instead of
+    /// `sample` + `sample_grad` separately.
+    fn sample_with_grad(
+        &self,
+        tile: TileKey,
+        local: Vec3,
+        voxel_size_m: f32,
+    ) -> (TerrainSample, Option<Vec3>) {
+        (
+            self.sample(tile, local, voxel_size_m),
+            self.sample_grad(tile, local, voxel_size_m),
+        )
+    }
 }
 
 #[cfg(test)]

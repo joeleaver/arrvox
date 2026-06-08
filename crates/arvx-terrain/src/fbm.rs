@@ -370,6 +370,25 @@ impl FbmTerrainFnResolved {
         }
         self.grass_material
     }
+
+    /// Same height-band + slope material rules as
+    /// [`Self::material_at_with_octaves`], but with the slope supplied
+    /// directly (degrees from horizontal) instead of re-probed with a
+    /// 4-tap finite difference. The bake's analytic-gradient path derives
+    /// `slope = atan(|∇h|)` from the gradient it already computes, so
+    /// this avoids ~4 redundant noise walks per sample.
+    pub fn material_for_slope(&self, y_m: f32, slope_deg: f32) -> u16 {
+        if y_m < self.sea_level_y {
+            return self.sand_material;
+        }
+        if y_m > self.snow_level_y {
+            return self.snow_material;
+        }
+        if slope_deg > self.slope_rock_threshold_deg {
+            return self.rock_material;
+        }
+        self.grass_material
+    }
 }
 
 impl TerrainFn for FbmTerrainFnResolved {
@@ -422,6 +441,35 @@ impl TerrainFn for FbmTerrainFnResolved {
         // the sample's y (the surface is a heightfield in this V1 form).
         let (_, h_x, h_z) = self.height_grad_at_with_octaves(wx, wz, octaves);
         Some(Vec3::new(-h_x, 1.0, -h_z))
+    }
+
+    fn sample_with_grad(
+        &self,
+        tile: TileKey,
+        local: Vec3,
+        voxel_size_m: f32,
+    ) -> (TerrainSample, Option<Vec3>) {
+        // ONE noise walk for everything: `height_grad_at_with_octaves`
+        // returns `(h, ∂h/∂x, ∂h/∂z)` in a single octave sweep. From that
+        // we get the sd, the SDF gradient `(−h_x, 1, −h_z)`, AND the
+        // material slope `atan(|∇h|)` — replacing `sample`'s 1 height +
+        // 4-tap slope probe (5 walks) plus a separate `sample_grad`
+        // (1 walk) with a single walk. Same world transform + octave
+        // clamp as `sample`, so the result matches (material differs only
+        // by the analytic-vs-probe slope, <1°, right at the threshold).
+        let world_origin = tile.origin_world().to_vec3();
+        let wx = world_origin.x + local.x;
+        let wy = world_origin.y + local.y;
+        let wz = world_origin.z + local.z;
+        let octaves = self.octaves_for_voxel(voxel_size_m);
+        let (surface_y, h_x, h_z) = self.height_grad_at_with_octaves(wx, wz, octaves);
+        let sd = wy - surface_y;
+        let slope_deg = (h_x * h_x + h_z * h_z).sqrt().atan().to_degrees();
+        let mat = self.material_for_slope(surface_y, slope_deg);
+        (
+            TerrainSample { sd, primary_mat: mat, secondary_mat: mat, blend: 0.0 },
+            Some(Vec3::new(-h_x, 1.0, -h_z)),
+        )
     }
 }
 
@@ -699,6 +747,56 @@ mod tests {
     /// override `sample_grad` drives the voxelizer's finite-difference
     /// path. (FbmTerrainFnResolved overrides it; this pins the contract
     /// for the test/stub TerrainFns that don't.)
+    /// `sample_with_grad` produces the same sd + gradient as the separate
+    /// `sample`/`sample_grad` calls, and the same material — except the
+    /// slope now comes analytically from the gradient instead of a 4-tap
+    /// probe, so material may differ only for cells within the
+    /// analytic-vs-probe slope gap (<~1°) of the rock threshold. We assert
+    /// exact sd + gradient, and material agreement away from that band.
+    #[test]
+    fn sample_with_grad_matches_separate_calls() {
+        let f = FbmTerrainFnResolved { scale_m: 45.0, amplitude_m: 28.0, ..resolved_default() };
+        let k = TileKey::level0(1, 0, -2);
+        let vs = 0.25f32;
+        let mut checked = 0usize;
+        let mut mat_mismatch = 0usize;
+        for i in 0..20 {
+            for j in 0..20 {
+                let local = Vec3::new(i as f32 * 3.1 + 0.3, 0.0, j as f32 * 2.7 - 0.4);
+                let (s, g) = f.sample_with_grad(k, local, vs);
+                let s_ref = f.sample(k, local, vs);
+                let g_ref = f.sample_grad(k, local, vs).unwrap();
+                assert_eq!(s.sd, s_ref.sd, "sd differs at {local:?}");
+                assert_eq!(g.unwrap(), g_ref, "gradient differs at {local:?}");
+                // Material: agrees unless the analytic slope lands on the
+                // opposite side of the rock threshold from the probe slope.
+                let octs = f.octaves_for_voxel(vs);
+                let o = k.origin_world().to_vec3();
+                let (wx, wz) = (o.x + local.x, o.z + local.z);
+                let analytic = {
+                    let (_, hx, hz) = f.height_grad_at_with_octaves(wx, wz, octs);
+                    (hx * hx + hz * hz).sqrt().atan().to_degrees()
+                };
+                let probe = f.slope_degrees_at_with_octaves(wx, wz, octs);
+                let near_threshold =
+                    (analytic - f.slope_rock_threshold_deg).abs() < 2.0
+                        || (probe - f.slope_rock_threshold_deg).abs() < 2.0;
+                if s.primary_mat != s_ref.primary_mat {
+                    mat_mismatch += 1;
+                    assert!(
+                        near_threshold,
+                        "material differs at {local:?} away from the slope \
+                         threshold (analytic {analytic:.2}° vs probe {probe:.2}°)"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 300);
+        // The vast majority must agree (only near-threshold cells may flip).
+        assert!(mat_mismatch * 20 < checked, "too many material flips: {mat_mismatch}/{checked}");
+    }
+
     #[test]
     fn default_terrain_fn_has_no_analytic_gradient() {
         struct Flat;

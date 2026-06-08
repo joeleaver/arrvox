@@ -146,7 +146,9 @@ pub fn bake_tile_with_skirts(
             .iter()
             .map(|&world_pos| {
                 let local = world_pos - tile_origin_world;
-                let mut s = terrain_fn.sample(key, local, voxel_size_m);
+                // One call: sd + material (analytic slope) + the SDF
+                // gradient, in a single noise walk on the FBM path.
+                let (mut s, base_grad) = terrain_fn.sample_with_grad(key, local, voxel_size_m);
 
                 let wy = world_pos.y;
                 let mut h = wy - s.sd;
@@ -213,13 +215,10 @@ pub fn bake_tile_with_skirts(
                 }
 
                 let blend_u4 = (s.blend.clamp(0.0, 1.0) * 15.0).round() as u8;
-                // Exact analytic ∇sd on pure-FBM tiles; `None` (6-tap FD)
-                // when stamps/regions/envelope warped the height above.
-                let grad = if use_analytic_grad {
-                    terrain_fn.sample_grad(key, local, voxel_size_m)
-                } else {
-                    None
-                };
+                // Exact analytic ∇sd (from the single sample_with_grad
+                // walk) on pure-FBM tiles; `None` (6-tap FD) when
+                // stamps/regions/envelope warped the height above.
+                let grad = if use_analytic_grad { base_grad } else { None };
                 (s.sd, s.primary_mat, s.secondary_mat, blend_u4, 0, grad)
             })
             .collect()
