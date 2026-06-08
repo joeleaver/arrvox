@@ -289,7 +289,8 @@ fn rebuild_mesh_sections(path: &std::path::Path) -> Result<(), String> {
             color_opt,
             skin_meta_in,
             mesh_sections,
-            None,
+            None, // distance_data
+            None, // progress
         )
         .map_err(|e| format!("write v5: {e}"))?;
     }

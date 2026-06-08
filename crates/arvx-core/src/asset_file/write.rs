@@ -4,7 +4,7 @@
 use std::io::{Seek, Write};
 
 use super::{
-    FLAG_HAS_BONES, FLAG_HAS_BRICKS, FLAG_HAS_COLOR, FLAG_HAS_NORMALS, ARVX_MAGIC,
+    FLAG_HAS_BONES, FLAG_HAS_BRICKS, FLAG_HAS_COLOR, FLAG_HAS_DISTANCE, FLAG_HAS_NORMALS, ARVX_MAGIC,
     ARVX_VERSION, ArvxFileError, ArvxHeader, SkinMetaIn, encode_skin_meta, write_stage,
 };
 
@@ -74,7 +74,8 @@ pub fn write_rkp<W: Write + Seek>(
         color_data,
         skin_meta,
         mesh_sections,
-        None,
+        None, // distance_data
+        None, // progress
     )
 }
 
@@ -100,6 +101,7 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
     color_data: Option<&[u8]>,
     skin_meta: Option<SkinMetaIn<'_>>,
     mesh_sections: Option<MeshSectionsIn<'_>>,
+    distance_data: Option<&[u8]>,
     progress: Option<&dyn Fn(&'static str)>,
 ) -> Result<(), ArvxFileError> {
     let tick = |label: &'static str| {
@@ -173,6 +175,15 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
             Some(lz4_flex::compress_prepend_size(m.dag_produced))
         }
     });
+    // v7+ per-leaf signed distance. Skip when empty (no distance baked) so
+    // the flag/size stay 0 and the loader takes the blur fallback.
+    let distance_compressed = distance_data.and_then(|d| {
+        if d.is_empty() {
+            None
+        } else {
+            Some(lz4_flex::compress_prepend_size(d))
+        }
+    });
     tick(write_stage::WRITE_FILE);
 
     let mut flags = 0u32;
@@ -180,6 +191,7 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
     if skin_meta.is_some()    { flags |= FLAG_HAS_BONES; }
     if normals_data.is_some() { flags |= FLAG_HAS_NORMALS; }
     if bricks_data.is_some()  { flags |= FLAG_HAS_BRICKS; }
+    if distance_compressed.is_some() { flags |= FLAG_HAS_DISTANCE; }
 
     let mut mat_ids = [0u16; 16];
     for (i, &id) in material_ids.iter().take(16).enumerate() {
@@ -218,6 +230,8 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
             .as_ref().map(|d| d.len() as u32).unwrap_or(0),
         dag_produced_compressed_size: dag_produced_compressed
             .as_ref().map(|d| d.len() as u32).unwrap_or(0),
+        distance_compressed_size: distance_compressed
+            .as_ref().map(|d| d.len() as u32).unwrap_or(0),
     };
 
     writer.write_all(bytemuck::bytes_of(&header))?;
@@ -251,6 +265,12 @@ pub fn write_rkp_with_progress<W: Write + Seek>(
         writer.write_all(data)?;
     }
     if let Some(ref data) = dag_produced_compressed {
+        writer.write_all(data)?;
+    }
+    // v7 distance section — written LAST so v4-v6 readers (which stop
+    // after dag_produced) are unaffected, and read_rkp_distance reads it
+    // after the DAG sections.
+    if let Some(ref data) = distance_compressed {
         writer.write_all(data)?;
     }
 

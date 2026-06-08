@@ -542,6 +542,35 @@ fn active_blur_params() -> (i32, f32, f32) {
         .unwrap_or((DENSITY_KERNEL_R, DENSITY_KERNEL_SIGMA, DENSITY_ISO))
 }
 
+thread_local! {
+    /// Per-thread switch selecting the **QEF-Hermite** vertex placement
+    /// (stored per-leaf signed distance → dual-contouring/QEF) over the
+    /// legacy `blur→D` + Newton + plane-fit recovery. `false` (default)
+    /// keeps the blur path. Set via [`set_qef_hermite`].
+    ///
+    /// This is the staged-rollout switch: Stage 2 reads it to validate the
+    /// new mesher on the bench against the blur baseline; Stage 5 flips the
+    /// production default to "QEF when per-leaf distance is present, else
+    /// blur fallback" and this thread-local reverts to bench/diagnostics use.
+    static QEF_HERMITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Select the QEF-Hermite mesher for the next extract on this thread
+/// (`true`) or the legacy blur path (`false`). **Bench / diagnostics**
+/// during the staged rollout; production gates on per-leaf distance
+/// presence instead (Stage 5).
+pub fn set_qef_hermite(on: bool) {
+    QEF_HERMITE.with(|c| c.set(on));
+}
+
+/// Whether the QEF-Hermite path is force-selected on this thread.
+// Wired into the extractor in Stage 2 — `allow` drops then.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn qef_hermite_enabled() -> bool {
+    QEF_HERMITE.with(|c| c.get())
+}
+
 /// Build the normalized 1D Gaussian weights for radius `r`, sigma
 /// `sigma`, over `[-r, r]` (length `2r+1`, summing to 1.0 so a fully-
 /// solid neighborhood blurs to exactly `D = 1.0`). Returned as a `Vec`

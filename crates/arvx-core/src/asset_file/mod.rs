@@ -76,20 +76,26 @@ pub const ARVX_MAGIC: [u8; 4] = [b'A', b'V', b'X', 0x01];
 
 /// Current format version.
 ///
-/// v6 (current): adds three baked DAG topology sections
-/// (`dag_groups`, `dag_consumed`, `dag_produced`) that mirror
+/// v7 (current): adds a per-leaf signed-distance section (`distance`,
+/// gated by `FLAG_HAS_DISTANCE`) — the sub-voxel surface offset the
+/// QEF-Hermite mesher places vertices on. v4/v5/v6 still load; the load
+/// path leaves the distance section empty (flag unset → mesher falls
+/// back to the blur path).
+///
+/// v6: adds three baked DAG topology sections (`dag_groups`,
+/// `dag_consumed`, `dag_produced`) that mirror
 /// [`arvx_core::mesh_lod::ClusterDag`]. Lets sculpt's per-chain
 /// LOD-0 clamp walk the bipartite cluster ↔ group graph without
-/// rebuilding the DAG at load. v5 and v4 still load — the load
-/// path leaves the new sections empty for v5 and falls through to
-/// the in-process `build_cluster_dag` rebuild for v4.
-pub const ARVX_VERSION: u32 = 6;
+/// rebuilding the DAG at load.
+pub const ARVX_VERSION: u32 = 7;
 
 /// Flags for optional sections.
 pub const FLAG_HAS_COLOR: u32 = 1 << 0;
 pub const FLAG_HAS_BONES: u32 = 1 << 1;
 pub const FLAG_HAS_NORMALS: u32 = 1 << 2;
 pub const FLAG_HAS_BRICKS: u32 = 1 << 3;
+/// v7+: a per-leaf quantized signed-distance section is present.
+pub const FLAG_HAS_DISTANCE: u32 = 1 << 4;
 
 /// .arvx file header (128 bytes).
 #[repr(C)]
@@ -149,6 +155,10 @@ pub struct ArvxHeader {
     /// Compressed size of DAG produced-cluster-IDs section. v6+. 0 if
     /// absent. Sized `dag_produced.len() * 4` (one u32 per entry).
     pub dag_produced_compressed_size: u32,
+    /// Compressed size of the per-leaf signed-distance section. v7+. 0 if
+    /// absent (FLAG_HAS_DISTANCE unset). Sized `voxel_count * 2` (one i16
+    /// per leaf slot) before compression.
+    pub distance_compressed_size: u32,
 }
 
 /// Per-write skin-meta input. Fed into [`write_rkp_with_progress`]'s
@@ -296,7 +306,11 @@ pub mod write_stage {
 /// existing v4/v5 files keep loading.
 const V4_HEADER_SIZE: usize = 128;
 const V5_HEADER_SIZE: usize = 144;
-const V6_HEADER_SIZE: usize = std::mem::size_of::<ArvxHeader>();
+const V6_HEADER_SIZE: usize = 156;
+const V7_HEADER_SIZE: usize = std::mem::size_of::<ArvxHeader>();
+// Pin the layout so adding a field can't silently shift the v6 reader.
+const _: () = assert!(V7_HEADER_SIZE == 160);
+const _: () = assert!(V6_HEADER_SIZE == V7_HEADER_SIZE - 4);
 
 /// Read a .arvx file header. Accepts v4 (128 B), v5 (144 B), and v6
 /// (156 B); older paths zero-fill the missing fields so the
@@ -316,17 +330,18 @@ pub fn read_rkp_header<R: Read>(reader: &mut R) -> Result<ArvxHeader, ArvxFileEr
         4 => V4_HEADER_SIZE - 8,
         5 => V5_HEADER_SIZE - 8,
         6 => V6_HEADER_SIZE - 8,
+        7 => V7_HEADER_SIZE - 8,
         v => return Err(ArvxFileError::UnsupportedVersion(v)),
     };
     let mut body = vec![0u8; body_len];
     reader.read_exact(&mut body)?;
 
-    // Reassemble into a fixed-size v6 buffer; older versions' tails
+    // Reassemble into a fixed-size v7 buffer; older versions' tails
     // are zeroed, which leaves the corresponding section-size fields
-    // at zero. The mesh-section readers short-circuit on size == 0,
-    // and the renderer falls back to in-process DAG build (v4) or
-    // empty DAG groups → asset-wide marking (v5).
-    let mut buf = [0u8; V6_HEADER_SIZE];
+    // at zero. The section readers short-circuit on size == 0, and the
+    // renderer falls back to in-process DAG build (v4) / empty DAG
+    // groups (v5) / blur mesher (no distance, v4-v6).
+    let mut buf = [0u8; V7_HEADER_SIZE];
     buf[..8].copy_from_slice(&prefix);
     buf[8..8 + body_len].copy_from_slice(&body);
     let header: ArvxHeader = *bytemuck::from_bytes(&buf);
@@ -395,6 +410,25 @@ pub fn read_rkp_color<R: Read>(
         return Ok(Vec::new());
     }
     let mut compressed = vec![0u8; header.color_compressed_size as usize];
+    reader.read_exact(&mut compressed)?;
+    lz4_flex::decompress_size_prepended(&compressed)
+        .map_err(|e| ArvxFileError::Decompress(e.to_string()))
+}
+
+/// Read and decompress the per-leaf signed-distance section (v7+, if
+/// present). One `i16` per leaf slot in slot order (quantized voxel
+/// units; see [`crate::LeafAttrPool::quantize_dist`]). Empty for v4-v6
+/// files or v7 files baked before distance was written — the mesher
+/// falls back to the blur path. Positioned **last** in the file, so the
+/// caller reads it after the DAG sections.
+pub fn read_rkp_distance<R: Read>(
+    reader: &mut R,
+    header: &ArvxHeader,
+) -> Result<Vec<u8>, ArvxFileError> {
+    if header.distance_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut compressed = vec![0u8; header.distance_compressed_size as usize];
     reader.read_exact(&mut compressed)?;
     lz4_flex::decompress_size_prepended(&compressed)
         .map_err(|e| ArvxFileError::Decompress(e.to_string()))

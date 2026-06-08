@@ -3,13 +3,90 @@ use std::io::{Cursor, Seek, SeekFrom};
 
 
 #[test]
-fn header_size_is_156_bytes() {
-    // v5: grew from 128 → 144 with the addition of three mesh
-    // section size slots + the lod0_index_count prefix (4 × u32).
-    // v6: 144 → 156 with three DAG-section size slots
-    // (`dag_groups_compressed_size`, `dag_consumed_compressed_size`,
-    // `dag_produced_compressed_size`).
-    assert_eq!(std::mem::size_of::<ArvxHeader>(), 156);
+fn header_size_is_160_bytes() {
+    // v5: 128 → 144 (three mesh section size slots + lod0_index_count).
+    // v6: 144 → 156 (three DAG-section size slots).
+    // v7: 156 → 160 (`distance_compressed_size`).
+    assert_eq!(std::mem::size_of::<ArvxHeader>(), 160);
+}
+
+#[test]
+fn write_and_read_distance_v7_roundtrip() {
+    let mut buf = Vec::new();
+    let mut cursor = Cursor::new(&mut buf);
+
+    let octree_nodes: Vec<u32> = vec![0xFFFF_FFFF];
+    let voxel_data: Vec<u8> = Vec::new();
+    let dists: Vec<i16> = vec![-100, 0, 8192, -8192, 42];
+    let dist_bytes: &[u8] = bytemuck::cast_slice(&dists);
+
+    write_rkp_with_progress(
+        &mut cursor,
+        &octree_nodes,
+        1,
+        0.1,
+        5,
+        [-1.0; 3],
+        [1.0; 3],
+        &[0, 1],
+        &voxel_data,
+        None, // normals
+        None, // bricks
+        None, // color
+        None, // skin_meta
+        None, // mesh_sections
+        Some(dist_bytes),
+        None, // progress
+    )
+    .unwrap();
+
+    cursor.seek(SeekFrom::Start(0)).unwrap();
+    let header = read_rkp_header(&mut cursor).unwrap();
+    assert_eq!(header.version, 7);
+    assert_ne!(header.flags & FLAG_HAS_DISTANCE, 0, "FLAG_HAS_DISTANCE set");
+    assert!(header.distance_compressed_size > 0);
+
+    // No normals/bricks/color/bone/mesh/dag were written, so after the
+    // octree + voxel sections the distance section is next.
+    let _ = read_rkp_octree(&mut cursor, &header).unwrap();
+    let _ = read_rkp_voxels(&mut cursor, &header).unwrap();
+    let dist_out = read_rkp_distance(&mut cursor, &header).unwrap();
+    let back: &[i16] = bytemuck::cast_slice(&dist_out);
+    assert_eq!(back, dists.as_slice());
+}
+
+#[test]
+fn no_distance_leaves_flag_unset() {
+    let mut buf = Vec::new();
+    let mut cursor = Cursor::new(&mut buf);
+    let octree_nodes: Vec<u32> = vec![0xFFFF_FFFF];
+    write_rkp(
+        &mut cursor, &octree_nodes, 1, 0.1, 0, [-1.0; 3], [1.0; 3], &[0],
+        &[], None, None, None, None, None,
+    )
+    .unwrap();
+    cursor.seek(SeekFrom::Start(0)).unwrap();
+    let header = read_rkp_header(&mut cursor).unwrap();
+    assert_eq!(header.flags & FLAG_HAS_DISTANCE, 0);
+    assert_eq!(header.distance_compressed_size, 0);
+    // read_rkp_distance short-circuits to empty → mesher takes blur fallback.
+    let _ = read_rkp_octree(&mut cursor, &header).unwrap();
+    let _ = read_rkp_voxels(&mut cursor, &header).unwrap();
+    assert!(read_rkp_distance(&mut cursor, &header).unwrap().is_empty());
+}
+
+#[test]
+fn v6_header_back_compat_zero_fills_distance() {
+    // Hand-assemble a 156-byte v6 header (version=6) and confirm the
+    // reader zero-fills the new v7 distance field (flag unset → fallback).
+    let mut hdr_bytes = vec![0u8; 156];
+    hdr_bytes[0..4].copy_from_slice(&ARVX_MAGIC);
+    hdr_bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
+    let mut cursor = Cursor::new(hdr_bytes);
+    let header = read_rkp_header(&mut cursor).unwrap();
+    assert_eq!(header.version, 6);
+    assert_eq!(header.distance_compressed_size, 0);
+    assert_eq!(header.flags & FLAG_HAS_DISTANCE, 0);
 }
 
 #[test]

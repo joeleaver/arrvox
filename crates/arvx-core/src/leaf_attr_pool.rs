@@ -41,6 +41,15 @@ pub struct LeafAttrPool {
     /// zero weights — shader treats it as "no skinning influence" so
     /// unskinned assets cost nothing beyond the 8 B per slot.
     bones: Vec<BoneVoxel>,
+    /// Parallel per-leaf signed distance, i16 fixed-point in **voxel
+    /// units** ([`Self::quantize_dist`]). This is the sub-voxel surface
+    /// offset the voxelizer/sculpt computes and used to discard — with the
+    /// stored normal it forms the Hermite sample (`p_surf = center - d·n`)
+    /// the QEF-Hermite mesher places vertices on. **CPU-only**: read by the
+    /// surface-mesh extractor and persisted to `.arvx`, but never uploaded
+    /// to the GPU (the resolve shader reads only normal/material), so —
+    /// unlike `colors`/`bones` — it carries no dirty-range tracker.
+    dists: Vec<i16>,
     /// Next unallocated slot (bump pointer).
     next_free: u32,
     /// Free list of reclaimed ranges — `(start, count)` pairs.
@@ -60,6 +69,7 @@ impl LeafAttrPool {
             data: std::sync::Arc::new(vec![LeafAttr::EMPTY; capacity as usize]),
             colors: vec![0u32; capacity as usize],
             bones: vec![BoneVoxel::default(); capacity as usize],
+            dists: vec![0i16; capacity as usize],
             next_free: 0,
             free_list: Vec::new(),
             dirty_attrs: DirtyRanges::new(),
@@ -215,6 +225,7 @@ impl LeafAttrPool {
         for s in start as usize..end {
             self.colors[s] = 0;
             self.bones[s] = BoneVoxel::default();
+            self.dists[s] = 0;
         }
         self.mark_slot_range_all(start, count);
         if start + count == self.next_free {
@@ -277,6 +288,7 @@ impl LeafAttrPool {
         self.data_mut().resize(new_cap as usize, LeafAttr::EMPTY);
         self.colors.resize(new_cap as usize, 0);
         self.bones.resize(new_cap as usize, BoneVoxel::default());
+        self.dists.resize(new_cap as usize, 0);
     }
 
     /// Raw byte slice of the allocated attr region (for GPU upload).
@@ -347,7 +359,54 @@ impl LeafAttrPool {
         self.data_mut()[s..s + n].copy_from_slice(other.as_slice());
         self.colors[s..s + n].copy_from_slice(&other.colors[..n]);
         self.bones[s..s + n].copy_from_slice(&other.bones[..n]);
+        self.dists[s..s + n].copy_from_slice(&other.dists[..n]);
         start
+    }
+
+    // ── Per-leaf signed distance (Hermite for QEF meshing) ────────────
+
+    /// Quantize a voxel-unit signed distance to i16 fixed-point. Scale
+    /// 8192 (res ≈ 0.00012 vox); clamped to ±3.99 voxels so it never
+    /// saturates on real surface leaves (`|d| ≤ 0.87` vox) and a
+    /// pathological input can't wrap.
+    #[inline]
+    pub fn quantize_dist(d_vox: f32) -> i16 {
+        (d_vox.clamp(-3.99, 3.99) * 8192.0).round() as i16
+    }
+
+    /// Inverse of [`Self::quantize_dist`].
+    #[inline]
+    pub fn dequantize_dist(q: i16) -> f32 {
+        q as f32 / 8192.0
+    }
+
+    /// Signed distance (voxel units) stored at `slot`.
+    #[inline]
+    pub fn dist(&self, slot: u32) -> f32 {
+        Self::dequantize_dist(self.dists[slot as usize])
+    }
+
+    /// Store a voxel-unit signed distance at `slot` (quantized).
+    #[inline]
+    pub fn set_dist(&mut self, slot: u32, d_vox: f32) {
+        self.dists[slot as usize] = Self::quantize_dist(d_vox);
+    }
+
+    /// Typed slice of the allocated quantized distances. Indexed by the
+    /// same slot id as [`as_slice`]; consumed by the surface-mesh extractor.
+    #[inline]
+    pub fn dists_as_slice(&self) -> &[i16] {
+        &self.dists[..self.next_free as usize]
+    }
+
+    /// Raw byte slice of the allocated distance array (for `.arvx`
+    /// serialization — NOT GPU upload).
+    pub fn dist_bytes(&self) -> &[u8] {
+        let count = self.next_free as usize;
+        if count == 0 {
+            return &[];
+        }
+        bytemuck::cast_slice(&self.dists[..count])
     }
 }
 
@@ -380,10 +439,49 @@ mod tests {
         let s = pool.allocate().unwrap();
         *pool.get_mut(s) = LeafAttr::new(Vec3::X, 99);
         pool.set_color(s, 0xAABBCCDD);
+        pool.set_dist(s, -0.5);
         pool.grow(100);
         assert_eq!(pool.capacity(), 100);
         assert_eq!(pool.get(s).material_primary, 99);
         assert_eq!(pool.color(s), 0xAABBCCDD);
+        assert!((pool.dist(s) - (-0.5)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn dist_quantize_roundtrip() {
+        // Exact at multiples of 1/8192; within ½ LSB elsewhere.
+        for &d in &[0.0f32, 0.25, -0.75, 0.86, -0.86, 3.5, -3.5] {
+            let q = LeafAttrPool::quantize_dist(d);
+            let back = LeafAttrPool::dequantize_dist(q);
+            assert!((back - d).abs() <= 1.0 / 8192.0, "d={d} back={back}");
+        }
+        // Clamp guards: ±4 voxels saturate at the clamp, never wrap.
+        assert!(LeafAttrPool::dequantize_dist(LeafAttrPool::quantize_dist(99.0)) <= 3.99);
+        assert!(LeafAttrPool::dequantize_dist(LeafAttrPool::quantize_dist(-99.0)) >= -3.99);
+    }
+
+    #[test]
+    fn dist_set_get_and_default_zero() {
+        let mut pool = LeafAttrPool::new(8);
+        pool.allocate_range(3).unwrap();
+        assert_eq!(pool.dist(1), 0.0, "unset slot defaults to 0");
+        pool.set_dist(1, 0.375);
+        assert!((pool.dist(1) - 0.375).abs() < 1e-3);
+        // dists_as_slice / dist_bytes track the allocated region.
+        assert_eq!(pool.dists_as_slice().len(), 3);
+        assert_eq!(pool.dist_bytes().len(), 3 * 2);
+    }
+
+    #[test]
+    fn deallocate_clears_dist() {
+        let mut pool = LeafAttrPool::new(16);
+        let a = pool.allocate_range(4).unwrap();
+        pool.set_dist(a[1], 0.5);
+        pool.deallocate_range(a[0], 4);
+        // Reuse the range; the cleared dist must read back 0, not stale 0.5.
+        let b = pool.allocate_range(4).unwrap();
+        assert_eq!(b[0], a[0]);
+        assert_eq!(pool.dist(b[1]), 0.0);
     }
 
     #[test]
@@ -509,6 +607,7 @@ mod tests {
         let mut bv = BoneVoxel::default();
         bv.indices = 0x0000_0007;
         private.set_bone(2, bv);
+        private.set_dist(0, -0.625);
 
         let mut scene = LeafAttrPool::new(8);
         scene.allocate_contiguous_bump(5).unwrap(); // occupy [0,5)
@@ -521,6 +620,7 @@ mod tests {
         assert_eq!(scene.get(start + 2).material_primary, 12);
         assert_eq!(scene.color(start + 1), 0xAB);
         assert_eq!(scene.bone(start + 2).indices, 0x0000_0007);
+        assert!((scene.dist(start) - (-0.625)).abs() < 1e-3);
     }
 
     #[test]

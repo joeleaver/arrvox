@@ -183,6 +183,7 @@ pub fn write_rkp(
             color_bytes,
             skin_meta,
             mesh_sections,
+            None, // distance_data (wired at bake time in a later stage)
             Some(&progress_cb),
         )
         .map_err(|e| format!("write .arvx: {e}"))
