@@ -6,12 +6,23 @@ use crate::leaf_attr_pool::LeafAttrPool;
 use crate::sparse_octree::INTERIOR_NODE;
 
 
-/// Wrap a per-point SDF as a batched callback for the tests.
-fn batched<Fp>(f: Fp) -> impl Fn(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>
+/// Wrap a per-point SDF (5-tuple, no analytic gradient) as a batched
+/// callback for the tests. The `None` gradient drives the voxelizer's
+/// 6-tap finite-difference path — the analytic path is exercised by the
+/// `analytic_gradient_*` tests below with an explicit `Some(grad)`.
+fn batched<Fp>(f: Fp) -> impl Fn(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)>
 where
     Fp: Fn(Vec3) -> (f32, u16, u16, u8, u32),
 {
-    move |positions: &[Vec3]| positions.iter().map(|p| f(*p)).collect()
+    move |positions: &[Vec3]| {
+        positions
+            .iter()
+            .map(|p| {
+                let (d, a, b, c, e) = f(*p);
+                (d, a, b, c, e, None)
+            })
+            .collect()
+    }
 }
 
 #[test]
@@ -202,4 +213,133 @@ fn sphere_normals_point_outward() {
     );
     assert!(checked > 0, "should have checked at least one cell normal");
     let _ = get_brick_id; let _ = is_brick; // silence unused-import warnings
+}
+
+// ── G2: analytic-gradient voxelize path ────────────────────────────
+
+/// Voxelize a surface, optionally supplying an analytic ∇sd at every
+/// sample, and return the per-leaf (normal, distance) over the asset's
+/// pool range. Slot allocation order is deterministic and identical
+/// regardless of whether the gradient is supplied (same sd → same
+/// classification → same surface cells, in the same order), so index
+/// `i` refers to the same node in two runs that differ only in the
+/// gradient.
+fn voxelize_collect<Fd, Fg>(
+    f: Fd,
+    grad: Fg,
+    supply_grad: bool,
+    aabb: &Aabb,
+    vs: f32,
+) -> (Vec<Vec3>, Vec<f32>)
+where
+    Fd: Fn(Vec3) -> f32,
+    Fg: Fn(Vec3) -> Vec3,
+{
+    let mut attrs = LeafAttrPool::new(2_000_000);
+    let mut bricks = BrickPool::new(50_000);
+    let sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
+        positions
+            .iter()
+            .map(|&p| {
+                let g = if supply_grad { Some(grad(p)) } else { None };
+                (f(p), 1u16, 1u16, 0u8, 0u32, g)
+            })
+            .collect()
+    };
+    let r = voxelize_octree(sdf, aabb, vs, &mut attrs, &mut bricks, 0).unwrap();
+    let start = r.leaf_attr_slot_start;
+    let n = r.leaf_attr_unique_count;
+    let mut normals = Vec::with_capacity(n as usize);
+    let mut dists = Vec::with_capacity(n as usize);
+    for s in start..start + n {
+        normals.push(crate::leaf_attr::unpack_oct(attrs.get(s).normal_oct).normalize_or_zero());
+        dists.push(attrs.dist(s));
+    }
+    (normals, dists)
+}
+
+/// A linear SDF (tilted plane) has EXACT central differences, so the
+/// taps synthesized from the analytic gradient (`d_center ± eps·g`)
+/// equal the sampled taps bit-for-bit. The analytic path must therefore
+/// produce identical per-leaf normals + distances to the FD path —
+/// proving the analytic fast path is a no-op on correctness.
+#[test]
+fn analytic_gradient_plane_is_bit_identical_to_finite_difference() {
+    let (m, k) = (0.4f32, -0.25);
+    let f = move |p: Vec3| p.y - m * p.x - k * p.z;
+    let g = move |_p: Vec3| Vec3::new(-m, 1.0, -k);
+    let aabb = Aabb { min: Vec3::splat(-2.0), max: Vec3::splat(2.0) };
+    let (n_fd, d_fd) = voxelize_collect(f, g, false, &aabb, 0.25);
+    let (n_an, d_an) = voxelize_collect(f, g, true, &aabb, 0.25);
+    assert_eq!(n_fd.len(), n_an.len(), "leaf count differs (fd {} vs an {})", n_fd.len(), n_an.len());
+    assert!(!n_fd.is_empty(), "plane should produce leaves");
+    for i in 0..n_fd.len() {
+        assert_eq!(n_fd[i], n_an[i], "normal differs at leaf {i}: fd {:?} an {:?}", n_fd[i], n_an[i]);
+        assert_eq!(d_fd[i], d_an[i], "dist differs at leaf {i}: fd {} an {}", d_fd[i], d_an[i]);
+    }
+}
+
+/// A curved SDF (sphere): FD has O(eps²) truncation error; the analytic
+/// gradient is exact. They should still agree closely on every leaf —
+/// normals near-parallel, distances within a small fraction of a voxel.
+#[test]
+fn analytic_gradient_sphere_matches_finite_difference() {
+    let radius = 1.0f32;
+    let f = move |p: Vec3| p.length() - radius;
+    let g = move |p: Vec3| p.normalize_or_zero();
+    let aabb = Aabb { min: Vec3::splat(-2.0), max: Vec3::splat(2.0) };
+    let (n_fd, d_fd) = voxelize_collect(f, g, false, &aabb, 0.125);
+    let (n_an, d_an) = voxelize_collect(f, g, true, &aabb, 0.125);
+    assert_eq!(n_fd.len(), n_an.len());
+    assert!(n_fd.len() > 100, "sphere should produce many leaves; got {}", n_fd.len());
+    for i in 0..n_fd.len() {
+        // Skip prefilter/degenerate (zero) normals.
+        if n_fd[i].length_squared() < 0.5 || n_an[i].length_squared() < 0.5 {
+            continue;
+        }
+        let dot = n_fd[i].dot(n_an[i]).clamp(-1.0, 1.0);
+        assert!(dot > 0.999, "normal {i}: dot {dot} (fd {:?} an {:?})", n_fd[i], n_an[i]);
+        assert!(
+            (d_fd[i] - d_an[i]).abs() < 0.05,
+            "dist {i}: fd {} an {} differ too much",
+            d_fd[i],
+            d_an[i]
+        );
+    }
+}
+
+/// Some samples in a batch carry `Some(grad)`, others `None` — the
+/// per-cell branching (synthesize taps vs sample them) must reproduce
+/// the all-FD result. On a plane the analytic taps equal the FD taps
+/// exactly, so a correct implementation is bit-identical to all-FD.
+#[test]
+fn analytic_gradient_mixed_batch_matches_all_finite_difference() {
+    let (m, k) = (0.3f32, 0.2);
+    let f = move |p: Vec3| p.y - m * p.x - k * p.z;
+    let g = move |_p: Vec3| Vec3::new(-m, 1.0, -k);
+    let aabb = Aabb { min: Vec3::splat(-2.0), max: Vec3::splat(2.0) };
+    let vs = 0.25f32;
+    let (n_fd, d_fd) = voxelize_collect(f, g, false, &aabb, vs);
+
+    let mut attrs = LeafAttrPool::new(2_000_000);
+    let mut bricks = BrickPool::new(50_000);
+    // Mixed: Some(grad) only where p.x > 0; None elsewhere.
+    let sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
+        positions
+            .iter()
+            .map(|&p| {
+                let gr = if p.x > 0.0 { Some(g(p)) } else { None };
+                (f(p), 1u16, 1u16, 0u8, 0u32, gr)
+            })
+            .collect()
+    };
+    let r = voxelize_octree(sdf, &aabb, vs, &mut attrs, &mut bricks, 0).unwrap();
+    let start = r.leaf_attr_slot_start;
+    let cnt = r.leaf_attr_unique_count;
+    assert_eq!(cnt as usize, n_fd.len(), "mixed leaf count differs");
+    for (i, s) in (start..start + cnt).enumerate() {
+        let nm = crate::leaf_attr::unpack_oct(attrs.get(s).normal_oct).normalize_or_zero();
+        assert_eq!(nm, n_fd[i], "mixed normal differs at {i}");
+        assert_eq!(attrs.dist(s), d_fd[i], "mixed dist differs at {i}");
+    }
 }

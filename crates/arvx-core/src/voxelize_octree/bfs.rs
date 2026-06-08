@@ -40,7 +40,7 @@ pub(super) fn subdivide_bfs<F>(
     stats: &mut BakeStats,
 ) -> Option<()>
 where
-    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)>,
 {
     // The octree's root spans `2^max_depth * base_voxel_size` on a side.
     let root_extent = (1u64 << max_depth) as f32 * base_voxel_size;

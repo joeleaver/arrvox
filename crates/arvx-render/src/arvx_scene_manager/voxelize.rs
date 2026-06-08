@@ -68,15 +68,17 @@ impl ArvxSceneManager {
         // `voxelize_octree`'s BFS hands us one call per level plus one
         // per terminal-geometry phase — the extra Vec allocations are
         // negligible next to the primitive evaluation cost.
-        let sdf_batch = |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
-            // Single-material import path — secondary/blend left at 0,
-            // so the shader's dual-material guard short-circuits.
-            // Color = 0 = "no override, use material base color".
-            positions
-                .iter()
-                .map(|p| (sdf_fn(*p), material_id, 0u16, 0u8, 0u32))
-                .collect()
-        };
+        let sdf_batch =
+            |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<glam::Vec3>)> {
+                // Single-material import path — secondary/blend left at 0,
+                // so the shader's dual-material guard short-circuits.
+                // Color = 0 = "no override, use material base color".
+                // `None` gradient → voxelizer's 6-tap finite difference.
+                positions
+                    .iter()
+                    .map(|p| (sdf_fn(*p), material_id, 0u16, 0u8, 0u32, None))
+                    .collect()
+            };
 
         let r = arvx_core::voxelize_octree::voxelize_octree(
             sdf_batch, &aabb, voxel_size, &mut self.leaf_attr_pool, &mut self.brick_pool, 0,
@@ -127,7 +129,7 @@ impl ArvxSceneManager {
         object_id: u32,
     ) -> Option<VoxelizeResult>
     where
-        F: FnMut(&[glam::Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+        F: FnMut(&[glam::Vec3]) -> Vec<(f32, u16, u16, u8, u32, Option<glam::Vec3>)>,
     {
         self.bump_geometry_epoch();
         let r = arvx_core::voxelize_octree::voxelize_octree(

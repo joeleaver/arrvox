@@ -132,7 +132,7 @@ pub fn bake_tile_with_skirts(
     // SDF callback: receives a batch of absolute-world positions from
     // the voxelizer, translates each to tile-local, asks the TerrainFn,
     // and folds Layer-2 stamps over the heightmap before repacking.
-    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         positions
             .iter()
             .map(|&world_pos| {
@@ -204,7 +204,9 @@ pub fn bake_tile_with_skirts(
                 }
 
                 let blend_u4 = (s.blend.clamp(0.0, 1.0) * 15.0).round() as u8;
-                (s.sd, s.primary_mat, s.secondary_mat, blend_u4, 0)
+                // G2: no analytic gradient yet (None → 6-tap FD). G3
+                // wires `Some(∇sd)` here for unmodified-height positions.
+                (s.sd, s.primary_mat, s.secondary_mat, blend_u4, 0, None)
             })
             .collect()
     };

@@ -211,10 +211,10 @@ fn write_artifact_rkp_roundtrip() {
     let half = Vec3::splat(0.4);
     let aabb = crate::Aabb::new(-half, half);
     let radius: f32 = 0.25;
-    let sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         positions
             .iter()
-            .map(|p| (p.length() - radius, 7u16, 0u16, 0u8, 0u32))
+            .map(|p| (p.length() - radius, 7u16, 0u16, 0u8, 0u32, None))
             .collect()
     };
 

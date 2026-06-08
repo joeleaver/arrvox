@@ -154,9 +154,9 @@ mod tests {
         let radius = 1.0_f32;
         let natural = arvx_core::Aabb::new(glam::Vec3::splat(-1.6), glam::Vec3::splat(1.6));
         let aabb = arvx_core::pad_to_pow2_cubic(&natural, voxel_size);
-        let mut sdf = |ps: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+        let mut sdf = |ps: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<glam::Vec3>)> {
             ps.iter()
-                .map(|p| (p.length() - radius, 0u16, 0u16, 0u8, 0u32))
+                .map(|p| (p.length() - radius, 0u16, 0u16, 0u8, 0u32, None))
                 .collect()
         };
         let artifact = arvx_core::voxelize_to_artifact(&mut sdf, &aabb, voxel_size, 0)

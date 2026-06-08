@@ -86,8 +86,15 @@ pub struct VoxelizeOctreeResult {
 ///
 /// `sdf_fn` takes a batch of world-space positions and returns
 /// `(signed_distance, primary_material, secondary_material,
-/// blend_weight_u4)` per position. Negative distance = inside the
-/// surface. The 1-Lipschitz property of an SDF is what makes the
+/// blend_weight_u4, color, analytic_gradient)` per position. Negative
+/// distance = inside the surface. The 6th field is the analytic
+/// world-space `∇(signed_distance)` at that point or `None`: when a
+/// surface cell's center sample carries `Some(grad)`, the voxelizer
+/// derives the per-leaf normal + perpendicular distance from it and
+/// SKIPS that cell's 6 finite-difference gradient taps; `None` cells
+/// fall back to the 6-tap central difference. Supplying it is purely an
+/// accuracy/speed optimization — `None` everywhere reproduces the
+/// finite-difference behaviour bit-for-bit. The 1-Lipschitz property of an SDF is what makes the
 /// coarse-level Empty/Interior classifier provably correct — the
 /// input should be a true signed distance, not an arbitrary scalar
 /// field that's merely sign-correct.
@@ -133,7 +140,7 @@ pub fn voxelize_octree<F>(
     halo: u32,
 ) -> Option<VoxelizeOctreeResult>
 where
-    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)>,
 {
     // Strict contract: AABB must be a cube whose extent equals
     // `(2^depth) * base_voxel_size` for some `depth`. This was loosened
@@ -341,12 +348,15 @@ enum RegionClass {
 /// `classify_region` — a 1-Lipschitz SDF means the surface can be at
 /// most `|d|` away from a sample, so if every `|d| > extent / 2` the
 /// node is definitively empty-or-interior depending on sign.
-fn classify_from_samples(samples: &[(f32, u16, u16, u8, u32)], extent: f32) -> RegionClass {
+fn classify_from_samples(
+    samples: &[(f32, u16, u16, u8, u32, Option<Vec3>)],
+    extent: f32,
+) -> RegionClass {
     debug_assert_eq!(samples.len(), 9);
     let threshold = extent * 0.5;
     let mut all_outside = true;
     let mut all_inside = true;
-    for &(d, _, _, _, _) in samples {
+    for &(d, ..) in samples {
         if d <= threshold {
             all_outside = false;
         }
@@ -441,7 +451,7 @@ fn sample_halo_cells<F>(
     leaf_attr_pool: &mut LeafAttrPool,
 ) -> Option<Vec<(IVec3, u32)>>
 where
-    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)>,
 {
     debug_assert!(halo > 0);
     let n = 1i32 << octree_depth;
@@ -496,6 +506,12 @@ where
         secondary: u16,
         blend: u8,
         color: u32,
+        /// Analytic world-space ∇sd at the cell center, when supplied —
+        /// same role as in `emit_bricks_batched`: synthesize the phase-2
+        /// taps from it instead of sampling. A pure function of world
+        /// position, so the neighbour tile computes a matching value at
+        /// the shared cell → the seam stays watertight.
+        grad: Option<Vec3>,
     }
     let mut out: Vec<(IVec3, u32)> = Vec::new();
     let mut mixed_cells: Vec<IVec3> = Vec::new();
@@ -538,7 +554,7 @@ where
 
     let mut surface_queue: Vec<HaloSurface> = Vec::new();
     for (i, &coord) in mixed_cells.iter().enumerate() {
-        let (d, primary, secondary, blend, color) = phase1_results[i];
+        let (d, primary, secondary, blend, color, grad) = phase1_results[i];
         if d > cell_lipschitz {
             // Empty at cell level — skip (matches `emit_bricks_batched`'s
             // BRICK_EMPTY-by-default behaviour for cells with d_center
@@ -560,14 +576,23 @@ where
             secondary,
             blend,
             color,
+            grad,
         });
     }
 
     // ── Phase 2: 6 gradient taps per surface halo cell. ──
     if !surface_queue.is_empty() {
-        let mut phase2_samples: Vec<Vec3> =
-            Vec::with_capacity(surface_queue.len() * 6);
-        for hs in &surface_queue {
+        // Only cells WITHOUT an analytic gradient need real SDF taps;
+        // analytic cells synthesize theirs below (`d_center ± eps·g`).
+        let fd_cells: Vec<usize> = surface_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, hs)| hs.grad.is_none())
+            .map(|(i, _)| i)
+            .collect();
+        let mut phase2_samples: Vec<Vec3> = Vec::with_capacity(fd_cells.len() * 6);
+        for &i in &fd_cells {
+            let hs = &surface_queue[i];
             let cell_center = grid_origin
                 + Vec3::new(
                     hs.coord.x as f32 + 0.5,
@@ -581,17 +606,42 @@ where
             phase2_samples.push(cell_center + Vec3::new(0.0, 0.0, eps));
             phase2_samples.push(cell_center - Vec3::new(0.0, 0.0, eps));
         }
-        let phase2_results = sdf_fn(&phase2_samples);
-        debug_assert_eq!(phase2_results.len(), surface_queue.len() * 6);
+        let phase2_results = if phase2_samples.is_empty() {
+            Vec::new()
+        } else {
+            sdf_fn(&phase2_samples)
+        };
+        debug_assert_eq!(phase2_results.len(), fd_cells.len() * 6);
 
-        for (i, hs) in surface_queue.iter().enumerate() {
-            let base = i * 6;
-            let d_xp = phase2_results[base    ].0;
-            let d_xm = phase2_results[base + 1].0;
-            let d_yp = phase2_results[base + 2].0;
-            let d_ym = phase2_results[base + 3].0;
-            let d_zp = phase2_results[base + 4].0;
-            let d_zm = phase2_results[base + 5].0;
+        let mut fd_k = 0usize;
+        for hs in surface_queue.iter() {
+            // Tap signed distances [xp, xm, yp, ym, zp, zm], synthesized
+            // from the analytic gradient or read from the FD batch — the
+            // reclassify + normal + distance below are identical for both
+            // (the all-FD path is bit-for-bit unchanged).
+            let taps: [f32; 6] = match hs.grad {
+                Some(g) => [
+                    hs.d_center + eps * g.x,
+                    hs.d_center - eps * g.x,
+                    hs.d_center + eps * g.y,
+                    hs.d_center - eps * g.y,
+                    hs.d_center + eps * g.z,
+                    hs.d_center - eps * g.z,
+                ],
+                None => {
+                    let base = fd_k * 6;
+                    fd_k += 1;
+                    [
+                        phase2_results[base].0,
+                        phase2_results[base + 1].0,
+                        phase2_results[base + 2].0,
+                        phase2_results[base + 3].0,
+                        phase2_results[base + 4].0,
+                        phase2_results[base + 5].0,
+                    ]
+                }
+            };
+            let [d_xp, d_xm, d_yp, d_ym, d_zp, d_zm] = taps;
             // Second-chance reclassify with the tighter 6-tap set
             // (matches the interior emit path).
             let max_tap = d_xp.max(d_xm).max(d_yp).max(d_ym).max(d_zp).max(d_zm);
@@ -728,7 +778,7 @@ pub fn voxelize_sphere_octree(
     };
     let aabb = pad_to_pow2_cubic(&natural, voxel_size);
 
-    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         positions
             .iter()
             .map(|pos| {
@@ -736,8 +786,9 @@ pub fn voxelize_sphere_octree(
                 // No per-voxel color on the sphere helper — the
                 // color_pool's `0` sentinel means the voxel shader
                 // falls back to the material's base color, which is
-                // what we want for an untextured primitive.
-                (d, material_id, 0, 0, 0u32)
+                // what we want for an untextured primitive. `None`
+                // gradient → the voxelizer's 6-tap finite difference.
+                (d, material_id, 0, 0, 0u32, None)
             })
             .collect()
     };
@@ -806,7 +857,7 @@ pub fn voxelize_to_artifact<F>(
     halo: u32,
 ) -> Option<BakeArtifact>
 where
-    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)>,
 {
     use crate::brick_pool::BRICK_CELLS as BC;
     // Small initial capacities — pools grow on demand and this keeps

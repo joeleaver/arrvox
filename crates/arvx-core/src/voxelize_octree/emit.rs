@@ -67,7 +67,7 @@ pub(super) fn emit_bricks_batched<F>(
     stats: &mut BakeStats,
 ) -> Option<()>
 where
-    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)>,
 {
     let t_start = std::time::Instant::now();
     let cell_size = base_voxel_size;
@@ -133,6 +133,12 @@ where
         secondary: u16,
         blend: u8,
         color: u32,
+        /// Analytic world-space ∇sd at the cell center, when the SDF
+        /// callback supplied one. `Some` → the phase-2 gradient taps are
+        /// synthesized from it (`d_center ± eps·g`) instead of sampled,
+        /// so the cell costs zero extra SDF dispatches. `None` → the cell
+        /// joins the 6-tap finite-difference batch as before.
+        grad: Option<Vec3>,
     }
     let mut surface_cells: Vec<SurfaceCell> = Vec::new();
     for (brick_idx, _job) in brick_queue.iter().enumerate() {
@@ -142,7 +148,7 @@ where
                 for cx in 0..BRICK_DIM {
                     let cell_idx = (cz * BRICK_DIM * BRICK_DIM + cy * BRICK_DIM + cx) as usize;
                     let flat = brick_idx * cells_per_brick + cell_idx;
-                    let (d_center, primary, secondary, blend, color) = phase1_results[flat];
+                    let (d_center, primary, secondary, blend, color, grad) = phase1_results[flat];
                     if d_center > lipschitz_threshold {
                         // Fully outside. Default brick cell is already
                         // BRICK_EMPTY, nothing to write.
@@ -161,7 +167,7 @@ where
                     // Surface cell — defer to phase 2.
                     surface_cells.push(SurfaceCell {
                         brick_slot, cx, cy, cz,
-                        d_center, primary, secondary, blend, color,
+                        d_center, primary, secondary, blend, color, grad,
                     });
                 }
             }
@@ -172,34 +178,26 @@ where
     // ── Phase 2: 6 gradient taps per surface cell. ───────────────
     if !surface_cells.is_empty() {
         let t_phase2_prep = std::time::Instant::now();
-        let phase2_count = surface_cells.len() * 6;
-        let mut phase2_samples: Vec<Vec3> = Vec::with_capacity(phase2_count);
-        for sc in &surface_cells {
-            let cell_min = Vec3::new(
-                sc.cx as f32 * cell_size,
-                sc.cy as f32 * cell_size,
-                sc.cz as f32 * cell_size,
-            );
-            // Reconstruct brick world_min from the brick's first cell
-            // in phase1. Easier: keep world_min on the SurfaceCell.
-            // Avoid by iterating brick_queue too. Simpler: we stored
-            // the cell-local offset; grab world_min from brick_queue.
-            let _ = cell_min;
-        }
-        // Build phase 2 sample list. Re-derive world positions from
-        // brick_queue; cheaper than threading world_min through
-        // SurfaceCell for each of the millions of surface cells.
-        phase2_samples.clear();
-        // Index surface cells by brick so we can reuse each brick's
-        // world_min. SurfaceCell already carries (brick_slot, cx..cz)
-        // — brick index is `brick_slot`'s position in `brick_slots`.
-        // We stored insertion order so `brick_slot` is unique per
-        // brick_idx. Build reverse lookup once.
+        // Only cells WITHOUT an analytic gradient need real SDF taps;
+        // cells WITH one synthesize their taps below (zero dispatches).
+        // Indices into `surface_cells`, in order, for the FD subset.
+        let fd_cells: Vec<usize> = surface_cells
+            .iter()
+            .enumerate()
+            .filter(|(_, sc)| sc.grad.is_none())
+            .map(|(i, _)| i)
+            .collect();
+        // Re-derive world positions from brick_queue; cheaper than
+        // threading world_min through every SurfaceCell. SurfaceCell
+        // carries (brick_slot, cx..cz); brick index is brick_slot's
+        // position in brick_slots, so build a reverse lookup once.
         let mut slot_to_idx = std::collections::HashMap::with_capacity(brick_slots.len());
         for (i, &id) in brick_slots.iter().enumerate() {
             slot_to_idx.insert(id, i);
         }
-        for sc in &surface_cells {
+        let mut phase2_samples: Vec<Vec3> = Vec::with_capacity(fd_cells.len() * 6);
+        for &i in &fd_cells {
+            let sc = &surface_cells[i];
             let brick_idx = slot_to_idx[&sc.brick_slot];
             let job = &brick_queue[brick_idx];
             let cell_min = job.world_min
@@ -219,21 +217,50 @@ where
         let _ = t_phase2_prep;
 
         let t_phase2_sdf = std::time::Instant::now();
-        let phase2_results = sdf_fn(&phase2_samples);
+        let phase2_results = if phase2_samples.is_empty() {
+            Vec::new()
+        } else {
+            sdf_fn(&phase2_samples)
+        };
         stats.sdf_bricks += t_phase2_sdf.elapsed();
-        stats.brick_sample_total += phase2_count;
-        debug_assert_eq!(phase2_results.len(), phase2_count);
+        stats.brick_sample_total += phase2_samples.len();
+        debug_assert_eq!(phase2_results.len(), fd_cells.len() * 6);
 
         // ── Populate surface cells from phase 2 readback. ────────
         let t_populate = std::time::Instant::now();
-        for (i, sc) in surface_cells.iter().enumerate() {
-            let base = i * 6;
-            let d_xp = phase2_results[base    ].0;
-            let d_xm = phase2_results[base + 1].0;
-            let d_yp = phase2_results[base + 2].0;
-            let d_ym = phase2_results[base + 3].0;
-            let d_zp = phase2_results[base + 4].0;
-            let d_zm = phase2_results[base + 5].0;
+        // Running cursor into the FD batch (advanced for `None`-grad cells
+        // in the same order they were pushed above).
+        let mut fd_k = 0usize;
+        for sc in surface_cells.iter() {
+            // The 6 tap signed distances [xp, xm, yp, ym, zp, zm], either
+            // synthesized from the analytic gradient (`d_center ± eps·g`,
+            // so `grad_from_taps = cell_size·g` and the normal/distance
+            // below come out exact) or read from the FD batch. The
+            // downstream reclassify + normal + distance code is identical
+            // for both, so the all-FD path is bit-for-bit unchanged.
+            let taps: [f32; 6] = match sc.grad {
+                Some(g) => [
+                    sc.d_center + eps * g.x,
+                    sc.d_center - eps * g.x,
+                    sc.d_center + eps * g.y,
+                    sc.d_center - eps * g.y,
+                    sc.d_center + eps * g.z,
+                    sc.d_center - eps * g.z,
+                ],
+                None => {
+                    let base = fd_k * 6;
+                    fd_k += 1;
+                    [
+                        phase2_results[base].0,
+                        phase2_results[base + 1].0,
+                        phase2_results[base + 2].0,
+                        phase2_results[base + 3].0,
+                        phase2_results[base + 4].0,
+                        phase2_results[base + 5].0,
+                    ]
+                }
+            };
+            let [d_xp, d_xm, d_yp, d_ym, d_zp, d_zm] = taps;
             // Second-chance INTERIOR / EMPTY checks with the tighter
             // sample set. Occasionally the center falls inside the
             // Lipschitz band but all 6 face-taps land on one side —
@@ -307,7 +334,7 @@ pub(super) fn emit_leaves_batched<F>(
     stats: &mut BakeStats,
 ) -> Option<()>
 where
-    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32)>,
+    F: FnMut(&[Vec3]) -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)>,
 {
     let t_start = std::time::Instant::now();
     let eps = base_voxel_size * 0.5;
@@ -330,19 +357,29 @@ where
     let t_cpu_start = std::time::Instant::now();
     for (leaf_idx, job) in leaf_queue.iter().enumerate() {
         let cell_base = leaf_idx * samples_per_leaf;
-        let (d_center, primary, secondary, blend, color) = results[cell_base];
+        let (d_center, primary, secondary, blend, color, grad_opt) = results[cell_base];
         if d_center > 0.0 {
             // Center is outside — this corner of a Mixed region is
             // not itself solid. Leave it EMPTY.
             continue;
         }
-        let d_xp = results[cell_base + 1].0;
-        let d_xm = results[cell_base + 2].0;
-        let d_yp = results[cell_base + 3].0;
-        let d_ym = results[cell_base + 4].0;
-        let d_zp = results[cell_base + 5].0;
-        let d_zm = results[cell_base + 6].0;
-        let grad = Vec3::new(d_xp - d_xm, d_yp - d_ym, d_zp - d_zm);
+        // Analytic gradient (when supplied) scaled to the FD grad
+        // magnitude (`grad_fd = cell_size·∇f`), so the normal + distance
+        // below are bit-for-bit the same code as the finite-difference
+        // path but with zero truncation error. Otherwise central-
+        // difference the 6 axis taps as before.
+        let grad = match grad_opt {
+            Some(g) => g * base_voxel_size,
+            None => {
+                let d_xp = results[cell_base + 1].0;
+                let d_xm = results[cell_base + 2].0;
+                let d_yp = results[cell_base + 3].0;
+                let d_ym = results[cell_base + 4].0;
+                let d_zp = results[cell_base + 5].0;
+                let d_zm = results[cell_base + 6].0;
+                Vec3::new(d_xp - d_xm, d_yp - d_ym, d_zp - d_zm)
+            }
+        };
         let normal = if grad.length_squared() > 1e-12 {
             grad.normalize()
         } else {

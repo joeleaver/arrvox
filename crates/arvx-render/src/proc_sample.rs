@@ -57,15 +57,18 @@ pub struct SampleResult {
 impl SampleResult {
     /// Narrow to the tuple shape `voxelize_octree`'s callback expects.
     /// Order matches the `sdf_fn` signature: distance, primary material,
-    /// secondary material, quantized blend weight, packed color.
+    /// secondary material, quantized blend weight, packed color, analytic
+    /// gradient. GPU procedurals don't return a gradient, so the last
+    /// field is `None` and the voxelizer uses its 6-tap finite difference.
     #[inline]
-    pub fn into_tuple(self) -> (f32, u16, u16, u8, u32) {
+    pub fn into_tuple(self) -> (f32, u16, u16, u8, u32, Option<glam::Vec3>) {
         (
             self.distance,
             self.primary as u16,
             self.secondary as u16,
             self.blend_u4 as u8,
             self.color,
+            None,
         )
     }
 }

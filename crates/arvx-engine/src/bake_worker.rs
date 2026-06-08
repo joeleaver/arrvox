@@ -483,7 +483,7 @@ fn run_bake(
                 // to `BakeOutcome::Failed`.
                 let artifact = {
                     let mut closure =
-                        |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+                        |positions: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<glam::Vec3>)> {
                             evaluator
                                 .evaluate(device, queue, positions, &instructions)
                                 .into_iter()

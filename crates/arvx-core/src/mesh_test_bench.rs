@@ -1656,13 +1656,13 @@ fn heightfield_surface_cells(
 pub fn bake_heightfield(hf: &HeightField, half_world: f32, voxel_size: f32) -> HeightMesh {
     let aabb = heightfield_tile_aabb(half_world, voxel_size);
     let h = &hf.h;
-    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         positions
             .iter()
             .map(|p| {
                 // Vertical-gap sign field, the real terrain bake's SDF.
                 let d = p.y - h(p.x, p.z);
-                (d, 1u16, 1u16, 0u8, 0u32)
+                (d, 1u16, 1u16, 0u8, 0u32, None)
             })
             .collect()
     };
@@ -1766,10 +1766,10 @@ pub fn bake_heightfield_qef(hf: &HeightField, half_world: f32, voxel_size: f32) 
 /// AABB — the seam-test baseline the QEF path is compared against.
 pub fn bake_heightfield_blur_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32) -> HeightMesh {
     let h = &hf.h;
-    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         positions
             .iter()
-            .map(|p| (p.y - h(p.x, p.z), 1u16, 1u16, 0u8, 0u32))
+            .map(|p| (p.y - h(p.x, p.z), 1u16, 1u16, 0u8, 0u32, None))
             .collect()
     };
     let artifact = voxelize_to_artifact(sdf_fn, &aabb, voxel_size, REPRO_TILE_HALO)
@@ -1802,10 +1802,10 @@ pub fn bake_heightfield_blur_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32)
 /// the seam test can bake two ADJACENT tiles that share a face.
 pub fn bake_heightfield_qef_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32) -> HeightMesh {
     let h = &hf.h;
-    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         positions
             .iter()
-            .map(|p| (p.y - h(p.x, p.z), 1u16, 1u16, 0u8, 0u32))
+            .map(|p| (p.y - h(p.x, p.z), 1u16, 1u16, 0u8, 0u32, None))
             .collect()
     };
     let artifact = voxelize_to_artifact(sdf_fn, &aabb, voxel_size, REPRO_TILE_HALO)
@@ -1847,10 +1847,10 @@ pub fn bake_heightfield_qef_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32) 
 pub fn region_mesh_heightfield_qef(hf: &HeightField, half_world: f32, voxel_size: f32) -> HeightMesh {
     let aabb = heightfield_tile_aabb(half_world, voxel_size);
     let h = &hf.h;
-    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         positions
             .iter()
-            .map(|p| (p.y - h(p.x, p.z), 1u16, 1u16, 0u8, 0u32))
+            .map(|p| (p.y - h(p.x, p.z), 1u16, 1u16, 0u8, 0u32, None))
             .collect()
     };
     let artifact = voxelize_to_artifact(sdf_fn, &aabb, voxel_size, REPRO_TILE_HALO)

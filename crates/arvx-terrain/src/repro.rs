@@ -171,14 +171,14 @@ pub fn bake_terrain_window(
     // EXACT bake-path SDF closure (mirrors bake_tile_with_skirts: ask the
     // TerrainFn in tile-local coords, sd = wy - surface_y).
     let tile_origin_world = key.origin_world().to_vec3();
-    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         positions
             .iter()
             .map(|&world_pos| {
                 let local = world_pos - tile_origin_world;
                 let s = terrain_fn.sample(key, local, voxel_size);
                 let blend_u4 = (s.blend.clamp(0.0, 1.0) * 15.0).round() as u8;
-                (s.sd, s.primary_mat, s.secondary_mat, blend_u4, 0)
+                (s.sd, s.primary_mat, s.secondary_mat, blend_u4, 0, None)
             })
             .collect()
     };

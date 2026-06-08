@@ -403,7 +403,7 @@ fn voxelize_octree_gpu_runs_end_to_end() {
     let instructions = flatten_tree(&obj);
     let mut attrs = LeafAttrPool::new(1_000_000);
     let mut bricks = BrickPool::new(10_000);
-    let gpu_sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let gpu_sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         evaluator
             .evaluate(&device, &queue, positions, &instructions)
             .into_iter()
@@ -476,7 +476,7 @@ fn artifact_roundtrip_matches_direct_voxelize() {
     let instructions = flatten_tree(&obj);
 
     // ── Path A: artifact → integrate ──
-    let sdf_a = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let sdf_a = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         evaluator
             .evaluate(&device, &queue, positions, &instructions)
             .into_iter()
@@ -495,7 +495,7 @@ fn artifact_roundtrip_matches_direct_voxelize() {
         .expect("integrate");
 
     // ── Path B: direct voxelize_sdf_fn on the same scene ──
-    let sdf_b = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+    let sdf_b = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
         evaluator
             .evaluate(&device, &queue, positions, &instructions)
             .into_iter()
@@ -564,7 +564,7 @@ fn bake_perf_sweep() {
         eprintln!("\n[perf_sweep] ===== voxel_size = {} =====", voxel_size);
         let mut attrs = LeafAttrPool::new(10_000_000);
         let mut bricks = BrickPool::new(1_000_000);
-        let gpu_sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+        let gpu_sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
             evaluator
                 .evaluate(&device, &queue, positions, &instructions)
                 .into_iter()
