@@ -543,33 +543,45 @@ fn active_blur_params() -> (i32, f32, f32) {
         .unwrap_or((DENSITY_KERNEL_R, DENSITY_KERNEL_SIGMA, DENSITY_ISO))
 }
 
-thread_local! {
-    /// Per-thread switch selecting the **QEF-Hermite** vertex placement
-    /// (stored per-leaf signed distance → dual-contouring/QEF) over the
-    /// legacy `blur→D` + Newton + plane-fit recovery. `false` (default)
-    /// keeps the blur path. Set via [`set_qef_hermite`].
-    ///
-    /// This is the staged-rollout switch: Stage 2 reads it to validate the
-    /// new mesher on the bench against the blur baseline; Stage 5 flips the
-    /// production default to "QEF when per-leaf distance is present, else
-    /// blur fallback" and this thread-local reverts to bench/diagnostics use.
-    static QEF_HERMITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Select the QEF-Hermite mesher for the next extract on this thread
-/// (`true`) or the legacy blur path (`false`). **Bench / diagnostics**
-/// during the staged rollout; production gates on per-leaf distance
-/// presence instead (Stage 5).
-pub fn set_qef_hermite(on: bool) {
-    QEF_HERMITE.with(|c| c.set(on));
-}
-
-/// Whether the QEF-Hermite path is force-selected on this thread.
-/// Read by [`extract_surface_mesh_haloed_impl`]; combined with a non-empty
-/// distance pool it selects QEF-Hermite over the blur/binary placement.
+/// Diagnostic / rollback kill-switch for the QEF-Hermite mesher. The
+/// production gate is **presence of a per-leaf distance pool** (Stage 5):
+/// any extract handed a non-empty `dists` slice meshes via QEF-Hermite,
+/// everything else (binary imports, old/no-distance assets, the sculpt
+/// region path until Stage 6) falls back to the blur/binary path.
+///
+/// Setting `ARVX_QEF_HERMITE=0` in the environment forces the blur path
+/// even when distances are present — a launch-time A/B / rollback switch.
+/// Read once per process (the value can't change mid-run), so it's free in
+/// the hot extract path.
 #[inline]
-pub(crate) fn qef_hermite_enabled() -> bool {
-    QEF_HERMITE.with(|c| c.get())
+pub(crate) fn qef_hermite_force_off() -> bool {
+    static FORCE_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE_OFF.get_or_init(|| {
+        std::env::var("ARVX_QEF_HERMITE")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+    })
+}
+
+thread_local! {
+    /// Per-thread force-OFF for the QEF-Hermite mesher (default `false` =
+    /// allow QEF when a distance pool is present). The terrain seam tests
+    /// that specifically exercise the **blur plane-fit FALLBACK** flip this
+    /// on to bake the legacy path even though the artifact now carries
+    /// distances. Mirrors [`set_wide_window_project`]'s test-only override.
+    static QEF_FORCE_OFF_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Force the blur/binary fallback on this thread regardless of distance
+/// presence. **Test / diagnostics only** — exercises the legacy path the
+/// QEF default now replaces. Reset to `false` when done.
+pub fn set_qef_force_off(on: bool) {
+    QEF_FORCE_OFF_THREAD.with(|c| c.set(on));
+}
+
+#[inline]
+fn qef_force_off_thread() -> bool {
+    QEF_FORCE_OFF_THREAD.with(|c| c.get())
 }
 
 /// Build the normalized 1D Gaussian weights for radius `r`, sigma
@@ -946,14 +958,16 @@ fn extract_surface_mesh_haloed_impl(
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
-    // **QEF-Hermite selection.** When enabled, the surface is meshed with
-    // BINARY topology (sign changes) + QEF-Hermite vertex placement — NOT
-    // the blurred-D topology/position. So the density precompute, the
-    // D-field owner expansion, and the wide-window plane fit are all
-    // bypassed (they exist only to recover the position the stored
-    // distance now carries exactly). `topo_blur` gates that legacy
-    // machinery; `use_qef` gates the placement.
-    let use_qef = qef_hermite_enabled() && !dists.is_empty();
+    // **QEF-Hermite selection.** The production gate is presence of a
+    // per-leaf distance pool (Stage 5): a non-empty `dists` slice selects
+    // the QEF-Hermite mesher; an env kill-switch can force it off. When
+    // enabled, the surface is meshed with BINARY topology (sign changes) +
+    // QEF-Hermite vertex placement — NOT the blurred-D topology/position.
+    // So the density precompute, the D-field owner expansion, and the
+    // wide-window plane fit are all bypassed (they exist only to recover the
+    // position the stored distance now carries exactly). `topo_blur` gates
+    // that legacy machinery; `use_qef` gates the placement.
+    let use_qef = !dists.is_empty() && !qef_hermite_force_off() && !qef_force_off_thread();
     let topo_blur = density_blur && !use_qef;
     if octree_nodes.is_empty() {
         return (vertices, indices);

@@ -1485,7 +1485,7 @@ fn bresenham(
 // measure a LOW-FREQUENCY ripple metric (not just the existing
 // high-frequency `roughness`, which misses wide flat treads).
 
-use crate::mesh_extract::{extract_surface_mesh_density_haloed, set_qef_hermite};
+use crate::mesh_extract::extract_surface_mesh_density_haloed;
 use crate::voxelize_octree::voxelize_to_artifact;
 
 /// Terrain halo the real bake uses (`bake.rs::TILE_HALO_VOXELS`).
@@ -1811,7 +1811,8 @@ pub fn bake_heightfield_qef_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32) 
         .expect("heightfield voxelize_to_artifact");
     let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
 
-    set_qef_hermite(true);
+    // Production gate is presence of the distance pool — passing the baked
+    // `leaf_attr_dists` selects QEF-Hermite (no toggle needed).
     let (verts, indices) = extract_surface_mesh_density_haloed(
         artifact.octree.as_slice(),
         artifact.octree.depth(),
@@ -1825,7 +1826,6 @@ pub fn bake_heightfield_qef_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32) 
         None,
         &artifact.leaf_attr_dists,
     );
-    set_qef_hermite(false);
 
     let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
     HeightMesh {
@@ -2687,6 +2687,27 @@ mod tests {
         assert!(
             qef_gap <= blur_gap.max(1e-4) * 2.0,
             "QEF seam gap {qef_gap:.6} vox regressed vs blur {blur_gap:.6}"
+        );
+    }
+
+    /// The force-off override (mirroring the `ARVX_QEF_HERMITE=0` env
+    /// kill-switch) makes a distance-present bake fall back to the blur
+    /// path — the rollback safety net for the Stage-5 production flip. With
+    /// it set, the gentle slope ripples like the blur baseline (>0.05)
+    /// instead of going flat (<0.02).
+    #[test]
+    fn qef_force_off_falls_back_to_blur() {
+        use crate::mesh_extract::set_qef_force_off;
+        let hf = HeightField::gentle_slope(0.10, 0.035);
+        let vs = 0.5f32;
+        set_qef_force_off(true);
+        let m = bake_heightfield_qef(&hf, 12.0, vs);
+        set_qef_force_off(false); // reset before the assert (panic-safe)
+        let forced = measure_ripple(&hf, &m, Vec3::X);
+        assert!(
+            forced.residual_rms_vox > 0.05,
+            "force-off should bake the (rippled) blur path, got {:.4}",
+            forced.residual_rms_vox
         );
     }
 

@@ -402,6 +402,8 @@ pub fn write_artifact_rkp(
             &[],
             &artifact.halo_cells,
             halo_width,
+            // Terrain bake → QEF-Hermite when the artifact carries distances.
+            &artifact.leaf_attr_dists,
         )
     };
     let mesh_sections = if !mesh_blob.vertices.is_empty() {
@@ -593,6 +595,10 @@ pub fn build_mesh_sections_blob_density_haloed(
     bone_voxels: &[crate::companion::BoneVoxel],
     halo_cells: &[(glam::IVec3, u32)],
     halo: u32,
+    // Per-leaf signed distances (voxel units), indexed like `leaf_attrs`.
+    // Non-empty selects the QEF-Hermite mesher (the terrain bake passes the
+    // artifact's `leaf_attr_dists`); `&[]` keeps the blur fallback.
+    dists: &[i16],
 ) -> MeshSectionsBlob {
     if octree_nodes.is_empty() || leaf_attrs.is_empty() {
         return MeshSectionsBlob::default();
@@ -610,9 +616,7 @@ pub fn build_mesh_sections_blob_density_haloed(
             halo,
             // Bake-time extract: no sculpt history yet.
             None,
-            // Distance pool wired in Stage 5 (terrain default flip); the
-            // binary import bake stays on legacy surface nets.
-            &[],
+            dists,
         );
     if vertices.is_empty() || indices_unclustered.is_empty() {
         return MeshSectionsBlob::default();

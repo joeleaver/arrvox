@@ -233,6 +233,10 @@ pub fn bake_tile_with_skirts(
         &[], // terrain is never skinned.
         &artifact.halo_cells,
         TILE_HALO_VOXELS,
+        // QEF-Hermite: the voxelizer baked per-leaf distance into the
+        // artifact, so the tile meshes smooth-by-construction (no terracing)
+        // instead of blur→D. `&[]` would keep the legacy blur path.
+        &artifact.leaf_attr_dists,
     );
 
     // V2 LOD pyramid: append lateral skirts so LOD-band cracks aren't
@@ -543,6 +547,23 @@ mod tests {
     use crate::stamp::{FalloffCurve, StampKind};
     use crate::terrain::Terrain;
     use crate::terrain_fn::TerrainSample;
+
+    /// RAII guard that forces the blur/plane-fit FALLBACK for the lifetime
+    /// of the scope (resets on drop, panic-safe). The seam tests below pin
+    /// the wide-window plane-fit specifically, which the QEF-Hermite default
+    /// (Stage 5) bypasses — so they bake through this guard.
+    struct BlurFallback;
+    impl BlurFallback {
+        fn enter() -> Self {
+            arvx_core::mesh_extract::set_qef_force_off(true);
+            BlurFallback
+        }
+    }
+    impl Drop for BlurFallback {
+        fn drop(&mut self) {
+            arvx_core::mesh_extract::set_qef_force_off(false);
+        }
+    }
 
     /// Empty region snapshot — the "no biomes in this scene" baseline
     /// every existing test wants. Phase 7 adds the regions parameter
@@ -962,6 +983,7 @@ mod tests {
     /// captured sets.
     #[test]
     fn adjacent_fbm_tiles_meet_at_shared_face() {
+        let _blur = BlurFallback::enter();
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
         let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
@@ -1083,6 +1105,7 @@ mod tests {
     /// watertight check missed.
     #[test]
     fn adjacent_slope_tiles_watertight_with_planefit() {
+        let _blur = BlurFallback::enter();
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
         let surface = SlopeHalf;
@@ -1102,6 +1125,7 @@ mod tests {
     /// is an explicit with-fix regression guard.
     #[test]
     fn adjacent_fbm_tiles_watertight_with_planefit() {
+        let _blur = BlurFallback::enter();
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
         let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
@@ -1120,6 +1144,7 @@ mod tests {
     #[test]
     fn slope_seam_ring_is_pinned_not_moved() {
         use arvx_core::mesh_extract::set_wide_window_project;
+        let _blur = BlurFallback::enter();
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
         let surface = SlopeHalf;
