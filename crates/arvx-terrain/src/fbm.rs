@@ -288,6 +288,37 @@ impl FbmTerrainFnResolved {
         self.height_at_with_octaves(x_m, z_m, self.octaves)
     }
 
+    /// Surface height and its analytic horizontal gradient at world
+    /// `(x, z)`: `(h, ∂h/∂x, ∂h/∂z)`.
+    ///
+    /// `h = base_height_m + amplitude_m · fbm(x/scale_m, z/scale_m)`, so
+    /// the chain rule gives `∂h/∂x = (amplitude_m / scale_m) · fbm_x`
+    /// (the inner `1/scale_m` from the noise-space remap). Exact — no
+    /// finite-difference probe — so the voxelizer can bake an exact
+    /// per-leaf normal `(−∂h/∂x, 1, −∂h/∂z)` and an exact perpendicular
+    /// distance instead of a 6-tap approximation. Mirrors
+    /// [`Self::height_at_with_octaves`]'s octave/scale handling so it
+    /// stays consistent with the height the same bake emits.
+    pub fn height_grad_at_with_octaves(
+        &self,
+        x_m: f32,
+        z_m: f32,
+        octaves: u8,
+    ) -> (f32, f32, f32) {
+        let (n, dn_du, dn_dw) =
+            fbm_2d_grad(x_m / self.scale_m, z_m / self.scale_m, octaves, self.seed);
+        let h = self.base_height_m + n * self.amplitude_m;
+        let inv_scale = 1.0 / self.scale_m;
+        let h_x = self.amplitude_m * dn_du * inv_scale;
+        let h_z = self.amplitude_m * dn_dw * inv_scale;
+        (h, h_x, h_z)
+    }
+
+    /// [`Self::height_grad_at_with_octaves`] at the full octave count.
+    pub fn height_grad_at(&self, x_m: f32, z_m: f32) -> (f32, f32, f32) {
+        self.height_grad_at_with_octaves(x_m, z_m, self.octaves)
+    }
+
     pub fn slope_degrees_at_with_octaves(
         &self,
         x_m: f32,
@@ -386,7 +417,7 @@ impl TerrainFn for FbmTerrainFnResolved {
 // use the same noise. The pre-filter normalisation (divide by the
 // geometric-series limit 2.0 instead of the partial sum) is
 // documented there; it's load-bearing for the V2 LOD pyramid.
-use crate::value_noise::fbm_2d;
+use crate::value_noise::{fbm_2d, fbm_2d_grad};
 
 #[cfg(test)]
 mod tests {
@@ -560,6 +591,68 @@ mod tests {
         // ∂h/∂x = ∂h/∂z = 0 → slope is 0°.
         let slope = f.slope_degrees_at(13.7, -42.1);
         assert!(slope.abs() < 1e-3, "expected 0°, got {slope}°");
+    }
+
+    // ── analytic height gradient ───────────────────────────────────
+
+    /// `height_grad_at` returns the same height as `height_at` and a
+    /// gradient that matches a tight central difference of the height
+    /// field across many points and a few configs.
+    #[test]
+    fn height_grad_matches_central_difference() {
+        let configs = [
+            resolved_default(),
+            FbmTerrainFnResolved { scale_m: 40.0, amplitude_m: 50.0, ..resolved_default() },
+            FbmTerrainFnResolved { octaves: 3, scale_m: 200.0, ..resolved_default() },
+        ];
+        let h = 1e-2_f32;
+        for f in &configs {
+            for i in 0..15 {
+                for j in 0..15 {
+                    let x = i as f32 * 7.3 + 1.1;
+                    let z = j as f32 * 5.9 - 3.7;
+                    let (gh, gx, gz) = f.height_grad_at(x, z);
+                    assert!((gh - f.height_at(x, z)).abs() < 1e-4, "height mismatch");
+                    let fd_x = (f.height_at(x + h, z) - f.height_at(x - h, z)) / (2.0 * h);
+                    let fd_z = (f.height_at(x, z + h) - f.height_at(x, z - h)) / (2.0 * h);
+                    // Tolerance scales with amplitude/scale (the gradient
+                    // magnitude) — these are metres-per-metre slopes.
+                    let tol = 1e-2 * (1.0 + f.amplitude_m / f.scale_m);
+                    assert!(
+                        (gx - fd_x).abs() < tol && (gz - fd_z).abs() < tol,
+                        "scale={} amp={} at ({x:.1},{z:.1}): analytic ({gx:.4},{gz:.4}) \
+                         vs FD ({fd_x:.4},{fd_z:.4})",
+                        f.scale_m,
+                        f.amplitude_m,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The slope angle derived from the analytic gradient matches
+    /// `slope_degrees_at` (which uses its own central-difference probe)
+    /// — pins that the gradient the bake will use agrees with the
+    /// material-assignment slope rule.
+    #[test]
+    fn analytic_slope_matches_slope_degrees_at() {
+        let f = FbmTerrainFnResolved { scale_m: 30.0, amplitude_m: 40.0, ..resolved_default() };
+        for &(x, z) in &[(2.3, 7.9), (13.1, -4.4), (-22.0, 18.5), (51.2, 33.3)] {
+            let (_, gx, gz) = f.height_grad_at(x, z);
+            let analytic_deg = (gx * gx + gz * gz).sqrt().atan().to_degrees();
+            let probe_deg = f.slope_degrees_at(x, z);
+            assert!(
+                (analytic_deg - probe_deg).abs() < 1.0,
+                "at ({x},{z}): analytic slope {analytic_deg:.2}° vs probe {probe_deg:.2}°"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_amplitude_has_zero_gradient() {
+        let f = flat_fbm(); // amplitude_m = 0
+        let (_, gx, gz) = f.height_grad_at(13.7, -42.1);
+        assert!(gx.abs() < 1e-6 && gz.abs() < 1e-6, "expected flat gradient, got ({gx},{gz})");
     }
 
     #[test]
