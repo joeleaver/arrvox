@@ -26,7 +26,6 @@
 
 use glam::{Affine3A, IVec3, Vec3};
 
-use arvx_core::mesh_cluster::{cluster_grid_aabb, cluster_overlaps_brush_grid_aabb};
 
 use super::remesh_region::{RemeshFilter, RemeshRegion};
 use arvx_core::mesh_extract::{
@@ -41,8 +40,10 @@ use arvx_core::sculpt::{
 use arvx_core::sparse_octree::{is_brick, is_leaf, leaf_slot, brick_id};
 use arvx_core::brick_pool::{BRICK_DIM, BRICK_EMPTY, BRICK_INTERIOR};
 
+use arvx_core::{BrickPool, LeafAttrPool};
+
 use super::manager::ArvxSceneManager;
-use super::types::AssetHandle;
+use super::types::{AssetEntry, AssetHandle, MeshView, VoxelModel};
 
 
 /// Outcome of [`ArvxSceneManager::apply_sculpt_brush`]. The engine
@@ -207,6 +208,39 @@ pub(super) fn mark_lod_dirty_chains(
         }
     }
     marked
+}
+
+/// Re-derive the per-leaf shading normal from the relaxed surface.
+/// The deferred resolve pass shades from `LeafAttr.normal_oct` in
+/// the leaf_attr_pool (selected per-pixel by a ½-voxel-snapped
+/// octree descent), NOT from the mesh vertex normal — so after
+/// Gibson relaxation moves the geometry, the shaded normal stays
+/// the stale, blocky brushfire-inherited value and the surface
+/// still reads stippled. This splats the relaxed vertex normals
+/// (recomputed from the relaxed faces) back into the pool per
+/// `leaf_attr_id`, averaging where several SN cubes share a slot,
+/// so shading reflects the smoothed surface. Skips slot 0 (the
+/// global default LeafAttr — clobbering it would mis-light every
+/// fallback pixel). This is "missing authority #2": move the
+/// surface → re-derive its normal from the moved surface.
+///
+/// A free fn over the scene-global `leaf_attr_pool` (the per-leaf
+/// normal storage is shared, not part of any one asset's `MeshView`);
+/// the sculpt re-extract path calls it, terrain does not.
+pub(super) fn splat_relaxed_normals(verts: &[MeshVertex], leaf_attr_pool: &mut arvx_core::LeafAttrPool) {
+    use std::collections::HashMap;
+    let mut acc: HashMap<u32, Vec3> = HashMap::new();
+    for v in verts {
+        if v.leaf_attr_id == 0 {
+            continue;
+        }
+        *acc.entry(v.leaf_attr_id).or_insert(Vec3::ZERO) += arvx_core::unpack_oct(v.normal_oct);
+    }
+    for (slot, n) in acc {
+        if n.length_squared() > 1e-12 {
+            leaf_attr_pool.get_mut(slot).normal_oct = arvx_core::pack_oct(n.normalize());
+        }
+    }
 }
 
 impl ArvxSceneManager {
@@ -864,8 +898,9 @@ impl ArvxSceneManager {
     /// [`arvx_core::sculpt::compute_brush_edits`]: `brush_lo .. brush_hi`
     /// is half-open, the brush walks cells in `lo.x..hi.x` etc. Cluster
     /// AABBs are derived on the fly from each cluster's object-local
-    /// float AABB via [`cluster_grid_aabb`] (1-voxel pad on each side
-    /// so SN-cube neighbor cells are conservatively included).
+    /// float AABB via `arvx_core::mesh_cluster::cluster_grid_aabb` (1-voxel
+    /// pad on each side so SN-cube neighbor cells are conservatively
+    /// included). Delegates to [`MeshView::clusters_in_grid_aabb`].
     ///
     /// Returns LOD-0 (`lod_level == 0`) cluster ids only. Coarser
     /// levels regenerate via the R5 lazy-ancestor path when their
@@ -883,43 +918,15 @@ impl ArvxSceneManager {
         let Some(entry) = self.asset_cache.get(handle) else {
             return Vec::new();
         };
-        if entry.view.meshlet_clusters.is_empty() {
-            return Vec::new();
-        }
-        // Empty brush AABB → no clusters can intersect.
-        if brush_lo.x >= brush_hi.x || brush_lo.y >= brush_hi.y || brush_lo.z >= brush_hi.z {
-            return Vec::new();
-        }
-        let depth = entry.model.spatial_handle.depth;
-        let base_vs = entry.model.spatial_handle.base_voxel_size;
-        let extent = (1u32 << depth) as f32 * base_vs;
-        let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
-        let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
-
-        // **D7 — spatial-indexed query.** Walk the bucket grid for
-        // candidate cluster ids touching the brush, then filter each
-        // candidate with the exact `cluster_overlaps_brush_grid_aabb`
-        // test. On splat5 elephant the linear scan ran in ~1.2 ms
-        // (104 k clusters × ~12 ns); the indexed path visits a few
-        // hundred candidates and finishes in <100 µs.
-        let candidates = entry.view.cluster_spatial_index.query(brush_lo, brush_hi);
-        let mut dirty = Vec::with_capacity(candidates.len());
-        for cid in candidates {
-            let c = &entry.view.meshlet_clusters[cid as usize];
-            // LOD filter — index only stores LOD-0, but a future
-            // change might let an entry slip through; keep the
-            // check for safety.
-            if c.lod_level != 0 {
-                continue;
-            }
-            let (cmin, cmax) = cluster_grid_aabb(c, grid_origin, base_vs);
-            if cluster_overlaps_brush_grid_aabb(cmin, cmax, brush_lo, brush_hi) {
-                dirty.push(cid);
-            }
-        }
-        dirty
+        // The query authority lives on `MeshView` (it reads only the
+        // view's cluster table + spatial index and the model's grid
+        // frame); this handle-keyed method is the thin scene-manager
+        // wrapper over it.
+        entry.view.clusters_in_grid_aabb(&entry.model, brush_lo, brush_hi)
     }
+}
 
+impl super::mesher::Mesher {
     /// Per-stamp mesh patch — **filter dirty clusters + extract brush
     /// region once** (Phase B R4c V2).
     ///
@@ -949,38 +956,14 @@ impl ArvxSceneManager {
     /// set is empty or the asset has no mesh — caller falls back to
     /// the full re-extract path.
     ///
-    /// Re-derive the per-leaf shading normal from the relaxed surface.
-    /// The deferred resolve pass shades from `LeafAttr.normal_oct` in
-    /// the leaf_attr_pool (selected per-pixel by a ½-voxel-snapped
-    /// octree descent), NOT from the mesh vertex normal — so after
-    /// Gibson relaxation moves the geometry, the shaded normal stays
-    /// the stale, blocky brushfire-inherited value and the surface
-    /// still reads stippled. This splats the relaxed vertex normals
-    /// (recomputed from the relaxed faces) back into the pool per
-    /// `leaf_attr_id`, averaging where several SN cubes share a slot,
-    /// so shading reflects the smoothed surface. Skips slot 0 (the
-    /// global default LeafAttr — clobbering it would mis-light every
-    /// fallback pixel). This is "missing authority #2": move the
-    /// surface → re-derive its normal from the moved surface.
-    fn splat_relaxed_normals_to_pool(&mut self, verts: &[MeshVertex]) {
-        use std::collections::HashMap;
-        let mut acc: HashMap<u32, Vec3> = HashMap::new();
-        for v in verts {
-            if v.leaf_attr_id == 0 {
-                continue;
-            }
-            *acc.entry(v.leaf_attr_id).or_insert(Vec3::ZERO) +=
-                arvx_core::unpack_oct(v.normal_oct);
-        }
-        for (slot, n) in acc {
-            if n.length_squared() > 1e-12 {
-                self.leaf_attr_pool.get_mut(slot).normal_oct =
-                    arvx_core::pack_oct(n.normalize());
-            }
-        }
-    }
-
-    fn rebuild_dirty_clusters(&mut self, handle: AssetHandle, op: &BrushOp) -> bool {
+    fn rebuild_dirty_clusters(
+        &mut self,
+        model: &VoxelModel,
+        view: &mut MeshView,
+        brick_pool: &BrickPool,
+        leaf_attr_pool: &mut LeafAttrPool,
+        op: &BrushOp,
+    ) -> bool {
         let t0 = std::time::Instant::now();
         // D0 per-phase timings inside the cluster-patch path. Mirrors
         // the apply_sculpt_brush phase timings; written into the
@@ -999,14 +982,13 @@ impl ArvxSceneManager {
         let (depth, base_vs, grid_origin, brush_lo, brush_hi,
              brush_center_local,
              brush_radius_local, brush_radius_sq) = {
-            let Some(entry) = self.asset_cache.get(handle) else { return false; };
-            if entry.view.meshlet_clusters.is_empty() {
+            if view.meshlet_clusters.is_empty() {
                 return false;
             }
-            let depth = entry.model.spatial_handle.depth;
-            let base_vs = entry.model.spatial_handle.base_voxel_size;
+            let depth = model.spatial_handle.depth;
+            let base_vs = model.spatial_handle.base_voxel_size;
             let extent_f = (1u32 << depth) as f32 * base_vs;
-            let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
+            let aabb_center = (model.aabb.min + model.aabb.max) * 0.5;
             let grid_origin = aabb_center - Vec3::splat(extent_f * 0.5);
 
             let extent = 1u32 << depth;
@@ -1069,7 +1051,7 @@ impl ArvxSceneManager {
             RemeshFilter::KeepAll
         };
         let region = RemeshRegion::brush(brush_lo, brush_hi, filter);
-        let (dirty, filter_stats) = self.remesh_filter_dirty_clusters(handle, &region);
+        let (dirty, filter_stats) = self.remesh_filter_dirty_clusters(model, view, &region);
         if dirty.is_empty() {
             return false;
         }
@@ -1093,11 +1075,10 @@ impl ArvxSceneManager {
         // know which sub-phase dominates the 10-18 ms extract budget.
         let _ph_t3a = std::time::Instant::now();
         let cells = {
-            let Some(entry) = self.asset_cache.get(handle) else { return false; };
             collect_cell_map_in_region(
-                entry.model.cpu_octree.as_slice(),
+                model.cpu_octree.as_slice(),
                 depth,
-                self.brick_pool.as_slice(),
+                brick_pool.as_slice(),
                 cells_min,
                 cells_max,
             )
@@ -1107,21 +1088,20 @@ impl ArvxSceneManager {
         let _ph_t3b = std::time::Instant::now();
 
         let (brush_verts, brush_indices) = {
-            let Some(entry) = self.asset_cache.get(handle) else { return false; };
             extract_mesh_region_from_cells_pooled_haloed(
-                &mut self.sculpt_extract_scratch,
+                &mut self.scratch,
                 &cells,
                 brush_lo,
                 brush_hi,
-                entry.model.cpu_octree.as_slice(),
+                model.cpu_octree.as_slice(),
                 depth,
                 base_vs,
                 grid_origin,
-                self.brick_pool.as_slice(),
-                self.leaf_attr_pool.as_slice(),
-                self.leaf_attr_pool.bones_as_slice(),
-                &entry.model.halo_cells,
-                Some(&entry.model.sculpt_owned_slots),
+                brick_pool.as_slice(),
+                leaf_attr_pool.as_slice(),
+                leaf_attr_pool.bones_as_slice(),
+                &model.halo_cells,
+                Some(&model.sculpt_owned_slots),
                 // TODO(stage-b): sdf_fn param now always None on the
                 // sculpt path (brush projection deleted in A4); remove
                 // the generic sdf_fn thread from the extract fns in
@@ -1142,9 +1122,9 @@ impl ArvxSceneManager {
         //
         // Carry the extract's ∇D normal into the pool so the deferred
         // resolve shades the smoothed surface (see
-        // `splat_relaxed_normals_to_pool`). Must run before the
-        // geometry-epoch bump re-uploads the leaf_attr pool.
-        self.splat_relaxed_normals_to_pool(&brush_verts);
+        // `splat_relaxed_normals`). Must run before the geometry-epoch
+        // bump re-uploads the leaf_attr pool.
+        splat_relaxed_normals(&brush_verts, leaf_attr_pool);
 
         _p_extract_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
         let _ph_t4 = std::time::Instant::now();
@@ -1156,7 +1136,7 @@ impl ArvxSceneManager {
         // born-dirty standalone patch cluster, and index it spatially so
         // the next stamp's dirty query finds it. No-op when the extract
         // produced no verts.
-        self.append_remesh_patch(handle, &brush_verts, &brush_indices, grid_origin, base_vs);
+        self.append_remesh_patch(view, &brush_verts, &brush_indices, grid_origin, base_vs);
 
         _p_append_patch_ms = _ph_t4.elapsed().as_secs_f64() * 1000.0;
         let _ph_t5 = std::time::Instant::now();
@@ -1201,8 +1181,7 @@ impl ArvxSceneManager {
         let brush_aabb_min = brush_center_local - Vec3::splat(brush_radius_local + base_vs);
         let brush_aabb_max = brush_center_local + Vec3::splat(brush_radius_local + base_vs);
         let walk_visited_count = {
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            mark_lod_dirty_chains(&mut entry.view, &dirty, brush_aabb_min, brush_aabb_max)
+            mark_lod_dirty_chains(view, &dirty, brush_aabb_min, brush_aabb_max)
         };
         _p_cc_walk_ms = _ph_t5.elapsed().as_secs_f64() * 1000.0;
 
@@ -1224,10 +1203,9 @@ impl ArvxSceneManager {
         // Runs AFTER the CC walk so the walk's seed list (`dirty`)
         // still indexes into the un-shifted table.
         let compacted_patches = {
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            let grid_origin = entry.model.grid_origin();
-            let base_vs = entry.model.spatial_handle.base_voxel_size;
-            entry.view.compact_empty_patches(grid_origin, base_vs)
+            let grid_origin = model.grid_origin();
+            let base_vs = model.spatial_handle.base_voxel_size;
+            view.compact_empty_patches(grid_origin, base_vs)
         };
 
         // ── Phase 4.6: defrag mesh_indices when fragmentation is high ─
@@ -1242,23 +1220,22 @@ impl ArvxSceneManager {
         // table itself isn't reordered, so DAG refs and the spatial
         // index stay valid.
         let defrag_reclaimed_bytes = {
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            if entry.view.should_compact_mesh_indices() {
-                let pre_free: usize = entry.view
+            if view.should_compact_mesh_indices() {
+                let pre_free: usize = view
                     .mesh_indices_free_list
                     .iter()
                     .map(|(_, l)| *l as usize)
                     .sum();
-                let pre_next_free = entry.view.mesh_indices_next_free;
-                let pre_holes = entry.view.mesh_indices_free_list.len();
-                let reclaimed = entry.view.compact_mesh_indices();
+                let pre_next_free = view.mesh_indices_next_free;
+                let pre_holes = view.mesh_indices_free_list.len();
+                let reclaimed = view.compact_mesh_indices();
                 eprintln!(
                     "[sculpt] defrag mesh_indices: pre next_free={} free={} holes={} → \
                      post next_free={} reclaimed={} B",
                     pre_next_free,
                     pre_free,
                     pre_holes,
-                    entry.view.mesh_indices_next_free,
+                    view.mesh_indices_next_free,
                     reclaimed,
                 );
                 reclaimed
@@ -1276,34 +1253,32 @@ impl ArvxSceneManager {
         //
         // Mark mesh + clusters dirty so the next geometry-epoch upload
         // loop picks this asset up and skips all the others.
-        let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-        entry.view.mesh_lod0_index_count = entry.view
+        view.mesh_lod0_index_count = view
             .meshlet_clusters
             .iter()
             .filter(|c| c.lod_level == 0)
             .map(|c| c.index_count)
             .sum();
-        entry.view.mesh_dirty = true;
-        entry.view.clusters_dirty = true;
+        view.mesh_dirty = true;
+        view.clusters_dirty = true;
 
-        let total_clusters = entry.view.meshlet_clusters.len();
+        let total_clusters = view.meshlet_clusters.len();
         // D0 — per-phase breakdown of rebuild_dirty_clusters. The
         // dominant sub-phase identifies which step of the cluster
         // patch path to target next (filter vs extract vs CC walk).
         eprintln!(
-            "[sculpt] V2 patch: handle={:?} dirty={} (sphere_outside={}) kept_tris={} dropped_tris={} \
+            "[sculpt] V2 patch: dirty={} (sphere_outside={}) kept_tris={} dropped_tris={} \
              brush_patch verts={} tris={} total flat verts={} indices={} \
              lod_dirty={}/{} ({:.0}%) compacted_patches={} defrag_reclaimed={}B ({:.2}ms) \
              [phases: setup={:.2} dirty_q={:.2} filter={:.2} extract={:.2} (collect={:.2} cells={} mesh={:.2}) append={:.2} cc_walk={:.2}]",
-            handle,
             dirty.len(),
             d1_clusters_sphere_outside,
             total_kept_tris,
             total_dropped_tris,
             brush_verts.len(),
             brush_indices.len() / 3,
-            entry.view.mesh_vertices.len(),
-            entry.view.mesh_indices.len(),
+            view.mesh_vertices.len(),
+            view.mesh_indices.len(),
             walk_visited_count,
             total_clusters,
             if total_clusters > 0 {
@@ -1333,59 +1308,60 @@ impl ArvxSceneManager {
     /// every stamp. Per-cluster re-extract is the perf path the full
     /// R4 covers; for now the cost is bounded by surface area + DAG
     /// build at `LOD_LEVELS=1` (no multi-level simplify).
-    fn rebuild_asset_mesh(&mut self, handle: AssetHandle) {
+    fn rebuild_asset_mesh(
+        &self,
+        model: &VoxelModel,
+        view: &mut MeshView,
+        brick_pool: &BrickPool,
+        leaf_attr_pool: &LeafAttrPool,
+    ) {
         let t0 = std::time::Instant::now();
 
         // Snapshot the per-asset parameters we need to pass into
         // `extract_surface_mesh`. We need them as owned values (not
         // borrows of the asset entry) because the entry will be
         // re-borrowed mutably later to write back the new mesh.
-        let Some(entry) = self.asset_cache.get(handle) else { return; };
-        let depth = entry.model.spatial_handle.depth;
-        let voxel_size = entry.model.spatial_handle.base_voxel_size;
+        let depth = model.spatial_handle.depth;
+        let voxel_size = model.spatial_handle.base_voxel_size;
         let extent = (1u32 << depth) as f32 * voxel_size;
-        let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
+        let aabb_center = (model.aabb.min + model.aabb.max) * 0.5;
         let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
 
         let (vertices, indices_unc) = extract_surface_mesh(
-            entry.model.cpu_octree.as_slice(),
+            model.cpu_octree.as_slice(),
             depth,
             voxel_size,
             grid_origin,
-            self.brick_pool.as_slice(),
-            self.leaf_attr_pool.as_slice(),
-            self.leaf_attr_pool.bones_as_slice(),
+            brick_pool.as_slice(),
+            leaf_attr_pool.as_slice(),
+            leaf_attr_pool.bones_as_slice(),
             // Sculpt full re-extract — bias the SN tie-break toward
             // sculpt-allocated slots so brush-added cells keep their
             // material/colour at vertices shared with procedural
             // neighbours.
-            Some(&entry.model.sculpt_owned_slots),
+            Some(&model.sculpt_owned_slots),
         );
 
         if vertices.is_empty() {
             // Asset carved away to nothing — clear mesh state. The
             // upload path drops the GPU buffers on empty input.
-            if let Some(entry) = self.asset_cache.get_mut(handle) {
-                entry.view.mesh_vertices.clear();
-                entry.view.mesh_indices.clear();
-                entry.view.meshlet_clusters.clear();
-                entry.view.bake_time_cluster_count = 0;
-                entry.view.mesh_lod0_index_count = 0;
-                // Slab allocator must reset in lockstep — the
-                // upload path uses `mesh_indices.len() == 0` to drop
-                // the GPU buffer, but the allocator state would
-                // otherwise hold stale `next_free` and free-list
-                // entries that violate the "all offsets <= len()"
-                // invariant on the next stamp.
-                entry.view.reset_mesh_indices_slab();
-                entry.view.mesh_dirty = true;
-                entry.view.clusters_dirty = true;
-                // D7 — spatial index must drop in lockstep with the
-                // cluster table; an empty index agrees with the empty
-                // cluster vec.
-                entry.view.cluster_spatial_index =
-                    super::cluster_spatial_index::ClusterSpatialIndex::new();
-            }
+            view.mesh_vertices.clear();
+            view.mesh_indices.clear();
+            view.meshlet_clusters.clear();
+            view.bake_time_cluster_count = 0;
+            view.mesh_lod0_index_count = 0;
+            // Slab allocator must reset in lockstep — the upload path
+            // uses `mesh_indices.len() == 0` to drop the GPU buffer, but
+            // the allocator state would otherwise hold stale `next_free`
+            // and free-list entries that violate the "all offsets <=
+            // len()" invariant on the next stamp.
+            view.reset_mesh_indices_slab();
+            view.mesh_dirty = true;
+            view.clusters_dirty = true;
+            // D7 — spatial index must drop in lockstep with the cluster
+            // table; an empty index agrees with the empty cluster vec.
+            view.cluster_spatial_index =
+                super::cluster_spatial_index::ClusterSpatialIndex::new();
             return;
         }
 
@@ -1397,42 +1373,40 @@ impl ArvxSceneManager {
         let dag = build_cluster_dag_with_levels(&vertices, &indices_unc, 1);
         let mesh_lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
 
-        let Some(entry) = self.asset_cache.get_mut(handle) else { return; };
-        entry.view.mesh_vertices = vertices;
-        entry.view.mesh_indices = dag.indices;
-        entry.view.meshlet_clusters = dag.clusters;
-        entry.view.bake_time_cluster_count = entry.view.meshlet_clusters.len() as u32;
-        entry.view.mesh_lod0_index_count = mesh_lod0_index_count;
+        view.mesh_vertices = vertices;
+        view.mesh_indices = dag.indices;
+        view.meshlet_clusters = dag.clusters;
+        view.bake_time_cluster_count = view.meshlet_clusters.len() as u32;
+        view.mesh_lod0_index_count = mesh_lod0_index_count;
         // Full re-extract replaces every cluster + every index — slab
         // allocator state from before the rebuild is meaningless. Reset
         // it and mark the full new buffer dirty so the IBO upload
         // pushes the whole new layout to the GPU.
-        entry.view.reset_mesh_indices_slab();
+        view.reset_mesh_indices_slab();
         // Mirror: the VBO was fully replaced too. Mark the entire new
         // vertex range dirty so the upload doesn't keep stale prefix
         // bytes from the previous mesh under the same handle.
-        entry.view.mesh_vertices_dirty.clear();
-        let vbo_bytes = (entry.view.mesh_vertices.len()
+        view.mesh_vertices_dirty.clear();
+        let vbo_bytes = (view.mesh_vertices.len()
             * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
             as u32;
         if vbo_bytes > 0 {
-            entry.view.mesh_vertices_dirty.mark_full(vbo_bytes);
+            view.mesh_vertices_dirty.mark_full(vbo_bytes);
         }
-        entry.view.mesh_dirty = true;
-        entry.view.clusters_dirty = true;
+        view.mesh_dirty = true;
+        view.clusters_dirty = true;
         // D7 — full re-extract replaced every cluster; rebuild the
         // spatial index from scratch. Grid origin matches the
         // convention used by `clusters_in_brush_grid_aabb`.
-        entry.view
+        view
             .cluster_spatial_index
-            .rebuild(&entry.view.meshlet_clusters, grid_origin, voxel_size);
+            .rebuild(&view.meshlet_clusters, grid_origin, voxel_size);
 
         eprintln!(
-            "[sculpt] mesh re-extract: handle={:?} verts={} indices={} clusters={} ({:.2}ms)",
-            handle,
-            entry.view.mesh_vertices.len(),
-            entry.view.mesh_indices.len(),
-            entry.view.meshlet_clusters.len(),
+            "[sculpt] mesh re-extract: verts={} indices={} clusters={} ({:.2}ms)",
+            view.mesh_vertices.len(),
+            view.mesh_indices.len(),
+            view.meshlet_clusters.len(),
             t0.elapsed().as_secs_f64() * 1000.0,
         );
     }
@@ -1440,62 +1414,46 @@ impl ArvxSceneManager {
     /// Stroke-wide re-extract: replaces per-stamp patch clusters with
     /// one unified mesh covering the full stroke region. Gives shared
     /// vertices across stamp boundaries for seamless surfaces.
-    fn rebuild_stroke_clusters(&mut self, handle: AssetHandle, op: &BrushOp) -> bool {
+    ///
+    /// The `union_lo`/`union_hi`/`prev_patch_ids` come pre-resolved from
+    /// the per-handle `StrokeExtractState` the scene-manager wrapper owns
+    /// (the mesher is handle-free); all eight inputs are load-bearing.
+    #[allow(clippy::too_many_arguments)]
+    fn rebuild_stroke_clusters(
+        &mut self,
+        model: &VoxelModel,
+        view: &mut MeshView,
+        brick_pool: &BrickPool,
+        leaf_attr_pool: &mut LeafAttrPool,
+        union_lo: IVec3,
+        union_hi: IVec3,
+        prev_patch_ids: &[u32],
+    ) -> Option<u32> {
+        // Stroke-state accumulation (`StrokeExtractState`, the per-handle
+        // union AABB + path + prev-patch ids) lives on the scene manager
+        // wrapper — the mesher is handle-free. The wrapper resolves
+        // `union_lo`/`union_hi`/`prev_patch_ids` and records the returned
+        // patch id; here we only re-extract the union region.
         let t0 = std::time::Instant::now();
 
-        let (depth, base_vs, grid_origin) = {
-            let Some(entry) = self.asset_cache.get(handle) else { return false; };
-            if entry.view.meshlet_clusters.is_empty() {
-                return false;
-            }
-            let depth = entry.model.spatial_handle.depth;
-            let base_vs = entry.model.spatial_handle.base_voxel_size;
-            let extent_f = (1u32 << depth) as f32 * base_vs;
-            let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
-            let grid_origin = aabb_center - Vec3::splat(extent_f * 0.5);
-            (depth, base_vs, grid_origin)
-        };
-
-        let extent = 1u32 << depth;
-        let (stamp_lo, stamp_hi) = brush_cell_range(op, extent);
-        let stamp_lo = IVec3::new(stamp_lo.x as i32, stamp_lo.y as i32, stamp_lo.z as i32);
-        let stamp_hi = IVec3::new(stamp_hi.x as i32, stamp_hi.y as i32, stamp_hi.z as i32);
-        let stamp_center_local = grid_origin + op.center * base_vs;
-
-        // ── Step 1: update stroke state ──
-        use super::manager::StrokeExtractState;
-        let stroke = self.sculpt_stroke_extracts
-            .entry(handle)
-            .or_insert_with(|| StrokeExtractState {
-                union_lo: stamp_lo,
-                union_hi: stamp_hi,
-                stroke_patch_cluster_ids: Vec::new(),
-                stroke_path_local: Vec::new(),
-            });
-        stroke.union_lo = stroke.union_lo.min(stamp_lo);
-        stroke.union_hi = stroke.union_hi.max(stamp_hi);
-        stroke.stroke_path_local.push(stamp_center_local);
-
-        let union_lo = stroke.union_lo;
-        let union_hi = stroke.union_hi;
-        let stroke_path = stroke.stroke_path_local.clone();
-        let prev_patch_ids = stroke.stroke_patch_cluster_ids.clone();
+        let depth = model.spatial_handle.depth;
+        let base_vs = model.spatial_handle.base_voxel_size;
+        let grid_origin = model.grid_origin();
 
         // ── Step 2: remove previous stroke patches ──
         {
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            for &cid in &prev_patch_ids {
-                if (cid as usize) < entry.view.meshlet_clusters.len() {
-                    let c = &entry.view.meshlet_clusters[cid as usize];
+            for &cid in prev_patch_ids {
+                if (cid as usize) < view.meshlet_clusters.len() {
+                    let c = &view.meshlet_clusters[cid as usize];
                     if c.index_count > 0 {
-                        entry.view.free_index_range(c.index_offset, c.index_count);
+                        view.free_index_range(c.index_offset, c.index_count);
                     }
-                    entry.view.meshlet_clusters[cid as usize].index_count = 0;
+                    view.meshlet_clusters[cid as usize].index_count = 0;
                 }
             }
-            let grid_origin = entry.model.grid_origin();
-            let base_vs = entry.model.spatial_handle.base_voxel_size;
-            entry.view.compact_empty_patches(grid_origin, base_vs);
+            let grid_origin = model.grid_origin();
+            let base_vs = model.spatial_handle.base_voxel_size;
+            view.compact_empty_patches(grid_origin, base_vs);
         }
 
         // ── Step 3: filter bake-time clusters inside the union AABB ──
@@ -1516,37 +1474,35 @@ impl ArvxSceneManager {
                 max: filter_max,
             },
         );
-        let (dirty, _filter_stats) = self.remesh_filter_dirty_clusters(handle, &region);
+        let (dirty, _filter_stats) = self.remesh_filter_dirty_clusters(model, view, &region);
 
         // ── Step 4: extract mesh over the union AABB ──
         let cells_min = union_lo - IVec3::splat(3);
         let cells_max = union_hi + IVec3::splat(3);
         let cells = {
-            let Some(entry) = self.asset_cache.get(handle) else { return false; };
             collect_cell_map_in_region(
-                entry.model.cpu_octree.as_slice(),
+                model.cpu_octree.as_slice(),
                 depth,
-                self.brick_pool.as_slice(),
+                brick_pool.as_slice(),
                 cells_min,
                 cells_max,
             )
         };
         let (stroke_verts, stroke_indices) = {
-            let Some(entry) = self.asset_cache.get(handle) else { return false; };
             extract_mesh_region_from_cells_pooled_haloed(
-                &mut self.sculpt_extract_scratch,
+                &mut self.scratch,
                 &cells,
                 union_lo,
                 union_hi,
-                entry.model.cpu_octree.as_slice(),
+                model.cpu_octree.as_slice(),
                 depth,
                 base_vs,
                 grid_origin,
-                self.brick_pool.as_slice(),
-                self.leaf_attr_pool.as_slice(),
-                self.leaf_attr_pool.bones_as_slice(),
-                &entry.model.halo_cells,
-                Some(&entry.model.sculpt_owned_slots),
+                brick_pool.as_slice(),
+                leaf_attr_pool.as_slice(),
+                leaf_attr_pool.bones_as_slice(),
+                &model.halo_cells,
+                Some(&model.sculpt_owned_slots),
                 // TODO(stage-b): sdf_fn param now always None on the
                 // sculpt path (stroke projection deleted in A4); remove
                 // the generic sdf_fn thread from the extract fns in
@@ -1566,53 +1522,154 @@ impl ArvxSceneManager {
         // (watertight, no welding).
         //
         // Carry the extract's ∇D normal into the pool (see
-        // `splat_relaxed_normals_to_pool`); deferred resolve shades
-        // from the per-leaf normal, not the mesh vertex normal.
-        self.splat_relaxed_normals_to_pool(&stroke_verts);
+        // `splat_relaxed_normals`); deferred resolve shades from the
+        // per-leaf normal, not the mesh vertex normal.
+        splat_relaxed_normals(&stroke_verts, leaf_attr_pool);
 
         // ── Step 6: append as unified patch cluster ──
         // Shared `append_remesh_patch` builds the born-dirty standalone
         // patch cluster (VBO extend + dirty-mark, slab IBO alloc +
-        // rebase, spatial insert). Record the new patch id so the next
-        // stamp in this stroke replaces it (Step 2).
-        if let Some(patch_cluster_id) =
-            self.append_remesh_patch(handle, &stroke_verts, &stroke_indices, grid_origin, base_vs)
-        {
-            if let Some(stroke) = self.sculpt_stroke_extracts.get_mut(&handle) {
-                stroke.stroke_patch_cluster_ids.clear();
-                stroke.stroke_patch_cluster_ids.push(patch_cluster_id);
-            }
-        }
+        // rebase, spatial insert). The returned id is handed back to the
+        // wrapper, which records it in the per-handle stroke state so the
+        // next stamp in this stroke replaces it (Step 2).
+        let new_patch_id =
+            self.append_remesh_patch(view, &stroke_verts, &stroke_indices, grid_origin, base_vs);
 
         // ── Step 7: LOD dirty + cleanup ──
         let union_aabb_min_local = grid_origin + union_lo.as_vec3() * base_vs - Vec3::splat(base_vs);
         let union_aabb_max_local = grid_origin + union_hi.as_vec3() * base_vs + Vec3::splat(base_vs);
         {
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return false; };
-            mark_lod_dirty_chains(&mut entry.view, &dirty, union_aabb_min_local, union_aabb_max_local);
-            entry.view.compact_empty_patches(grid_origin, base_vs);
-            entry.view.mesh_lod0_index_count = entry.view
+            mark_lod_dirty_chains(view, &dirty, union_aabb_min_local, union_aabb_max_local);
+            view.compact_empty_patches(grid_origin, base_vs);
+            view.mesh_lod0_index_count = view
                 .meshlet_clusters
                 .iter()
                 .filter(|c| c.lod_level == 0)
                 .map(|c| c.index_count)
                 .sum();
-            entry.view.mesh_dirty = true;
-            entry.view.clusters_dirty = true;
+            view.mesh_dirty = true;
+            view.clusters_dirty = true;
         }
 
         eprintln!(
-            "[sculpt] stroke-extract: handle={:?} union=[{},{},{}→{},{},{}] path_len={} \
-             verts={} tris={} ({:.2}ms)",
-            handle,
+            "[sculpt] stroke-extract: union=[{},{},{}→{},{},{}] verts={} tris={} ({:.2}ms)",
             union_lo.x, union_lo.y, union_lo.z,
             union_hi.x, union_hi.y, union_hi.z,
-            stroke_path.len(),
             stroke_verts.len(),
             stroke_indices.len() / 3,
             t0.elapsed().as_secs_f64() * 1000.0,
         );
 
+        new_patch_id
+    }
+}
+
+impl ArvxSceneManager {
+    /// Scene-manager wrapper over [`Mesher::rebuild_dirty_clusters`]:
+    /// field-destructure `self` into disjoint borrows, fetch the entry,
+    /// split it into `(model, view)`, and delegate. The epoch bump stays
+    /// at the `apply_sculpt_brush` call site.
+    fn rebuild_dirty_clusters(&mut self, handle: AssetHandle, op: &BrushOp) -> bool {
+        let Self {
+            asset_cache,
+            brick_pool,
+            leaf_attr_pool,
+            mesher,
+            ..
+        } = self;
+        let Some(entry) = asset_cache.get_mut(handle) else {
+            return false;
+        };
+        let AssetEntry { model, view, .. } = entry;
+        mesher.rebuild_dirty_clusters(model, view, brick_pool, leaf_attr_pool, op)
+    }
+
+    /// Scene-manager wrapper over [`Mesher::rebuild_asset_mesh`] (full
+    /// re-extract fallback). `leaf_attr_pool` is read-only here — the
+    /// full extract doesn't re-derive ∇D normals.
+    fn rebuild_asset_mesh(&mut self, handle: AssetHandle) {
+        let Self {
+            asset_cache,
+            brick_pool,
+            leaf_attr_pool,
+            mesher,
+            ..
+        } = self;
+        let Some(entry) = asset_cache.get_mut(handle) else {
+            return;
+        };
+        let AssetEntry { model, view, .. } = entry;
+        mesher.rebuild_asset_mesh(model, view, brick_pool, leaf_attr_pool);
+    }
+
+    /// Scene-manager wrapper over [`Mesher::rebuild_stroke_clusters`].
+    /// The per-handle stroke session state (`StrokeExtractState` — the
+    /// accumulated union AABB + stroke path + previous patch ids) lives
+    /// on the manager, NOT the handle-free mesher: this wrapper resolves
+    /// the union from `op`, hands the mesher `(union_lo, union_hi,
+    /// prev_patch_ids)`, and records the returned patch id so the next
+    /// stamp in the stroke replaces it.
+    fn rebuild_stroke_clusters(&mut self, handle: AssetHandle, op: &BrushOp) -> bool {
+        use super::manager::StrokeExtractState;
+        let Self {
+            asset_cache,
+            brick_pool,
+            leaf_attr_pool,
+            mesher,
+            sculpt_stroke_extracts,
+            ..
+        } = self;
+        let Some(entry) = asset_cache.get_mut(handle) else {
+            return false;
+        };
+        let AssetEntry { model, view, .. } = entry;
+        if view.meshlet_clusters.is_empty() {
+            // Caller falls back to the full re-extract path.
+            return false;
+        }
+
+        // ── Step 1: update per-handle stroke state (manager-owned) ──
+        let depth = model.spatial_handle.depth;
+        let base_vs = model.spatial_handle.base_voxel_size;
+        let grid_origin = model.grid_origin();
+        let extent = 1u32 << depth;
+        let (stamp_lo, stamp_hi) = brush_cell_range(op, extent);
+        let stamp_lo = IVec3::new(stamp_lo.x as i32, stamp_lo.y as i32, stamp_lo.z as i32);
+        let stamp_hi = IVec3::new(stamp_hi.x as i32, stamp_hi.y as i32, stamp_hi.z as i32);
+        let stamp_center_local = grid_origin + op.center * base_vs;
+        let stroke = sculpt_stroke_extracts
+            .entry(handle)
+            .or_insert_with(|| StrokeExtractState {
+                union_lo: stamp_lo,
+                union_hi: stamp_hi,
+                stroke_patch_cluster_ids: Vec::new(),
+                stroke_path_local: Vec::new(),
+            });
+        stroke.union_lo = stroke.union_lo.min(stamp_lo);
+        stroke.union_hi = stroke.union_hi.max(stamp_hi);
+        stroke.stroke_path_local.push(stamp_center_local);
+        let union_lo = stroke.union_lo;
+        let union_hi = stroke.union_hi;
+        let prev_patch_ids = stroke.stroke_patch_cluster_ids.clone();
+
+        // ── Steps 2–7: re-extract the union region (handle-free) ──
+        let new_patch_id = mesher.rebuild_stroke_clusters(
+            model,
+            view,
+            brick_pool,
+            leaf_attr_pool,
+            union_lo,
+            union_hi,
+            &prev_patch_ids,
+        );
+
+        // ── Step 6 write-back: record the new patch id ──
+        if let Some(id) = new_patch_id {
+            if let Some(stroke) = sculpt_stroke_extracts.get_mut(&handle) {
+                stroke.stroke_patch_cluster_ids.clear();
+                stroke.stroke_patch_cluster_ids.push(id);
+            }
+        }
         true
     }
 }

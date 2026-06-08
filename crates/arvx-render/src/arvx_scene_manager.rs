@@ -24,6 +24,7 @@
 mod asset_load;
 mod cluster_spatial_index;
 mod manager;
+mod mesher;
 mod paint;
 mod remesh_region;
 mod sculpt;

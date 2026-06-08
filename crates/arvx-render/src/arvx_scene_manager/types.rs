@@ -624,6 +624,57 @@ impl MeshView {
         }
         removed
     }
+
+    /// LOD-0 cluster ids whose object-local grid AABB overlaps the
+    /// half-open brush grid-coord AABB `brush_lo .. brush_hi`. Walks the
+    /// D7 spatial index for candidates, then confirms each with the exact
+    /// [`cluster_overlaps_brush_grid_aabb`](arvx_core::mesh_cluster::cluster_overlaps_brush_grid_aabb)
+    /// test. The grid origin / `base_vs` come from the companion
+    /// [`VoxelModel`] (the view holds no grid frame of its own). Empty for
+    /// an empty cluster table, a degenerate brush AABB, or zero overlap.
+    /// Ascending cluster id.
+    ///
+    /// The dirty-cluster query authority for the re-extract paths; the
+    /// `ArvxSceneManager::clusters_in_brush_grid_aabb` handle-keyed method
+    /// is a thin wrapper over this.
+    pub(super) fn clusters_in_grid_aabb(
+        &self,
+        model: &VoxelModel,
+        brush_lo: glam::IVec3,
+        brush_hi: glam::IVec3,
+    ) -> Vec<u32> {
+        if self.meshlet_clusters.is_empty() {
+            return Vec::new();
+        }
+        // Empty brush AABB → no clusters can intersect.
+        if brush_lo.x >= brush_hi.x || brush_lo.y >= brush_hi.y || brush_lo.z >= brush_hi.z {
+            return Vec::new();
+        }
+        let depth = model.spatial_handle.depth;
+        let base_vs = model.spatial_handle.base_voxel_size;
+        let extent = (1u32 << depth) as f32 * base_vs;
+        let aabb_center = (model.aabb.min + model.aabb.max) * 0.5;
+        let grid_origin = aabb_center - glam::Vec3::splat(extent * 0.5);
+
+        let candidates = self.cluster_spatial_index.query(brush_lo, brush_hi);
+        let mut dirty = Vec::with_capacity(candidates.len());
+        for cid in candidates {
+            let c = &self.meshlet_clusters[cid as usize];
+            // LOD filter — index only stores LOD-0, but keep the check
+            // for safety against a future change letting one slip through.
+            if c.lod_level != 0 {
+                continue;
+            }
+            let (cmin, cmax) =
+                arvx_core::mesh_cluster::cluster_grid_aabb(c, grid_origin, base_vs);
+            if arvx_core::mesh_cluster::cluster_overlaps_brush_grid_aabb(
+                cmin, cmax, brush_lo, brush_hi,
+            ) {
+                dirty.push(cid);
+            }
+        }
+        dirty
+    }
 }
 
 impl VoxelModel {

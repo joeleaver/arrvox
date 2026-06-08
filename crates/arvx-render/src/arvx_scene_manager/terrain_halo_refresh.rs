@@ -26,9 +26,11 @@ use arvx_core::mesh_lod::build_cluster_dag_with_levels;
 use arvx_core::sparse_octree::{brick_id, is_brick, is_leaf, leaf_slot, EMPTY_NODE, INTERIOR_NODE};
 use arvx_core::LeafAttr;
 
+use arvx_core::{BrickPool, LeafAttrPool};
+
 use super::manager::ArvxSceneManager;
 use super::remesh_region::{RemeshRegion, RemeshScope};
-use super::types::AssetHandle;
+use super::types::{AssetEntry, AssetHandle, MeshView, VoxelModel};
 
 /// Face index in `arvx_core::mesh_extract::FACE_DIRS` order.
 /// 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z.
@@ -386,7 +388,9 @@ impl ArvxSceneManager {
         new_extra_slots.push(new_slot);
         Some(new_slot)
     }
+}
 
+impl super::mesher::Mesher {
     /// Phase 4.2b — slab-only re-extract on halo refresh.
     ///
     /// Replaces `rebuild_asset_mesh_haloed`'s full-tile re-extract
@@ -444,19 +448,25 @@ impl ArvxSceneManager {
     /// Trade-off accepted for V1 — see
     /// `project_terrain_phase4_session_endpoint` for the 4.2b followup
     /// this implements.
-    fn rebuild_face_band_clusters(&mut self, handle: AssetHandle, target_face: u8) {
+    fn rebuild_face_band_clusters(
+        &mut self,
+        model: &VoxelModel,
+        view: &mut MeshView,
+        brick_pool: &BrickPool,
+        leaf_attr_pool: &LeafAttrPool,
+        target_face: u8,
+    ) {
         let t0 = std::time::Instant::now();
 
         // Resolve asset geometry config + build the slab change-region.
         let (depth, base_vs, grid_origin, region, slab_aabb_min_obj, slab_aabb_max_obj) = {
-            let Some(entry) = self.asset_cache.get(handle) else { return };
-            if entry.view.meshlet_clusters.is_empty() {
+            if view.meshlet_clusters.is_empty() {
                 return;
             }
-            let depth = entry.model.spatial_handle.depth;
-            let base_vs = entry.model.spatial_handle.base_voxel_size;
+            let depth = model.spatial_handle.depth;
+            let base_vs = model.spatial_handle.base_voxel_size;
             let extent_f = (1u32 << depth) as f32 * base_vs;
-            let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
+            let aabb_center = (model.aabb.min + model.aabb.max) * 0.5;
             let grid_origin = aabb_center - Vec3::splat(extent_f * 0.5);
 
             let s = 1i32 << depth;
@@ -481,41 +491,40 @@ impl ArvxSceneManager {
         // Phases 1–3: query the dirty clusters overlapping the slab and
         // drop the stale boundary triangles (`BoxTouch` predicate), all
         // in the shared executor.
-        let (dirty, stats) = self.remesh_filter_dirty_clusters(handle, &region);
+        let (dirty, stats) = self.remesh_filter_dirty_clusters(model, view, &region);
 
         // Phase 4: re-extract the slab region. (Terrain does NOT splat
         // ∇D normals into the pool — the band refresh only welds the
         // halo seam; it doesn't re-derive the interior normals the way
         // the sculpt paths do.)
         let (slab_verts, slab_indices, cells_count) = {
-            let Some(entry) = self.asset_cache.get(handle) else { return };
             // Pad collect by +3 each side so the extractor's pad gets
             // boundary cells for 8-corner classification (mirrors
             // sculpt.rs's `cells_min = brush_lo - IVec3::splat(3)`).
             let cells_lo = region.extract_lo - IVec3::splat(3);
             let cells_hi = region.extract_hi + IVec3::splat(3);
             let cells = collect_cell_map_in_region(
-                entry.model.cpu_octree.as_slice(),
+                model.cpu_octree.as_slice(),
                 depth,
-                self.brick_pool.as_slice(),
+                brick_pool.as_slice(),
                 cells_lo,
                 cells_hi,
             );
             let cells_count = cells.len();
             let (verts, indices) = extract_mesh_region_from_cells_pooled_haloed(
-                &mut self.sculpt_extract_scratch,
+                &mut self.scratch,
                 &cells,
                 region.extract_lo,
                 region.extract_hi,
-                entry.model.cpu_octree.as_slice(),
+                model.cpu_octree.as_slice(),
                 depth,
                 base_vs,
                 grid_origin,
-                self.brick_pool.as_slice(),
-                self.leaf_attr_pool.as_slice(),
-                self.leaf_attr_pool.bones_as_slice(),
-                &entry.model.halo_cells,
-                Some(&entry.model.sculpt_owned_slots),
+                brick_pool.as_slice(),
+                leaf_attr_pool.as_slice(),
+                leaf_attr_pool.bones_as_slice(),
+                &model.halo_cells,
+                Some(&model.sculpt_owned_slots),
                 None::<&fn(glam::Vec3) -> f32>,
             );
             (verts, indices, cells_count)
@@ -524,7 +533,7 @@ impl ArvxSceneManager {
         // Phase 5: append the slab as a fresh LOD-0 patch cluster.
         let patch_verts_count = slab_verts.len();
         let patch_indices_count = slab_indices.len();
-        self.append_remesh_patch(handle, &slab_verts, &slab_indices, grid_origin, base_vs);
+        self.append_remesh_patch(view, &slab_verts, &slab_indices, grid_origin, base_vs);
 
         // Phase 6: CC-walk LOD_DIRTY marking over slab AABB. Forces
         // the LOD selector to drop dirty ancestors and admit dirty
@@ -532,9 +541,8 @@ impl ArvxSceneManager {
         // coarse LOD>0 clusters at the boundary would render with
         // stale (pre-refresh) vertex positions.
         let _walk_visited = if !dirty.is_empty() {
-            let Some(entry) = self.asset_cache.get_mut(handle) else { return };
             super::sculpt::mark_lod_dirty_chains(
-                &mut entry.view,
+                view,
                 &dirty,
                 slab_aabb_min_obj,
                 slab_aabb_max_obj,
@@ -546,17 +554,14 @@ impl ArvxSceneManager {
         // Phase 7: bookkeeping flags. `bump_geometry_epoch` happens
         // at the `apply_halo_refresh` call site, mirroring the
         // sculpt path.
-        if let Some(entry) = self.asset_cache.get_mut(handle) {
-            entry.view.mesh_dirty = true;
-            entry.view.clusters_dirty = true;
-        }
+        view.mesh_dirty = true;
+        view.clusters_dirty = true;
 
         if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
             eprintln!(
-                "[halo-refresh] band re-extract handle={:?} face={} \
+                "[halo-refresh] band re-extract face={} \
                  dirty_clusters={} cells={} kept_tris={} dropped_tris={} \
                  slab_verts={} slab_indices={} ({:.2}ms)",
-                handle,
                 target_face,
                 dirty.len(),
                 cells_count,
@@ -574,30 +579,34 @@ impl ArvxSceneManager {
     /// uses `extract_surface_mesh_haloed` with halo width 2.
     /// Called from `apply_halo_refresh` after the halo cells are
     /// updated.
-    fn rebuild_asset_mesh_haloed(&mut self, handle: AssetHandle) {
+    fn rebuild_asset_mesh_haloed(
+        &self,
+        model: &VoxelModel,
+        view: &mut MeshView,
+        brick_pool: &BrickPool,
+        leaf_attr_pool: &LeafAttrPool,
+    ) {
         let t0 = std::time::Instant::now();
 
         let (depth, voxel_size, grid_origin, halo_cells) = {
-            let Some(entry) = self.asset_cache.get(handle) else { return; };
-            let depth = entry.model.spatial_handle.depth;
-            let voxel_size = entry.model.spatial_handle.base_voxel_size;
+            let depth = model.spatial_handle.depth;
+            let voxel_size = model.spatial_handle.base_voxel_size;
             let extent = (1u32 << depth) as f32 * voxel_size;
-            let aabb_center = (entry.model.aabb.min + entry.model.aabb.max) * 0.5;
+            let aabb_center = (model.aabb.min + model.aabb.max) * 0.5;
             let grid_origin = aabb_center - Vec3::splat(extent * 0.5);
-            (depth, voxel_size, grid_origin, entry.model.halo_cells.clone())
+            (depth, voxel_size, grid_origin, model.halo_cells.clone())
         };
 
         let (vertices, indices_unc) = {
-            let entry = self.asset_cache.get(handle).expect("just confirmed above");
-            let nodes = entry.model.cpu_octree.as_slice();
+            let nodes = model.cpu_octree.as_slice();
             extract_surface_mesh_haloed(
                 nodes,
                 depth,
                 voxel_size,
                 grid_origin,
-                self.brick_pool.as_slice(),
-                self.leaf_attr_pool.as_slice(),
-                self.leaf_attr_pool.bones_as_slice(),
+                brick_pool.as_slice(),
+                leaf_attr_pool.as_slice(),
+                leaf_attr_pool.bones_as_slice(),
                 &halo_cells,
                 TILE_HALO_VOXELS as u32,
                 // Halo refresh re-extracts the whole target tile —
@@ -606,23 +615,21 @@ impl ArvxSceneManager {
                 // keep their material/colour against neighbour
                 // halo cells (which always carry the procedural
                 // material).
-                Some(&entry.model.sculpt_owned_slots),
+                Some(&model.sculpt_owned_slots),
             )
         };
 
         if vertices.is_empty() {
-            if let Some(entry) = self.asset_cache.get_mut(handle) {
-                entry.view.mesh_vertices.clear();
-                entry.view.mesh_indices.clear();
-                entry.view.meshlet_clusters.clear();
-                entry.view.bake_time_cluster_count = 0;
-                entry.view.mesh_lod0_index_count = 0;
-                entry.view.reset_mesh_indices_slab();
-                entry.view.mesh_dirty = true;
-                entry.view.clusters_dirty = true;
-                entry.view.cluster_spatial_index =
-                    super::cluster_spatial_index::ClusterSpatialIndex::new();
-            }
+            view.mesh_vertices.clear();
+            view.mesh_indices.clear();
+            view.meshlet_clusters.clear();
+            view.bake_time_cluster_count = 0;
+            view.mesh_lod0_index_count = 0;
+            view.reset_mesh_indices_slab();
+            view.mesh_dirty = true;
+            view.clusters_dirty = true;
+            view.cluster_spatial_index =
+                super::cluster_spatial_index::ClusterSpatialIndex::new();
             return;
         }
 
@@ -634,38 +641,72 @@ impl ArvxSceneManager {
         let dag = build_cluster_dag_with_levels(&vertices, &indices_unc, 1);
         let mesh_lod0_index_count = dag.lod0_index_range.1 - dag.lod0_index_range.0;
 
-        let Some(entry) = self.asset_cache.get_mut(handle) else { return; };
-        entry.view.mesh_vertices = vertices;
-        entry.view.mesh_indices = dag.indices;
-        entry.view.meshlet_clusters = dag.clusters;
-        entry.view.bake_time_cluster_count = entry.view.meshlet_clusters.len() as u32;
-        entry.view.mesh_lod0_index_count = mesh_lod0_index_count;
-        entry.view.reset_mesh_indices_slab();
+        view.mesh_vertices = vertices;
+        view.mesh_indices = dag.indices;
+        view.meshlet_clusters = dag.clusters;
+        view.bake_time_cluster_count = view.meshlet_clusters.len() as u32;
+        view.mesh_lod0_index_count = mesh_lod0_index_count;
+        view.reset_mesh_indices_slab();
         // Full re-extract — mirror the IBO reset on the VBO side so the
         // upload doesn't carry stale prefix bytes.
-        entry.view.mesh_vertices_dirty.clear();
-        let vbo_bytes = (entry.view.mesh_vertices.len()
+        view.mesh_vertices_dirty.clear();
+        let vbo_bytes = (view.mesh_vertices.len()
             * std::mem::size_of::<crate::mesh_pass::MeshVertex>())
             as u32;
         if vbo_bytes > 0 {
-            entry.view.mesh_vertices_dirty.mark_full(vbo_bytes);
+            view.mesh_vertices_dirty.mark_full(vbo_bytes);
         }
-        entry.view.mesh_dirty = true;
-        entry.view.clusters_dirty = true;
-        entry.view
+        view.mesh_dirty = true;
+        view.clusters_dirty = true;
+        view
             .cluster_spatial_index
-            .rebuild(&entry.view.meshlet_clusters, grid_origin, voxel_size);
+            .rebuild(&view.meshlet_clusters, grid_origin, voxel_size);
 
         if std::env::var("ARVX_TERRAIN_DEBUG").is_ok() {
             eprintln!(
-                "[halo-refresh] mesh re-extract handle={:?} verts={} indices={} clusters={} ({:.2}ms)",
-                handle,
-                entry.view.mesh_vertices.len(),
-                entry.view.mesh_indices.len(),
-                entry.view.meshlet_clusters.len(),
+                "[halo-refresh] mesh re-extract verts={} indices={} clusters={} ({:.2}ms)",
+                view.mesh_vertices.len(),
+                view.mesh_indices.len(),
+                view.meshlet_clusters.len(),
                 t0.elapsed().as_secs_f64() * 1000.0,
             );
         }
+    }
+}
+
+impl ArvxSceneManager {
+    /// Scene-manager wrapper over [`Mesher::rebuild_face_band_clusters`]:
+    /// fetch the entry, split into `(model, view)`, lend the scene pools.
+    fn rebuild_face_band_clusters(&mut self, handle: AssetHandle, target_face: u8) {
+        let Self {
+            asset_cache,
+            brick_pool,
+            leaf_attr_pool,
+            mesher,
+            ..
+        } = self;
+        let Some(entry) = asset_cache.get_mut(handle) else {
+            return;
+        };
+        let AssetEntry { model, view, .. } = entry;
+        mesher.rebuild_face_band_clusters(model, view, brick_pool, leaf_attr_pool, target_face);
+    }
+
+    /// Scene-manager wrapper over [`Mesher::rebuild_asset_mesh_haloed`]
+    /// (full-asset haloed re-extract). `leaf_attr_pool` is read-only.
+    fn rebuild_asset_mesh_haloed(&mut self, handle: AssetHandle) {
+        let Self {
+            asset_cache,
+            brick_pool,
+            leaf_attr_pool,
+            mesher,
+            ..
+        } = self;
+        let Some(entry) = asset_cache.get_mut(handle) else {
+            return;
+        };
+        let AssetEntry { model, view, .. } = entry;
+        mesher.rebuild_asset_mesh_haloed(model, view, brick_pool, leaf_attr_pool);
     }
 }
 

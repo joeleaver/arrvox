@@ -10,7 +10,6 @@
 //! per-file `impl ArvxSceneManager` blocks; private fields are
 //! `pub(super)` so sibling impls can drive them directly.
 
-use arvx_core::mesh_extract::SculptExtractScratch;
 use arvx_core::{BrickPool, LeafAttrPool, OctreeHandle, SparseOctree};
 
 use crate::octree_gpu::OctreeGpu;
@@ -148,16 +147,18 @@ pub struct ArvxSceneManager {
     /// fast path on the render side that gates on it.
     pub(super) paint_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
 
-    // ── Sculpt drain scratch (D6.3.c) ───────────────────────────────
-    /// Pool-reused scratch buffers for the sculpt extract path. Held
-    /// here rather than allocated per-stamp because the per-stamp
-    /// `Vec<u32>` alloc + memset of two ~4.5 MB grids costs ~500-700 µs
-    /// — significant relative to the 5-10 ms per-stamp budget on
-    /// medium-density brushes. Grows on demand to the largest brush
-    /// footprint seen so far and never shrinks; `extract_*_pooled`
-    /// resets only the touched slots between stamps via the grids'
-    /// dirty lists.
-    pub(super) sculpt_extract_scratch: SculptExtractScratch,
+    // ── Surface mesher (re-extract, freed from the manager) ─────────
+    /// The [`super::mesher::Mesher`] hosts every surface re-extract path
+    /// (the `remesh_region` executors, the incremental orchestrators, and
+    /// the full-asset rebuilds), operating on explicit `(&VoxelModel,
+    /// &mut MeshView, &BrickPool, &mut LeafAttrPool)` instead of `&mut
+    /// self` — the boundary the future GPU mesher shares. It owns the
+    /// pool-reused sculpt extract scratch (held here rather than
+    /// allocated per-stamp: the per-stamp alloc + memset of two ~4.5 MB
+    /// grids costs ~500-700 µs, significant against the 5-10 ms per-stamp
+    /// budget; grows on demand and never shrinks). The manager's thin
+    /// re-extract wrappers field-destructure `self` and delegate here.
+    pub(super) mesher: super::mesher::Mesher,
     /// Stroke-id of the active sculpt stroke. Bumped on every LMB-down
     /// in the editor and passed through `apply_sculpt_brush`; when the
     /// next stamp arrives with a different value, [`sculpt_stroke_touched`]
@@ -239,7 +240,7 @@ impl ArvxSceneManager {
             last_geometry_bump_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_geometry_submit_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             paint_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            sculpt_extract_scratch: SculptExtractScratch::new(),
+            mesher: super::mesher::Mesher::new(),
             sculpt_stroke_seq: 0,
             sculpt_stroke_touched: rustc_hash::FxHashSet::default(),
             sculpt_stroke_prev_center_world: None,

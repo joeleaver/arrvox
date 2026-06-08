@@ -36,8 +36,8 @@ use arvx_core::mesh_cluster::{
 
 use crate::mesh_pass::MeshVertex;
 
-use super::manager::ArvxSceneManager;
-use super::types::AssetHandle;
+use super::mesher::Mesher;
+use super::types::{MeshView, VoxelModel};
 
 /// How a re-extract decides which pre-existing triangles to drop before
 /// re-meshing a region. The single authority for the three drop rules
@@ -226,7 +226,7 @@ pub struct RemeshFilterStats {
     pub dropped_tris: usize,
 }
 
-impl ArvxSceneManager {
+impl Mesher {
     /// Query the clusters overlapping `region.query_{lo,hi}` and drop the
     /// stale triangles `region.filter` selects, in place. Returns the
     /// dirty-cluster list (the caller still needs it to seed the
@@ -235,13 +235,15 @@ impl ArvxSceneManager {
     /// Phases 1–3 of the legacy re-extract functions, unified: dirty
     /// query → rayon per-triangle filter → sequential in-place merge +
     /// free-tail. `KeepAll` short-circuits after the query so additive
-    /// brushes do zero index-buffer writes.
+    /// brushes do zero index-buffer writes. Pure over `(model, view)` —
+    /// no manager, no handle, no scene pools.
     pub(super) fn remesh_filter_dirty_clusters(
-        &mut self,
-        handle: AssetHandle,
+        &self,
+        model: &VoxelModel,
+        view: &mut MeshView,
         region: &RemeshRegion,
     ) -> (Vec<u32>, RemeshFilterStats) {
-        let dirty = self.clusters_in_brush_grid_aabb(handle, region.query_lo, region.query_hi);
+        let dirty = view.clusters_in_grid_aabb(model, region.query_lo, region.query_hi);
         let mut stats = RemeshFilterStats::default();
         if dirty.is_empty() {
             return (dirty, stats);
@@ -261,14 +263,12 @@ impl ArvxSceneManager {
         // filter is independent (reads its own index slice + indexed
         // vertices, produces a kept-index Vec). `par_iter().collect()`
         // preserves input order so the sequential merge below is
-        // deterministic.
+        // deterministic. Immutable reborrows of `*view` scoped so the
+        // sequential merge below can take `&mut view`.
         let results: Vec<(u32, Vec<u32>)> = {
-            let Some(entry) = self.asset_cache.get(handle) else {
-                return (dirty, stats);
-            };
-            let clusters = &entry.view.meshlet_clusters;
-            let indices = &entry.view.mesh_indices;
-            let verts = &entry.view.mesh_vertices;
+            let clusters = &view.meshlet_clusters;
+            let indices = &view.mesh_indices;
+            let verts = &view.mesh_vertices;
             dirty
                 .par_iter()
                 .filter_map(|&cid| {
@@ -313,22 +313,19 @@ impl ArvxSceneManager {
         // cluster AABB stays at its pre-filter bounds (kept tris fit
         // inside it).
         {
-            let Some(entry) = self.asset_cache.get_mut(handle) else {
-                return (dirty, stats);
-            };
             for (cid, kept) in &results {
-                let old_offset = entry.view.meshlet_clusters[*cid as usize].index_offset;
-                let old_count = entry.view.meshlet_clusters[*cid as usize].index_count;
+                let old_offset = view.meshlet_clusters[*cid as usize].index_offset;
+                let old_count = view.meshlet_clusters[*cid as usize].index_count;
                 let new_count = kept.len() as u32;
                 stats.kept_tris += (new_count as usize) / 3;
                 stats.dropped_tris += ((old_count - new_count) as usize) / 3;
                 if new_count > 0 {
-                    entry.view.mesh_indices_write_at(old_offset, kept);
+                    view.mesh_indices_write_at(old_offset, kept);
                 }
                 if new_count < old_count {
-                    entry.view.free_index_range(old_offset + new_count, old_count - new_count);
+                    view.free_index_range(old_offset + new_count, old_count - new_count);
                 }
-                entry.view.meshlet_clusters[*cid as usize].index_count = new_count;
+                view.meshlet_clusters[*cid as usize].index_count = new_count;
             }
         }
 
@@ -346,8 +343,8 @@ impl ArvxSceneManager {
     /// force-admits it unconditionally and CC walks never traverse
     /// through it.
     pub(super) fn append_remesh_patch(
-        &mut self,
-        handle: AssetHandle,
+        &self,
+        view: &mut MeshView,
         verts: &[MeshVertex],
         indices: &[u32],
         grid_origin: Vec3,
@@ -369,23 +366,21 @@ impl ArvxSceneManager {
             }
         }
 
-        let entry = self.asset_cache.get_mut(handle)?;
-        let vertex_offset = entry.view.mesh_vertices.len() as u32;
+        let vertex_offset = view.mesh_vertices.len() as u32;
         let append_start_bytes =
             (vertex_offset as usize * std::mem::size_of::<MeshVertex>()) as u32;
-        entry.view.mesh_vertices.extend_from_slice(verts);
+        view.mesh_vertices.extend_from_slice(verts);
         let append_len_bytes = std::mem::size_of_val(verts) as u32;
         if append_len_bytes > 0 {
-            entry.view
-                .mesh_vertices_dirty
+            view.mesh_vertices_dirty
                 .mark(append_start_bytes, append_len_bytes);
         }
 
         let patch_index_count = indices.len() as u32;
         let new_index_offset = if patch_index_count > 0 {
-            let offset = entry.view.alloc_index_range(patch_index_count);
+            let offset = view.alloc_index_range(patch_index_count);
             let rebased: Vec<u32> = indices.iter().map(|&i| i + vertex_offset).collect();
-            entry.view.mesh_indices_write_at(offset, &rebased);
+            view.mesh_indices_write_at(offset, &rebased);
             offset
         } else {
             0
@@ -405,10 +400,9 @@ impl ArvxSceneManager {
             group_below_idx: DAG_GROUP_NONE,
             _pad3: 0,
         };
-        let patch_cluster_id = entry.view.meshlet_clusters.len() as u32;
-        entry.view.meshlet_clusters.push(patch_cluster);
-        entry.view
-            .cluster_spatial_index
+        let patch_cluster_id = view.meshlet_clusters.len() as u32;
+        view.meshlet_clusters.push(patch_cluster);
+        view.cluster_spatial_index
             .insert(patch_cluster_id, &patch_cluster, grid_origin, base_vs);
         Some(patch_cluster_id)
     }
