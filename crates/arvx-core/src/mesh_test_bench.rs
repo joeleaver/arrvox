@@ -1758,7 +1758,48 @@ pub fn bake_heightfield_blur(
 /// analytic-distance injection it replaced has been dropped; the asserts
 /// are unchanged, now validating the voxelizer's distance write too.)
 pub fn bake_heightfield_qef(hf: &HeightField, half_world: f32, voxel_size: f32) -> HeightMesh {
-    let aabb = heightfield_tile_aabb(half_world, voxel_size);
+    bake_heightfield_qef_aabb(hf, heightfield_tile_aabb(half_world, voxel_size), voxel_size)
+}
+
+/// [`bake_heightfield`] (blur path) over an explicit (grid-aligned) tile
+/// AABB — the seam-test baseline the QEF path is compared against.
+pub fn bake_heightfield_blur_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32) -> HeightMesh {
+    let h = &hf.h;
+    let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
+        positions
+            .iter()
+            .map(|p| (p.y - h(p.x, p.z), 1u16, 1u16, 0u8, 0u32))
+            .collect()
+    };
+    let artifact = voxelize_to_artifact(sdf_fn, &aabb, voxel_size, REPRO_TILE_HALO)
+        .expect("heightfield voxelize_to_artifact");
+    let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
+    let (verts, indices) = extract_surface_mesh_density_haloed(
+        artifact.octree.as_slice(),
+        artifact.octree.depth(),
+        voxel_size,
+        artifact.grid_origin,
+        &brick_pool_flat,
+        &artifact.leaf_attrs,
+        &[],
+        &artifact.halo_cells,
+        REPRO_TILE_HALO,
+        None,
+        &[],
+    );
+    let surface_cells = heightfield_surface_cells(hf, &aabb, voxel_size);
+    HeightMesh {
+        verts,
+        indices,
+        grid_origin: artifact.grid_origin,
+        voxel_size,
+        surface_cells,
+    }
+}
+
+/// [`bake_heightfield_qef`] over an explicit (grid-aligned) tile AABB — so
+/// the seam test can bake two ADJACENT tiles that share a face.
+pub fn bake_heightfield_qef_aabb(hf: &HeightField, aabb: Aabb, voxel_size: f32) -> HeightMesh {
     let h = &hf.h;
     let sdf_fn = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32)> {
         positions
@@ -2560,5 +2601,120 @@ mod tests {
             "QEF FBM residual floor should stay small ({:.4} ≥ 0.05)",
             qef.residual_rms_vox
         );
+    }
+
+    /// **Watertight seam across adjacent tiles.** Two independently
+    /// voxelized tiles share the `x = 0` face. Each emits the boundary
+    /// cubes that straddle the seam (the tile owns them on one side and
+    /// folds the other side in as halo); for a watertight mesh those
+    /// shared vertices must COINCIDE.
+    ///
+    /// They are not *bit*-identical: each tile's grid origin is its own
+    /// `aabb.min`, so the QEF (and the blur Newton) solve at different
+    /// coordinate magnitudes — a property of the full-asset path, not of
+    /// QEF (the shipped blur path has the same limitation). What we pin is
+    /// that the seam gap stays deep sub-voxel (no visible crack) AND that
+    /// QEF does not regress watertightness vs the blur baseline. The Stage-3
+    /// halo distance write (phase-1 center sample = the neighbour's interior
+    /// sample) is what keeps the QEF seam this tight.
+    #[test]
+    fn qef_hermite_seam_watertight_across_adjacent_tiles() {
+        let hf = HeightField::gentle_slope(0.10, 0.035);
+        let vs = 0.5f32;
+        let n = 32i32; // pow2 cells per tile
+        let span = n as f32 * vs;
+        let ymin = -span * 0.5;
+        let zmin = -span * 0.5;
+        let aabb_a = Aabb::new(
+            Vec3::new(-span, ymin, zmin),
+            Vec3::new(0.0, ymin + span, zmin + span),
+        );
+        let aabb_b = Aabb::new(
+            Vec3::new(0.0, ymin, zmin),
+            Vec3::new(span, ymin + span, zmin + span),
+        );
+
+        // Max seam gap: for each A seam-band vertex, the distance to the
+        // nearest B vertex (within ½-voxel, i.e. a genuine shared cube).
+        let band = REPRO_TILE_HALO as f32 * vs;
+        let seam_gap = |a: &HeightMesh, b: &HeightMesh| -> (f32, usize) {
+            let sa: Vec<_> = a
+                .verts
+                .iter()
+                .filter(|v| v.local_pos[0].abs() <= band)
+                .collect();
+            let sb: Vec<_> = b
+                .verts
+                .iter()
+                .filter(|v| v.local_pos[0].abs() <= band)
+                .collect();
+            let mut max_gap = 0.0f32;
+            let mut matched = 0usize;
+            for v in &sa {
+                let mut best = f32::INFINITY;
+                for w in &sb {
+                    let d = (Vec3::from(v.local_pos) - Vec3::from(w.local_pos)).length();
+                    if d < best {
+                        best = d;
+                    }
+                }
+                if best <= 0.5 * vs {
+                    matched += 1;
+                    if best > max_gap {
+                        max_gap = best;
+                    }
+                }
+            }
+            (max_gap / vs, matched)
+        };
+
+        let (qef_gap, qef_matched) =
+            seam_gap(&bake_heightfield_qef_aabb(&hf, aabb_a, vs), &bake_heightfield_qef_aabb(&hf, aabb_b, vs));
+        let (blur_gap, _) =
+            seam_gap(&bake_heightfield_blur_aabb(&hf, aabb_a, vs), &bake_heightfield_blur_aabb(&hf, aabb_b, vs));
+
+        // A healthy shared boundary exists (the tiles really do meet).
+        assert!(
+            qef_matched >= 32,
+            "expected a populated shared seam, only {qef_matched} matched cubes"
+        );
+        // Deep sub-voxel: no visible crack (observed ~2e-4 vox).
+        assert!(
+            qef_gap < 0.01,
+            "QEF seam gap {qef_gap:.6} vox ≥ 0.01 — possible crack"
+        );
+        // No regression vs the shipped blur path's watertightness.
+        assert!(
+            qef_gap <= blur_gap.max(1e-4) * 2.0,
+            "QEF seam gap {qef_gap:.6} vox regressed vs blur {blur_gap:.6}"
+        );
+    }
+
+    /// QEF placement is deterministic: two bakes of the same tile produce
+    /// the identical SURFACE (multiset of vertex positions). The vertex
+    /// *array order* is not deterministic — voxelization uses parallel +
+    /// hashed cell maps — so we compare the position multiset, mirroring
+    /// `wide_window_fix_off_is_bit_stable`. A non-deterministic gather
+    /// order or solve would surface as a mismatch here, which is what makes
+    /// the seam reproducible in the first place.
+    #[test]
+    fn qef_hermite_bake_is_bit_stable() {
+        let hf = HeightField::gentle_slope(0.10, 0.035);
+        let a = bake_heightfield_qef(&hf, 12.0, 0.5);
+        let b = bake_heightfield_qef(&hf, 12.0, 0.5);
+        assert_eq!(a.verts.len(), b.verts.len());
+        let key = |v: &MeshVertex| {
+            (
+                v.local_pos[0].to_bits(),
+                v.local_pos[1].to_bits(),
+                v.local_pos[2].to_bits(),
+                v.normal_oct,
+            )
+        };
+        let mut sa: Vec<_> = a.verts.iter().map(key).collect();
+        let mut sb: Vec<_> = b.verts.iter().map(key).collect();
+        sa.sort_unstable();
+        sb.sort_unstable();
+        assert_eq!(sa, sb, "QEF vertex positions+normals must be stable");
     }
 }
