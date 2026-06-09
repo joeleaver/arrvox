@@ -268,20 +268,10 @@ fn main() -> anyhow::Result<()> {
         arvx_engine::engine::EngineConfig {
             width: 1920,
             height: 1080,
-            // Sim at 60 Hz (default). Render CAPPED at 60 Hz — NOT the
-            // struct default of `Uncapped`. The editor viewport shares
-            // the physical GPU with the Wayland compositor that presents
-            // rinch's window; uncapped, the engine renders the scene
-            // ~275 fps and becomes GPU-bound (~4ms of passes back-to-back
-            // = ~100% GPU), starving the compositor → it can't present
-            // rinch's window → `get_current_texture` fails → "surface
-            // lost". As the terrain grows the per-frame GPU cost climbs
-            // until that starvation point, which is why it dies *during*
-            // generation. Capping at the display rate leaves the GPU
-            // ~75% idle for the compositor (and matches `PacingMode`'s
-            // documented editor default). `render_worker` interpolates
-            // between sim snapshots, but at 60/60 it's frame-for-frame.
-            render_pacing: arvx_engine::engine::PacingMode::TargetHz(60),
+            // Defaults: sim at 60 Hz (matches the fixed-step rate of
+            // physics + behavior FixedUpdate), render uncapped (the
+            // editor surface is a game viewport — let it run as fast
+            // as the GPU can sustain).
             ..arvx_engine::engine::EngineConfig::default()
         },
         // Frame callback: route each viewport's pixels to its writer.
