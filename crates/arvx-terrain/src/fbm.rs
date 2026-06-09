@@ -471,6 +471,17 @@ impl TerrainFn for FbmTerrainFnResolved {
             Some(Vec3::new(-h_x, 1.0, -h_z)),
         )
     }
+
+    fn surface_y_bounds(&self) -> Option<(f32, f32)> {
+        // `fbm_2d` normalises to [-1, 1] (divides by the geometric-series
+        // limit 2.0), and dropping octaves only SHRINKS the range, so the
+        // surface `base + amplitude·fbm` is hard-bounded to
+        // `[base − |amp|, base + |amp|]` for ANY octave count. Conservative
+        // over-approximation (never clips the surface). Stamps/regions can
+        // exceed it, but the bake only consults this when none are active.
+        let amp = self.amplitude_m.abs();
+        Some((self.base_height_m - amp, self.base_height_m + amp))
+    }
 }
 
 // FBM primitives (hash2 / value_noise_2d / fbm_2d) live in

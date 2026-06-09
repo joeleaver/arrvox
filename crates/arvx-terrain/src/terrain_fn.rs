@@ -90,6 +90,18 @@ pub trait TerrainFn: Send + Sync {
             self.sample_grad(tile, local, voxel_size_m),
         )
     }
+
+    /// Conservative world-space `(min_y, max_y)` the surface can occupy,
+    /// if cheaply known. The bake skips the halo-sampling pass for tiles
+    /// whose whole Y-span (expanded by the halo reach) lies entirely
+    /// outside this band — they're provably all-sky or all-solid. MUST
+    /// over-approximate (never clip the real surface). `None` (the
+    /// default) disables the skip. The bake only consults it on tiles
+    /// with no stamps/regions/envelope, which can push the surface beyond
+    /// the base field's range.
+    fn surface_y_bounds(&self) -> Option<(f32, f32)> {
+        None
+    }
 }
 
 #[cfg(test)]

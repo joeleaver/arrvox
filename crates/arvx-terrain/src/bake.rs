@@ -224,7 +224,36 @@ pub fn bake_tile_with_skirts(
             .collect()
     };
 
-    let artifact = voxelize_to_artifact(sdf_fn, &aabb, voxel_size_m, TILE_HALO_VOXELS)?;
+    // Halo width — normally `TILE_HALO_VOXELS`, but skipped (0) when this
+    // tile + its halo are PROVABLY surface-free. A pure-FBM surface is
+    // bounded to `base_height ± amplitude` (fbm normalises to [-1, 1]); if
+    // the tile's whole Y-span, expanded by the halo reach, sits entirely
+    // above or below that band, no cell — interior OR halo — can hold the
+    // surface, so the ~halo-sampling pass (the dominant cost of an
+    // otherwise-empty sky/underground tile, ~80ms in the profile) would
+    // sample nothing. Output-identical: the octree is the same empty/solid
+    // tree, and an out-of-band halo folds in no surface cells anyway.
+    //
+    // Gated on `use_analytic_grad` (no stamps/regions/envelope) because
+    // those post-modify the height and can push the surface outside the
+    // FBM band — there we keep the full halo. The margin (halo reach in
+    // metres) is what makes boundary tiles safe: a tile within the band's
+    // halo neighbourhood is NOT culled, so its seam with the surface tile
+    // stays watertight.
+    let halo = {
+        let mut h = TILE_HALO_VOXELS;
+        if use_analytic_grad {
+            if let Some((lo, hi)) = terrain_fn.surface_y_bounds() {
+                let margin = TILE_HALO_VOXELS as f32 * voxel_size_m;
+                if aabb.min.y > hi + margin || aabb.max.y < lo - margin {
+                    h = 0;
+                }
+            }
+        }
+        h
+    };
+
+    let artifact = voxelize_to_artifact(sdf_fn, &aabb, voxel_size_m, halo)?;
 
     // Flatten the per-brick cell payloads (Vec<[u32; BRICK_CELLS]>) into
     // a single Vec<u32> so `build_mesh_sections_blob_haloed` can index
@@ -264,7 +293,7 @@ pub fn bake_tile_with_skirts(
         &artifact.leaf_attrs,
         &[], // terrain is never skinned.
         &artifact.halo_cells,
-        TILE_HALO_VOXELS,
+        halo,
         // QEF-Hermite: the voxelizer baked per-leaf distance into the
         // artifact, so the tile meshes smooth-by-construction (no terracing)
         // instead of blur→D. `&[]` would keep the legacy blur path.
@@ -1051,6 +1080,42 @@ mod tests {
             up * 2 > attrs.len(),
             "most leaf normals should point upward on an above-sea surface ({up}/{})",
             attrs.len(),
+        );
+    }
+
+    /// **Empty-sky/underground tile halo skip.** An FBM tile whose whole
+    /// Y-span (+ halo margin) sits outside the surface band
+    /// (`base ± amplitude`) is provably surface-free, so the bake skips
+    /// the halo-sampling pass (the dominant cost of an otherwise-empty
+    /// tile). We can't time it deterministically, but the skip is
+    /// observable: an out-of-band tile's artifact has NO halo cells,
+    /// while an in-band tile keeps a populated halo. Output (the mesh) is
+    /// empty either way for the sky tile — the point is it got there
+    /// cheaply.
+    #[test]
+    fn out_of_band_fbm_tile_skips_halo() {
+        let t = Terrain::default();
+        let vs = t.voxel_size_for_level(0);
+        // Default FBM: base 16, amplitude 24 → surface band [-8, 40] m.
+        let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
+
+        // Tile y ∈ [128, 192] — far above the band + halo margin.
+        let high =
+            bake_tile(TileKey::level0(0, 2, 0), vs, &fbm, &[], &empty_regions()).expect("bake high");
+        assert_eq!(high.vertex_count(), 0, "tile far above the band must be empty");
+        assert!(
+            high.artifact.halo_cells.is_empty(),
+            "out-of-band tile should skip halo sampling (got {} halo cells)",
+            high.artifact.halo_cells.len(),
+        );
+
+        // Tile y ∈ [0, 64] — straddles the band → real surface + halo.
+        let mid =
+            bake_tile(TileKey::level0(0, 0, 0), vs, &fbm, &[], &empty_regions()).expect("bake mid");
+        assert!(mid.vertex_count() > 0, "tile straddling the band must have surface");
+        assert!(
+            !mid.artifact.halo_cells.is_empty(),
+            "in-band tile must keep its halo for watertight seams",
         );
     }
 
