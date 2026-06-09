@@ -555,6 +555,19 @@ impl ArvxScene {
             return UploadStats::default();
         }
         let needed = data.len() as u64;
+        // Loud guard: a storage buffer bound past
+        // `max_storage_buffer_binding_size` is INVALID — the shader reads
+        // garbage / the bind group fails / the device may fault. As a
+        // scene's pools grow (e.g. terrain streaming many tiles) this is a
+        // hard ceiling that's hit at a specific size, not gradually. If
+        // this fires near a "surface lost", the growing pool is the cause.
+        let max_binding = device.limits().max_storage_buffer_binding_size as u64;
+        if needed > max_binding {
+            eprintln!(
+                "[POOL LIMIT] {label}: {needed} bytes EXCEEDS max_storage_buffer_binding_size \
+                 {max_binding} — this binding is now invalid (GPU may fault / surface may drop)",
+            );
+        }
         // After any path below, `[0, data.len())` is resident on the GPU.
         let prev_valid = (*valid_bytes).min(needed);
         *valid_bytes = needed;
