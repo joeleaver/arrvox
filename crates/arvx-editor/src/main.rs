@@ -277,14 +277,39 @@ fn main() -> anyhow::Result<()> {
         // Frame callback: route each viewport's pixels to its writer.
         // Unknown viewport ids are silently dropped (defensive — the
         // engine only emits MAIN/BUILD today).
-        Box::new(move |viewport_id, pixels, w, h| {
-            use arvx_engine::viewport::ViewportId;
-            if viewport_id == ViewportId::MAIN {
-                main_surface_writer.submit_frame(pixels, w, h);
-            } else if viewport_id == ViewportId::BUILD {
-                build_surface_writer.submit_frame(pixels, w, h);
-            }
-        }),
+        //
+        // Diagnostic: log when a viewport's pixel dimensions CHANGE. A
+        // viewport resize forces the surface to reconfigure, the classic
+        // wgpu `Outdated`/surface-lost trigger — if the "surface lost"
+        // flood starts right after a `[viewport] … resized` line, the
+        // layout reflow (e.g. the inspector populating on terrain-select)
+        // is the culprit, not a CPU stall.
+        {
+            let main_last_size = std::cell::Cell::new((0u32, 0u32));
+            let build_last_size = std::cell::Cell::new((0u32, 0u32));
+            Box::new(move |viewport_id, pixels: &[u8], w, h| {
+                use arvx_engine::viewport::ViewportId;
+                if viewport_id == ViewportId::MAIN {
+                    let prev = main_last_size.replace((w, h));
+                    if prev.0 != 0 && prev != (w, h) {
+                        eprintln!(
+                            "[viewport] MAIN resized {}x{} -> {}x{} (surface reconfigure)",
+                            prev.0, prev.1, w, h
+                        );
+                    }
+                    main_surface_writer.submit_frame(pixels, w, h);
+                } else if viewport_id == ViewportId::BUILD {
+                    let prev = build_last_size.replace((w, h));
+                    if prev.0 != 0 && prev != (w, h) {
+                        eprintln!(
+                            "[viewport] BUILD resized {}x{} -> {}x{}",
+                            prev.0, prev.1, w, h
+                        );
+                    }
+                    build_surface_writer.submit_frame(pixels, w, h);
+                }
+            })
+        },
         // State callback: push engine state to EditorStore signals (cross-thread).
         {
             let store = store;
