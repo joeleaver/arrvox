@@ -45,9 +45,10 @@ struct TlasState {
 // ..., 27). Standard Morton "expand" via shift+mask. 10 bits caps
 // the per-axis quantization at 1024 buckets, which is plenty for
 // scene-coherent BVH ordering — finer is nice-to-have but the
-// tree builder doesn't depend on key uniqueness within a bucket
-// (radix sort is stable; ties retain prim_idx order as a
-// secondary key).
+// tree builder doesn't depend on key uniqueness within a bucket:
+// the radix sort is stable (a hard requirement, see
+// tlas_radix_sort.wesl module doc) so ties retain prim_idx order,
+// and Karras' delta() tiebreaks equal keys on index.
 fn expand_bits_10(v_in: u32) -> u32 {
     var v = v_in & 0x3FFu;
     v = (v | (v << 16u)) & 0x030000FFu;

@@ -355,8 +355,24 @@ fn propagate_atomic_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // ancestor's atomic accumulator. atomicMin/Max are commutative
     // — final accumulator value is correct regardless of which
     // leaf gets there first.
+    //
+    // HOP CAP — defense in depth against a corrupt `parents[]`
+    // graph. A legitimate root walk visits at most `total_nodes`
+    // distinct nodes, so exceeding that many hops PROVES a cycle;
+    // without the cap this loop's only exit is the sentinel, and a
+    // cyclic graph parks the thread in an infinite, fully-in-bounds
+    // loop — non-preemptible GPU work that froze the whole desktop
+    // (NVRM Xid 109 CTX SWITCH TIMEOUT). The cycle source was the
+    // non-stable radix scatter feeding Karras unsorted keys (fixed
+    // in tlas_radix_sort.wesl; pinned by tests/tlas_sort_stability
+    // .rs) — under sorted input "each child has exactly one parent"
+    // holds and the cap never fires; it costs one add + compare per
+    // hop and guarantees no future parents[] corruption, whatever
+    // its source, can hang the device again.
+    let total_nodes = 2u * n - 1u;
     let leaf_node_idx = n - 1u + i;
     var cur = leaf_node_idx;
+    var hops = 0u;
     loop {
         let parent = parents[cur];
         if (parent == PARENT_SENTINEL) { return; }
@@ -367,6 +383,8 @@ fn propagate_atomic_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicMax(&aabb_max_atomic[parent * 3u + 1u], key_max_y);
         atomicMax(&aabb_max_atomic[parent * 3u + 2u], key_max_z);
         cur = parent;
+        hops = hops + 1u;
+        if (hops > total_nodes) { return; }
     }
 }
 

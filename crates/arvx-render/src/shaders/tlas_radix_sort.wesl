@@ -5,10 +5,27 @@
 // fires count → scan → scatter four times (digit shifts 0, 8, 16,
 // 24), swapping the (keys_in/keys_out, vals_in/vals_out) bind
 // group between passes. After the fourth scatter the (key, val)
-// pairs are sorted ascending by full 32-bit Morton; ties within
-// the same digit may permute (V1 uses non-stable scatter via
-// per-bucket atomic counters), but Karras tree construction
-// tolerates non-strict tie ordering.
+// pairs are sorted ascending by full 32-bit Morton.
+//
+// EVERY pass MUST be stable (preserve the input order of elements
+// with equal digits): LSD radix sort *derives* global sortedness
+// from per-pass stability — pass k only orders by digit k, and
+// relies on lower digits already being in order for keys whose
+// digit k ties. A non-stable pass reorders DISTINCT keys that
+// share their higher digits, and no later pass ever re-compares
+// them, so the final output is NOT globally sorted. The original
+// V1 scatter claimed slots with a per-(WG, bucket) `atomicAdd`
+// (non-deterministic thread order = non-stable) on the incorrect
+// theory that only tie ordering was affected; the unsorted output
+// violated the Karras builder's sorted-keys precondition, which
+// produced cyclic `parents[]` graphs, which made
+// `propagate_atomic_main`'s walk-up loop spin forever — the
+// whole-desktop NVRM "Xid 109 CTX SWITCH TIMEOUT" GPU hang at
+// ~15-20 resident terrain tiles (grid-clustered tile centroids
+// maximize shared-high-bit Morton keys, the exact pattern the
+// instability corrupts). Pinned by
+// `tests/tlas_sort_stability.rs`, which runs this chain on a real
+// adapter and asserts sortedness + parents[] acyclicity.
 //
 // ## Shared layout
 //
@@ -25,10 +42,10 @@
 //   `[wg_idx × 256 + digit]`.
 // * `scan_offsets`  — `array<atomic<u32>>` of length
 //   `num_workgroups × 256`. `scan_main` writes per-WG-per-bucket
-//   starting offsets; `scatter_main` atomic-adds into them as it
-//   places elements (cheap "next-offset" cursor; the array is
-//   consumed by the scatter and re-written by the next pass's
-//   scan).
+//   starting offsets; `scatter_main` reads them as immutable bases
+//   and adds each element's stable in-workgroup rank (the array is
+//   re-written by the next pass's scan). Kept `atomic` only to
+//   avoid a bind-group-layout change from the V1 cursor design.
 // * `u: RadixUniform`  — `prim_count`, `digit_shift`,
 //   `num_workgroups`. Engine bumps `digit_shift` by 8 between
 //   passes.
@@ -143,18 +160,25 @@ fn scan_main(@builtin(local_invocation_index) lid: u32) {
     }
 }
 
-// ── Pass 3 — scatter ───────────────────────────────────────────────
+// ── Pass 3 — scatter (STABLE) ──────────────────────────────────────
 //
-// Each thread reads its (key, val), computes the bucket digit,
-// atomic-bumps `scan_offsets[wg, digit]` to claim a slot, and
-// writes the pair to that slot in `keys_out` / `vals_out`.
+// Each thread reads its (key, val), computes the bucket digit, and
+// derives its destination DETERMINISTICALLY:
 //
-// Within a WG-bucket, the order of writes is non-deterministic
-// (atomic order across threads in a workgroup is not specified by
-// WGSL). Across WG-buckets the layout is exact (per-bucket runs
-// are contiguous). For the Karras tree builder this is enough —
-// it depends on Mortons being globally sorted, not on stable
-// tie-breaking.
+//   dst = scan_offsets[wg, digit]            (this WG's global base
+//                                             for this bucket)
+//       + stable_rank                        (count of earlier
+//                                             same-digit elements
+//                                             in this workgroup)
+//
+// `scan_main` already lays out per-(WG, bucket) runs contiguously
+// in workgroup order, so input order is preserved both across and
+// within workgroups — the pass is stable, which the LSD sort's
+// correctness requires (see module doc). The rank loop re-reads up
+// to WG_SIZE_COUNT_SCATTER-1 keys from storage; at TLAS prim
+// counts (tens to low thousands) this is noise. If prim counts
+// ever grow to the 4 M scan cap, replace with a workgroup-shared
+// prefix sum over per-digit match masks — keep it stable.
 
 @compute @workgroup_size(64, 1, 1)
 fn scatter_main(
@@ -168,7 +192,14 @@ fn scatter_main(
     let key = keys_in[i];
     let val = vals_in[i];
     let digit = (key >> u.digit_shift) & 0xFFu;
-    let off = atomicAdd(&scan_offsets[wg.x * RADIX_BUCKETS + digit], 1u);
+    let wg_base = wg.x * WG_SIZE_COUNT_SCATTER;
+    var rank: u32 = 0u;
+    for (var j: u32 = wg_base; j < i; j = j + 1u) {
+        if (((keys_in[j] >> u.digit_shift) & 0xFFu) == digit) {
+            rank = rank + 1u;
+        }
+    }
+    let off = atomicLoad(&scan_offsets[wg.x * RADIX_BUCKETS + digit]) + rank;
     keys_out[off] = key;
     vals_out[off] = val;
 }
