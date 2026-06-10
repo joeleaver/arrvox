@@ -2029,6 +2029,14 @@ impl ReadbackRing {
         self.pending.iter().any(|p| p.is_none())
     }
 
+    /// Number of readback slots currently awaiting a `map_async`
+    /// completion (0..=3). Diagnostic only: the render-thread
+    /// backpressure-stall probe logs this to show whether `poll`/`drain`
+    /// is making progress when the gate wedges.
+    pub fn pending_count(&self) -> usize {
+        self.pending.iter().filter(|p| p.is_some()).count()
+    }
+
     /// After submit, kick off `map_async` on the buffer that was just
     /// written. Buffer state goes from idle → in-flight; later
     /// `drain_completed` will read it back and return it to idle.

@@ -72,6 +72,19 @@ pub(super) fn run_render_thread(
     // EMA value for that one frame).
     let mut prev_render_start: Option<std::time::Instant> = None;
 
+    // ── Backpressure-gate stall probe ──
+    // The render thread can only go *permanently silent* (no `[render]`
+    // lines, no frames shipped → rinch surface goes Outdated) by
+    // spinning in the GPU-backpressure gate below: every MAIN readback
+    // slot stays pending and the `continue` never logs. These track how
+    // long we've been stalled; an abnormal (>50 ms) stall logs a
+    // `[render-stall]` canary so a GPU-side wedge is attributable from
+    // the log alone (this is how the Xid-109 TLAS hang was localized).
+    // Pure observation — no behavior change.
+    let mut bp_stall_start: Option<std::time::Instant> = None;
+    let mut bp_spins: u64 = 0;
+    let mut bp_last_log: Option<std::time::Instant> = None;
+
     // Per-scope rolling sample buffer for the [render.gpu.percentiles]
     // diagnostic dump. Bounded to PERCENTILE_WINDOW; oldest sample
     // drops when full. Costs ~PERCENTILE_WINDOW × 4 B × scope_count
@@ -148,14 +161,86 @@ pub(super) fn run_render_thread(
             .map(|vr| vr.readback.has_idle_slot())
             .unwrap_or(true);
         if !main_has_slot {
-            // Don't spin — sleep long enough to let in-flight
-            // map_asyncs complete on whatever cadence the GPU offers,
-            // but short enough not to add perceptible latency once
-            // the GPU frees a slot. 500 µs is well under a 60 Hz
-            // frame budget and well over the cost of a context
-            // switch.
-            std::thread::sleep(std::time::Duration::from_micros(500));
+            bp_spins += 1;
+            let now = std::time::Instant::now();
+            let started = *bp_stall_start.get_or_insert(now);
+            // Surface-lost canary: only ABNORMAL stalls (>50 ms). Healthy
+            // GPU backpressure clears in a few ms; the wedge this fixes
+            // climbed for seconds. Rate-limited to every ~250 ms.
+            let stalled_ms = now.duration_since(started).as_secs_f32() * 1000.0;
+            if stalled_ms > 50.0 {
+                let due = bp_last_log
+                    .map(|t| now.duration_since(t).as_millis() >= 250)
+                    .unwrap_or(true);
+                if due {
+                    bp_last_log = Some(now);
+                    let pending = state
+                        .viewport_renderers
+                        .get(&crate::viewport::ViewportId::MAIN)
+                        .map(|vr| vr.readback.pending_count())
+                        .unwrap_or(0);
+                    eprintln!(
+                        "[render-stall] backpressure: no idle MAIN slot for {:.0}ms \
+                         ({} spins) pending={}/3 — render thread cannot ship",
+                        stalled_ms, bp_spins, pending,
+                    );
+                }
+            }
+            // Block until the GPU signals the in-flight readbacks complete,
+            // delivering their `map_async` callbacks. A non-blocking
+            // `PollType::Poll` does NOT advance those callbacks once we
+            // stop submitting frames — with no new submission to drive the
+            // device timeline forward, the three pending readbacks never
+            // complete, `has_idle_slot()` stays false, and this gate wedges
+            // FOREVER (observed: a terrain-gen bake burst pushed the render
+            // thread into the gate; it then spun for 4.5 s+ at pending=3/3,
+            // never shipping a frame → rinch's window surface went Outdated
+            // → #42's missing reconfigure made the dead viewport permanent).
+            // `wait_indefinitely` is the same blocking idiom the proc
+            // readbacks use; the next iteration's poll+drain frees the slot.
+            //
+            // PROBE: log on entry to the blocking wait (once per stall
+            // episode) and again if a single wait runs long. If the last
+            // render-thread line in the log is "→ wait_indefinitely" with
+            // no following "wait returned" / "[render-stall] recovered",
+            // the GPU work behind the readbacks never completed and the
+            // device itself is wedged (that signature localized the
+            // Xid-109 TLAS hang).
+            let fresh_stall = bp_spins == 1;
+            if fresh_stall {
+                let pending = state
+                    .viewport_renderers
+                    .get(&crate::viewport::ViewportId::MAIN)
+                    .map(|vr| vr.readback.pending_count())
+                    .unwrap_or(0);
+                eprintln!(
+                    "[render-gate] stall begin → wait_indefinitely (pending={pending}/3)"
+                );
+            }
+            let wait_t0 = std::time::Instant::now();
+            let _ = state.device.poll(wgpu::PollType::wait_indefinitely());
+            let wait_ms = wait_t0.elapsed().as_secs_f32() * 1000.0;
+            if wait_ms > 100.0 {
+                eprintln!("[render-gate] wait_indefinitely returned after {wait_ms:.0}ms");
+            }
             continue;
+        }
+        // Recovered from an abnormal (>50 ms) stall — pair the canary so a
+        // wedge that the fix did NOT cover stands out as a backpressure
+        // line with no matching recovery.
+        if let Some(started) = bp_stall_start.take() {
+            let stalled_ms = std::time::Instant::now()
+                .duration_since(started)
+                .as_secs_f32()
+                * 1000.0;
+            if stalled_ms > 50.0 {
+                eprintln!(
+                    "[render-stall] recovered after {:.0}ms ({} spins)",
+                    stalled_ms, bp_spins,
+                );
+            }
+            bp_spins = 0;
+            bp_last_log = None;
         }
 
         // We are about to render a real frame. Compute the dt back
