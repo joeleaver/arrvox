@@ -26,6 +26,13 @@ pub struct BakedTile {
     /// Surface mesh + cluster DAG, ready for the v6 `.arvx` mesh sections
     /// (or for direct GPU upload at integrate-time).
     pub mesh: MeshSectionsBlob,
+    /// LOD-0 index count of the SURFACE only — `mesh.lod0_index_count`
+    /// captured before the back-culled lateral skirts were appended. The
+    /// per-tile physics collider snapshots this prefix instead of the full
+    /// `lod0_index_count` so bodies don't snag on the invisible skirt walls
+    /// at tile seams. Equals `mesh.lod0_index_count` when no skirts were
+    /// appended (`skirt_depth_m == 0`).
+    pub surface_index_count: u32,
     /// Wall time of the bake in milliseconds (voxelize + mesh + DAG).
     pub bake_time_ms: f32,
 }

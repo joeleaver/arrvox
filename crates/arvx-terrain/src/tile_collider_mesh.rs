@@ -49,20 +49,27 @@ impl TileColliderMesh {
         self.triangles.is_empty()
     }
 
-    /// Snapshot LOD-0 positions + indices from a baked
-    /// [`MeshSectionsBlob`].
+    /// Snapshot the LOD-0 surface from a baked [`MeshSectionsBlob`], using
+    /// the full `lod0_index_count`. Prefer [`Self::from_mesh_blob_prefix`]
+    /// with the surface-only count for terrain — the lateral skirts are
+    /// folded into `lod0_index_count` but are back-culled (never drawn), so
+    /// including them gives bodies invisible walls to snag on.
+    pub fn from_mesh_blob(mesh: &MeshSectionsBlob) -> Self {
+        Self::from_mesh_blob_prefix(mesh, mesh.lod0_index_count)
+    }
+
+    /// Snapshot the first `index_count` LOD-0 indices into a collider mesh.
     ///
     /// Vertex stride is 32 B (matches arvx's `MeshVertex` layout —
-    /// `CLAUDE.md` "Key Data Types"); the first 12 B are the f32
-    /// position. Index stride is 4 B (u32). `lod0_index_count`
-    /// caps the index iteration so higher-LOD chains never bleed
-    /// into the collider (which would create overlapping triangles
-    /// at LOD seams).
-    pub fn from_mesh_blob(mesh: &MeshSectionsBlob) -> Self {
+    /// `CLAUDE.md` "Key Data Types"); the first 12 B are the f32 position.
+    /// Index stride is 4 B (u32). `index_count` caps the iteration so neither
+    /// higher-LOD chains nor the back-culled lateral skirts (a suffix of the
+    /// LOD-0 range) bleed into the collider. Pass `BakedTile::surface_index_count`.
+    pub fn from_mesh_blob_prefix(mesh: &MeshSectionsBlob, index_count: u32) -> Self {
         const VERTEX_STRIDE: usize = 32;
         const INDEX_STRIDE: usize = 4;
 
-        let lod0_n = mesh.lod0_index_count as usize;
+        let lod0_n = (index_count as usize).min(mesh.indices.len() / INDEX_STRIDE);
         if lod0_n < 3 || lod0_n % 3 != 0 {
             return Self {
                 vertices: Vec::new(),

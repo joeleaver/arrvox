@@ -129,13 +129,23 @@ pub fn bake_tile_with_skirts(
     // it even at the coarsest voxel size in a tile.
     let envelope_floor = world_floor_y.map(|f| f + 2.0 * voxel_size_m);
 
-    // Analytic gradient is only valid where the emitted height is the
-    // RAW TerrainFn value. Stamps, biome regions, and the world-envelope
-    // clamp all post-modify `h`, so the base-FBM gradient would no longer
-    // describe the surface — fall back to the voxelizer's 6-tap finite
-    // difference for any tile that has them. Pure-FBM tiles (the common
-    // case) get exact analytic normals + distances and skip the taps.
-    let use_analytic_grad =
+    // The analytic FBM gradient describes the surface wherever the emitted
+    // height is the RAW TerrainFn value. Only two things warp the height:
+    // a stamp touching a column, and the world-envelope clamp lifting a
+    // sub-floor trough. Both are decided PER SAMPLE below — `grad` (the
+    // voxelizer's per-leaf normal/distance) and the shading normal fall
+    // back to finite-difference / ∇D only at the warped samples, NOT per
+    // tile. The old whole-tile gate forced every tile of a Bounded terrain
+    // (which always has a floor) onto the inaccurate FD+∇D path — even
+    // peak tiles nowhere near the floor — which is the "default terrain
+    // looks rough" bug. Biome regions only override MATERIAL, never height,
+    // so they never disqualify the analytic gradient.
+    //
+    // `can_cull_halo`: the empty-sky/underground halo-skip optimisation
+    // below stays gated on a whole-tile guarantee — it needs the surface to
+    // be provably inside the FBM band, which stamps and the envelope clamp
+    // can break, so the conservative tile-wide test is kept there only.
+    let can_cull_halo =
         stamps.is_empty() && regions.is_empty() && envelope_floor.is_none();
 
     // SDF callback: receives a batch of absolute-world positions from
@@ -153,6 +163,11 @@ pub fn bake_tile_with_skirts(
                 let wy = world_pos.y;
                 let mut h = wy - s.sd;
                 let mut mat_override: Option<u16> = None;
+                // Set when a stamp or the envelope clamp warps this column's
+                // height away from the raw FBM value, so the base-FBM
+                // gradient no longer describes the surface here → fall the
+                // per-leaf normal/distance back to the voxelizer's 6-tap FD.
+                let mut height_warped = false;
 
                 // Layer 2 — heightmap-style stamps. The V2 stamp
                 // API returns `(target_h, weight)`; we blend the
@@ -175,6 +190,7 @@ pub fn bake_tile_with_skirts(
                             // Lerp(h, combined, weight). weight = 1
                             // reproduces V1 behaviour exactly.
                             h = h + (combined - h) * sample.weight;
+                            height_warped = true;
                             if let Some(m) = stamp.material_override {
                                 mat_override = Some(m);
                             }
@@ -193,6 +209,7 @@ pub fn bake_tile_with_skirts(
                 if let Some(floor_h) = envelope_floor {
                     if h < floor_h {
                         h = floor_h;
+                        height_warped = true;
                     }
                 }
 
@@ -216,9 +233,10 @@ pub fn bake_tile_with_skirts(
 
                 let blend_u4 = (s.blend.clamp(0.0, 1.0) * 15.0).round() as u8;
                 // Exact analytic ∇sd (from the single sample_with_grad
-                // walk) on pure-FBM tiles; `None` (6-tap FD) when
-                // stamps/regions/envelope warped the height above.
-                let grad = if use_analytic_grad { base_grad } else { None };
+                // walk) wherever this column's height is the raw FBM value;
+                // `None` (→ 6-tap FD) only at the samples a stamp or the
+                // envelope clamp actually warped.
+                let grad = if height_warped { None } else { base_grad };
                 (s.sd, s.primary_mat, s.secondary_mat, blend_u4, 0, grad)
             })
             .collect()
@@ -242,7 +260,7 @@ pub fn bake_tile_with_skirts(
     // stays watertight.
     let halo = {
         let mut h = TILE_HALO_VOXELS;
-        if use_analytic_grad {
+        if can_cull_halo {
             if let Some((lo, hi)) = terrain_fn.surface_y_bounds() {
                 let margin = TILE_HALO_VOXELS as f32 * voxel_size_m;
                 if aabb.min.y > hi + margin || aabb.max.y < lo - margin {
@@ -260,25 +278,45 @@ pub fn bake_tile_with_skirts(
     // it as `brick_id * BRICK_CELLS + flat`.
     let brick_pool_flat: Vec<u32> = artifact.brick_cells.iter().flatten().copied().collect();
 
-    // Exact analytic SHADING NORMAL: evaluate the TerrainFn's `∇sd` AT
-    // THE VERTEX (the "derive the normal from the field" approach), so
-    // the per-leaf accuracy from the analytic gradient actually reaches
-    // shading — no grid reconstruction, no `∇D` relief loss. Only on
-    // pure-procedural tiles (`use_analytic_grad`): stamps / regions /
-    // the world-envelope clamp warp the height, so the base gradient no
-    // longer describes the surface there and the mesher falls back to
-    // its interpolated `∇D`. Generalizes to 3D-SDF terrain unchanged
-    // (`sample_grad` returns `∇sd` either way). Pure function of world
-    // position ⇒ adjacent tiles agree at the seam.
+    // Exact analytic SHADING NORMAL: evaluate the TerrainFn's `∇sd` AT THE
+    // VERTEX (the "derive the normal from the field" approach), so the
+    // per-leaf accuracy from the analytic gradient actually reaches shading
+    // — no grid reconstruction, no `∇D` relief loss. The closure decides
+    // PER VERTEX whether the analytic normal is valid; where it isn't, it
+    // returns the zero vector, which the mesher reads as "fall back to the
+    // interpolated `∇D` normal here" (see `build_cube_vertex`'s `normal_fn`
+    // contract). Pure function of world position ⇒ adjacent tiles agree at
+    // the seam (watertight). Generalizes to 3D-SDF terrain unchanged
+    // (`sample_grad` returns `∇sd` either way).
     let analytic_normal = |p_world: Vec3| -> Vec3 {
         let local = p_world - tile_origin_world;
-        terrain_fn.sample_grad(key, local, voxel_size_m).unwrap_or(Vec3::Y)
+        // Stamp-touched column → warped (non-FBM) surface with no analytic
+        // gradient → `∇D` fallback (zero vector).
+        if !stamps.is_empty()
+            && stamps
+                .iter()
+                .any(|s| s.sample_height(p_world.x, p_world.z).is_some())
+        {
+            return Vec3::ZERO;
+        }
+        // One walk yields both the raw FBM height (for the clamp test) and
+        // the analytic `∇sd`. `sd = query_y − h_fbm`, so `h_fbm` recovers
+        // exactly from any query y, independent of the vertex's own y.
+        let (s, g) = terrain_fn.sample_with_grad(key, local, voxel_size_m);
+        // Where the envelope clamp lifts the surface to the flat floor, the
+        // true normal is straight up — not the (steep) FBM gradient.
+        if let Some(floor_h) = envelope_floor {
+            if p_world.y - s.sd < floor_h {
+                return Vec3::Y;
+            }
+        }
+        // Pure-FBM column → exact field normal. A TerrainFn with no analytic
+        // gradient (`g == None`) returns the zero vector → `∇D` fallback.
+        g.unwrap_or(Vec3::ZERO)
     };
-    let surface_normal_fn: Option<&dyn Fn(Vec3) -> Vec3> = if use_analytic_grad {
-        Some(&analytic_normal)
-    } else {
-        None
-    };
+    // Always supplied: the closure itself picks analytic vs `∇D`-fallback
+    // per vertex.
+    let surface_normal_fn: Option<&dyn Fn(Vec3) -> Vec3> = Some(&analytic_normal);
 
     // Mesh the tile through the QEF-Hermite path. Watertight across tile
     // seams: the per-leaf distance + the analytic normal are pure local
@@ -302,6 +340,14 @@ pub fn bake_tile_with_skirts(
         surface_normal_fn,
     );
 
+    // Surface-only LOD-0 index count, captured BEFORE the skirts are
+    // appended. The skirts (next) are folded into `mesh.lod0_index_count` as
+    // a suffix, but they are deliberately back-culled and never drawn — so a
+    // collider built from the full `lod0_index_count` would snag bodies on
+    // invisible vertical curtain walls at every tile seam. The collider uses
+    // this surface-only prefix instead.
+    let surface_index_count = mesh.lod0_index_count;
+
     // V2 LOD pyramid: append lateral skirts so LOD-band cracks aren't
     // see-through. Edge-stitched quads with sculpt-aware per-face depth
     // (drops to span the local height delta if it exceeds the baseline).
@@ -319,6 +365,7 @@ pub fn bake_tile_with_skirts(
         voxel_size_m,
         artifact,
         mesh,
+        surface_index_count,
         bake_time_ms: t0.elapsed().as_secs_f32() * 1000.0,
     })
 }
@@ -991,21 +1038,26 @@ mod tests {
         (if n > 0 { sum / n as f32 } else { 0.0 }, n)
     }
 
-    /// **G3 — pure-FBM tiles bake EXACT per-leaf normals via the analytic
-    /// gradient, and beat the finite-difference path.** Bake the same
-    /// steep-FBM surface two ways: pure (`stamps`/`regions`/envelope all
-    /// empty → analytic gradient) and with a world floor far below the
-    /// tile (never clamps the height, so the surface is identical, but
-    /// trips the envelope gate → 6-tap finite difference). The analytic
-    /// bake's stored normals track the true surface markedly better.
+    /// **G3 / per-sample-gate regression — a Bounded (floored) tile bakes
+    /// the SAME exact analytic per-leaf normals as the unfloored tile,
+    /// everywhere the floor doesn't actually clamp.** This is the "default
+    /// terrain looks rough" fix: a Bounded terrain always carries a world
+    /// floor, and the OLD whole-tile gate forced every such tile onto the
+    /// inaccurate 6-tap finite-difference path. The fix decides per sample,
+    /// so an above-floor surface keeps its exact analytic gradient even
+    /// with a floor present. Bake the same steep-FBM surface two ways —
+    /// unfloored (`bake_tile` → `None`) and floored at y=0 (the editor's
+    /// default, `Some(0.0)`, which never clamps this base-32 surface) — and
+    /// assert both track the true surface to the octahedral-pack floor.
     #[test]
-    fn analytic_gradient_makes_leaf_normals_track_the_fbm_surface() {
+    fn floored_tile_keeps_analytic_normals_above_the_clamp() {
         use crate::fbm::FbmTerrainFnResolved;
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0); // 0.25 m
         let key = TileKey::level0(0, 0, 0);
-        // Steep FBM (amp/scale ≈ 0.67) → high curvature, so the FD bias
-        // is unambiguous; base 32 keeps the surface inside the tile's y.
+        // Steep FBM (amp/scale ≈ 0.67) → high curvature, so any FD bias
+        // would be unambiguous; base 32 keeps the surface (≈[12, 52] m)
+        // inside the tile's y and well above the y=0 floor.
         let fbm = FbmTerrainFnResolved {
             scale_m: 30.0,
             amplitude_m: 20.0,
@@ -1014,71 +1066,87 @@ mod tests {
         };
         let octs = fbm.octaves_for_voxel(vs);
 
-        // Analytic (pure FBM → use_analytic_grad = true).
-        let analytic = bake_tile(key, vs, &fbm, &[], &empty_regions()).expect("analytic bake");
-        // Identical surface, but the envelope gate forces the FD path.
-        let fd =
-            bake_tile_with_skirts(key, vs, &fbm, &[], &empty_regions(), 0.0, Some(-1.0e6))
-                .expect("fd bake");
+        // Unfloored (Unbounded-style) bake → analytic.
+        let unfloored = bake_tile(key, vs, &fbm, &[], &empty_regions()).expect("unfloored bake");
+        // Floored bake = the editor's default Bounded terrain. The floor at
+        // y=0 never clamps this above-floor surface, so the PER-SAMPLE gate
+        // keeps the analytic gradient — the old per-tile gate did not.
+        let floored =
+            bake_tile_with_skirts(key, vs, &fbm, &[], &empty_regions(), 0.0, Some(0.0))
+                .expect("floored bake");
 
-        let (an_err, an_n) = mean_halo_leaf_normal_error(&analytic, &fbm, octs);
-        let (fd_err, fd_n) = mean_halo_leaf_normal_error(&fd, &fbm, octs);
-        assert!(an_n > 50 && fd_n > 50, "need enough halo surface leaves (an {an_n}, fd {fd_n})");
+        let (un_err, un_n) = mean_halo_leaf_normal_error(&unfloored, &fbm, octs);
+        let (fl_err, fl_n) = mean_halo_leaf_normal_error(&floored, &fbm, octs);
+        assert!(un_n > 50 && fl_n > 50, "need enough halo surface leaves (un {un_n}, fl {fl_n})");
 
         eprintln!(
-            "[G3] mean per-leaf normal error vs analytic surface (at cell center): \
-             analytic={:.4}°  fd={:.4}°  (ratio {:.2})",
-            an_err.to_degrees(),
-            fd_err.to_degrees(),
-            an_err / fd_err.max(1e-9),
+            "[gate] mean per-leaf normal error vs analytic surface (at cell center): \
+             unfloored={:.4}°  floored={:.4}°",
+            un_err.to_degrees(),
+            fl_err.to_degrees(),
         );
 
-        // Analytic normals are far closer to the true surface than FD.
+        // Both near the octahedral-pack floor (<0.05°) + the FBM's own
+        // sub-cell curvature — i.e. the floored editor path is no longer
+        // the rough FD path.
         assert!(
-            an_err < fd_err * 0.7,
-            "analytic ({:.4}°) should beat FD ({:.4}°) by ≥30%",
-            an_err.to_degrees(),
-            fd_err.to_degrees(),
+            un_err.to_degrees() < 0.5 && fl_err.to_degrees() < 0.5,
+            "both paths should track the surface to the pack floor; \
+             got unfloored {:.4}° / floored {:.4}°",
+            un_err.to_degrees(),
+            fl_err.to_degrees(),
         );
-        // And accurate in absolute terms: at the cell center the only
-        // residual is octahedral packing (<0.05°) plus the FBM's own
-        // sub-cell curvature.
+        // The floor presence must not degrade accuracy above the clamp.
         assert!(
-            an_err.to_degrees() < 0.5,
-            "analytic mean per-leaf normal error should be near the pack floor; got {:.4}°",
-            an_err.to_degrees(),
+            (fl_err - un_err).to_degrees().abs() < 0.1,
+            "floored path should match unfloored above the clamp; \
+             unfloored {:.4}° vs floored {:.4}°",
+            un_err.to_degrees(),
+            fl_err.to_degrees(),
         );
     }
 
-    /// A stamped tile (or any post-modified height) must NOT use the
-    /// analytic gradient — the base-FBM gradient no longer describes the
-    /// warped surface. We can't observe the gate directly, but the FD
-    /// path is what keeps stamped/region/envelope tiles correct, and the
-    /// bake must still succeed and produce a smooth surface. The
-    /// envelope variant (identical surface, FD path) is the proxy: it
-    /// bakes a valid mesh whose stored normals are sign-correct (point
-    /// generally upward on this above-sea surface).
+    /// **A genuinely-clamped column falls back correctly.** Where the
+    /// world-envelope floor actually lifts the FBM surface to the flat
+    /// floor plane, the analytic FBM gradient no longer describes the
+    /// surface, so the bake must fall the per-leaf normal back to finite
+    /// difference (→ ≈ +Y on the flat floor) — NOT emit the steep FBM
+    /// gradient. Set a floor ABOVE the FBM troughs so a large flat region
+    /// is created, and assert the bake succeeds with a substantial set of
+    /// near-vertical-up normals (the flat clamp plane) it would not have
+    /// if it had used the FBM gradient there.
     #[test]
-    fn envelope_tile_falls_back_to_finite_difference_and_still_bakes() {
+    fn clamped_column_falls_back_to_flat_floor_normal() {
         let t = Terrain::default();
         let vs = t.voxel_size_for_level(0);
         let key = TileKey::level0(0, 0, 0);
         let fbm = FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup);
-        // Floor far below the tile → never clamps → identical surface,
-        // but `envelope_floor.is_some()` forces the FD path.
-        let baked =
-            bake_tile_with_skirts(key, vs, &fbm, &[], &empty_regions(), 0.0, Some(-1.0e6))
-                .expect("fd bake");
-        assert!(baked.vertex_count() > 100, "FD bake should still produce a surface");
-        // Up-facing sanity: most LOD-0 leaf normals point above horizontal.
+        // Default FBM surface band ≈ [-8, 40] m. A floor at y = 24 clamps
+        // every column whose FBM height is below ≈24.5 → a big flat plateau
+        // inside the tile (y ∈ [0, 64]).
+        let baked = bake_tile_with_skirts(key, vs, &fbm, &[], &empty_regions(), 0.0, Some(24.0))
+            .expect("clamped bake");
+        assert!(baked.vertex_count() > 100, "clamped bake should still produce a surface");
+
+        // Most leaf normals still point up.
         let attrs = &baked.artifact.leaf_attrs;
         let up = attrs
             .iter()
             .filter(|a| a.normal().normalize_or_zero().y > 0.0)
             .count();
+        assert!(up * 2 > attrs.len(), "most leaf normals up ({up}/{})", attrs.len());
+
+        // The flat clamp plane contributes many near-vertical normals
+        // (y > 0.99). On a pure-FBM surface with this steepness there are
+        // far fewer; their abundance is the fingerprint of the flat floor
+        // produced by the clamp + FD fallback.
+        let flat = attrs
+            .iter()
+            .filter(|a| a.normal().normalize_or_zero().y > 0.99)
+            .count();
         assert!(
-            up * 2 > attrs.len(),
-            "most leaf normals should point upward on an above-sea surface ({up}/{})",
+            flat > attrs.len() / 20,
+            "clamp should create a flat (≈+Y) plateau; only {flat}/{} near-vertical",
             attrs.len(),
         );
     }
@@ -2105,6 +2173,31 @@ mod tests {
         assert!(
             baked_with.mesh.lod0_index_count > baked_without.mesh.lod0_index_count,
             "skirt indices count as LOD-0"
+        );
+        // D5: the collider's surface-only prefix excludes the back-culled
+        // skirts. surface_index_count is the pre-skirt LOD-0 count, so it
+        // equals the no-skirt bake's count and is strictly less than the
+        // with-skirt lod0_index_count.
+        assert_eq!(
+            baked_with.surface_index_count, baked_without.mesh.lod0_index_count,
+            "surface_index_count must be the skirt-free surface count"
+        );
+        assert!(
+            baked_with.surface_index_count < baked_with.mesh.lod0_index_count,
+            "surface_index_count must exclude the appended skirt indices"
+        );
+        // The collider built from the surface prefix has no skirt triangles;
+        // the full-lod0 collider does → strictly fewer surface triangles.
+        let surf = crate::TileColliderMesh::from_mesh_blob_prefix(
+            &baked_with.mesh,
+            baked_with.surface_index_count,
+        );
+        let full = crate::TileColliderMesh::from_mesh_blob(&baked_with.mesh);
+        assert!(
+            surf.triangles.len() < full.triangles.len(),
+            "surface-prefix collider must drop the skirt triangles ({} vs {})",
+            surf.triangles.len(),
+            full.triangles.len(),
         );
     }
 

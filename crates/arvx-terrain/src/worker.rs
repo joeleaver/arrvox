@@ -253,13 +253,20 @@ fn worker_loop(
                     match read_baked_tile(p) {
                         Ok((artifact, mesh, vs)) => {
                             // Loaded from cache — not freshly baked, so no
-                            // write-through.
+                            // write-through. The `.arvxtile` format does not
+                            // (yet) persist the surface/skirt split, so the
+                            // collider falls back to the full lod0 prefix for
+                            // cached tiles — same as before this fix. Persisting
+                            // surface_index_count is a follow-up (ties into the
+                            // audit's Phase-3 v7-writer routing).
+                            let surface_index_count = mesh.lod0_index_count;
                             return (
                                 Some(BakedTile {
                                     key,
                                     artifact,
                                     mesh,
                                     voxel_size_m: vs,
+                                    surface_index_count,
                                     bake_time_ms: 0.0,
                                 }),
                                 false,

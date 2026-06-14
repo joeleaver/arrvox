@@ -254,14 +254,18 @@ impl super::state::EngineState {
             artifact,
             mesh,
             voxel_size_m,
+            surface_index_count,
             ..
         } = baked;
 
         // Phase 8: snapshot the LOD-0 triangle data so the play-mode
         // physics path can build a Rapier TriMesh later. Reading
         // before `mesh` moves into `sm.integrate_baked_tile` because
-        // the scene manager consumes the blob.
-        let collider_mesh = arvx_terrain::TileColliderMesh::from_mesh_blob(&mesh);
+        // the scene manager consumes the blob. Use the SURFACE-only index
+        // count (skirts are folded into lod0 but back-culled / never drawn,
+        // so a full-lod0 collider would snag bodies on invisible seam walls).
+        let collider_mesh =
+            arvx_terrain::TileColliderMesh::from_mesh_blob_prefix(&mesh, surface_index_count);
         let synthetic_path = PathBuf::from(format!(
             "terrain://{}_{}_{}_{}",
             key.level, key.x, key.y, key.z
