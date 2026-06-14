@@ -105,6 +105,8 @@ pub(super) fn encode_viewports(
         // PCF tap count comes from the Shadow Quality preset; the
         // shade shader clamps 1..16 internally.
         shade_params.pcf_taps = frame.shadow_csm_pcf_taps;
+        // Diagnostic G-buffer debug view (ARVX_DEBUG_VIEW); 0 in normal use.
+        shade_params.debug_view = arvx_render::arvx_shade::debug_view_from_env();
         state
             .renderer
             .update_shade_params(&state.queue, &shade_params);

@@ -11,7 +11,7 @@
 struct ToneMapParams {
     mode: u32,       // 0 = ACES, 1 = AgX
     exposure: f32,   // manual exposure multiplier (default 1.0)
-    _pad0: u32,
+    debug_view: u32, // non-zero ⇒ passthrough (no exposure/tone curve)
     _pad1: u32,
 }
 @group(2) @binding(0) var<uniform> params: ToneMapParams;
@@ -114,6 +114,14 @@ fn main(@builtin(global_invocation_id) pixel: vec3<u32>) {
 
     let coord = vec2<i32>(pixel.xy);
     var hdr = textureLoad(hdr_input, coord, 0).rgb;
+
+    // DIAGNOSTIC: debug-view images are already display-range colours (e.g.
+    // normals mapped to 0..1); skip exposure + tone curve so auto-exposure
+    // doesn't crush them to black. The sRGB swapchain still gamma-encodes.
+    if params.debug_view != 0u {
+        textureStore(ldr_output, coord, vec4<f32>(clamp(hdr, vec3(0.0), vec3(1.0)), 1.0));
+        return;
+    }
 
     // Apply auto-exposure (adapted EV → multiplier) and manual exposure override
     let auto_ev = exposure_data[0];

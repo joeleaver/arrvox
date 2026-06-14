@@ -337,7 +337,9 @@ struct ShadeParams {
     /// 4/9/16 = soft (rotated disc PCF). Driven by the Shadow
     /// Quality preset on the engine side.
     pcf_taps: u32,
-    _pad3: u32,
+    // DIAGNOSTIC G-buffer debug view (0 = normal PBR; 1 = world normal,
+    // 2 = material id hash, 3 = SSAO). Former `_pad3`.
+    debug_view: u32,
 }
 
 // 32-byte storage buffer written by `brush_state.wesl` once per frame

@@ -27,8 +27,11 @@ pub struct ToneMapParams {
     pub mode: u32,
     /// Exposure multiplier (typically 2^EV from auto-exposure).
     pub exposure: f32,
-    #[doc(hidden)]
-    pub _pad0: u32,
+    /// DIAGNOSTIC: when non-zero the tone map is a straight passthrough
+    /// (no exposure, no tone curve), so a `ShadeParams.debug_view` image
+    /// written into the HDR buffer isn't crushed to black by auto-exposure.
+    /// Driven by `ARVX_DEBUG_VIEW` (former `_pad0`).
+    pub debug_view: u32,
     #[doc(hidden)]
     pub _pad1: u32,
 }
@@ -163,7 +166,10 @@ impl ToneMapPass {
         let tone_params = ToneMapParams {
             mode: ToneMapMode::Aces as u32,
             exposure: DEFAULT_EXPOSURE,
-            _pad0: 0,
+            // Static for the process; baking it in at construction means the
+            // per-frame set_mode/set_exposure writes (offsets 0/4) leave it
+            // intact — no per-frame plumbing needed.
+            debug_view: crate::arvx_shade::debug_view_from_env(),
             _pad1: 0,
         };
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -311,7 +317,7 @@ mod tests {
         let p = ToneMapParams {
             mode: 1,
             exposure: 2.5,
-            _pad0: 0,
+            debug_view: 0,
             _pad1: 0,
         };
         let bytes = bytemuck::bytes_of(&p);

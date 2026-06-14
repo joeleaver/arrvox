@@ -105,7 +105,28 @@ pub struct ShadeParams {
     /// Driven by the Shadow Quality preset; clamped to {1,4,9,16}
     /// on the shader side. Zero is treated as 1 for safety.
     pub pcf_taps: u32,
-    pub _pad3: u32,
+    /// DIAGNOSTIC G-buffer debug view (0 = normal PBR). When non-zero the
+    /// shade pass replaces lit geometry with a chosen resolved-G-buffer
+    /// channel so a render-side artifact can be attributed to a specific
+    /// channel: 1 = world normal (RGB), 2 = primary material id (hashed
+    /// colour), 3 = SSAO. Driven by `ARVX_DEBUG_VIEW` via
+    /// [`debug_view_from_env`]; reuses the former `_pad3` slot so the
+    /// uniform stays 128 B.
+    pub debug_view: u32,
+}
+
+/// Parse the `ARVX_DEBUG_VIEW` env var into a [`ShadeParams::debug_view`]
+/// selector, read once per process. `normal`|`1`, `material`|`mat`|`2`,
+/// `ssao`|`ao`|`3`; anything else (incl. unset) ⇒ 0 (normal PBR).
+pub fn debug_view_from_env() -> u32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("ARVX_DEBUG_VIEW").as_deref() {
+        Ok("normal") | Ok("1") => 1,
+        Ok("material") | Ok("mat") | Ok("2") => 2,
+        Ok("ssao") | Ok("ao") | Ok("3") => 3,
+        _ => 0,
+    })
 }
 
 impl Default for ShadeParams {
@@ -131,7 +152,7 @@ impl Default for ShadeParams {
             shadow_map_enabled: 0,
             shadow_disabled: 0,
             pcf_taps: 1,
-            _pad3: 0,
+            debug_view: 0,
         }
     }
 }

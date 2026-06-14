@@ -672,6 +672,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // No geometry → sky.
     if hit_t >= SKY_DEPTH_SENTINEL || hit_t <= 0.0 {
+        // Debug view: black sky so terrain debug colours stand out.
+        if shade_params.debug_view != 0u {
+            textureStore(output, coord, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+            return;
+        }
         if shade_params.isolation != 0u {
             // Isolation: flat neutral background, no sun disc, no sky LUT.
             // The grid pass paints over this for floor pixels.
@@ -704,6 +709,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let primary_mat_id = packed_r & 0xFFFFu;
     let secondary_mat_id = (packed_r >> 16u) & 0xFFFFu;
     let blend_weight = f32(packed_g & 0xFFu) / 255.0;
+
+    // ── DIAGNOSTIC G-BUFFER DEBUG VIEW (debug_view != 0) ──
+    // Replace lit geometry with one resolved-G-buffer channel so a
+    // render-side artifact can be attributed to a specific channel.
+    // Sky pixels already returned above, so this only colours geometry.
+    if shade_params.debug_view != 0u {
+        var dbg = vec3<f32>(1.0, 0.0, 1.0); // magenta = unknown mode
+        if shade_params.debug_view == 1u {
+            dbg = normal * 0.5 + vec3<f32>(0.5); // world normal → RGB
+        } else if shade_params.debug_view == 2u {
+            // Hash the primary material id to a distinct colour: a
+            // scattered different-material cell pops as a colour speck.
+            let h = primary_mat_id * 2654435761u;
+            dbg = vec3<f32>(f32(h & 255u), f32((h >> 8u) & 255u), f32((h >> 16u) & 255u)) / 255.0;
+        } else if shade_params.debug_view == 3u {
+            let ao = textureLoad(ssao_tex, coord / 2, 0).r; // half-res SSAO
+            dbg = vec3<f32>(ao);
+        }
+        textureStore(output, coord, vec4<f32>(dbg, 1.0));
+        return;
+    }
 
     // Resolve material. Metallic/roughness/emission come from the
     // palette; base_color is used for the albedo unless a per-voxel
