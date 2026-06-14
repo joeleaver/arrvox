@@ -1040,7 +1040,17 @@ fn extract_surface_mesh_haloed_impl(
     } else {
         (DENSITY_KERNEL_R, DENSITY_KERNEL_SIGMA, DENSITY_ISO)
     };
-    let density_grids: Option<DensityGrids> = if density_blur {
+    // Skip the (expensive, ~kernel·N³) blur+∇D precompute when it is provably
+    // unused: in QEF mode the topology+position come from sign+stored distance
+    // (`topo_blur == false`), and when the caller supplies an analytic
+    // `surface_normal_fn` the QEF branch takes its shading normal from THAT
+    // (the `unwrap_or(&outward_normal)` below resolves to the analytic fn;
+    // `build_cube_vertex`'s zero-return fallback is the corner-average
+    // `normal_sum`, not `∇D`). So the whole ∇D field is dead on the terrain
+    // bake path. The region/sculpt re-extract passes `surface_normal_fn = None`
+    // → `∇D` IS the shading normal there, so it still computes it.
+    let density_unused_in_qef = use_qef && surface_normal_fn.is_some();
+    let density_grids: Option<DensityGrids> = if density_blur && !density_unused_in_qef {
         // Bounding box of every cell in the map (interior + halo).
         let mut bb_min = IVec3::splat(i32::MAX);
         let mut bb_max = IVec3::splat(i32::MIN);
