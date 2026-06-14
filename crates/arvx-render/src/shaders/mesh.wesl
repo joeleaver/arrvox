@@ -401,46 +401,56 @@ fn frag_main(in: VsOut) -> FsOut {
     // (`mesh_glass.wesl`) capture entry/exit on the same triangles
     // separately and pack into `gbuf_glass` for the composite.
     let inst = instances[instance.object_id];
-    // Sculpt-carve discard (Phase A) — per-pixel resolved.
+
+    // Per-pixel cell resolution. `in.leaf_attr_id` is the FLAT provoking-
+    // vertex slot — one SN-cube corner's cell, shared (winner-take-all)
+    // across every triangle whose provoking vertex sits at that SN-vertex.
+    // Both discards below (sculpt-carve and glass) must test the cell the
+    // FRAGMENT actually covers, not that one corner: otherwise a single
+    // glass (or carved) corner punches out the whole triangle, which on
+    // terrain shows up as scattered triangle-sized holes ("specks") wherever
+    // a band cell resolves to a sub-threshold-opacity material.
     //
-    // The flat-interpolated `in.leaf_attr_id` is shared across many
-    // triangles (each SN-vertex picks ONE cell's slot, but multiple
-    // triangles whose provoking vertex sits at that SN-vertex all
-    // see the same id). Testing the discard against it removes
-    // whole meshlet-scale regions per carved cell — the user's
-    // first stamp produced a sharp angular bird-shape, not a divot.
-    //
-    // Per-pixel resolve via `lookup_cell_at` descends the octree at
-    // the fragment's rest_pos to recover the actual surface cell.
-    // Test that against the sculpt set; fall back to the flat id
-    // when the descent misses (rare — only the brick neighborhood
-    // boundary, where it doesn't matter for a sphere-shaped brush).
-    //
-    // Short-circuit: `is_leaf_removed` returns false in O(1) when
-    // the instance has nothing carved, so the resolve is only paid
-    // by instances under active sculpt.
-    if inst.sculpt_count != 0u {
+    // `lookup_cell_at` descends the octree at the fragment's rest_pos to
+    // recover the real surface cell (falls back to the flat id on a miss —
+    // rare brick-boundary cases). It is only paid when a per-pixel decision
+    // can actually differ from the flat id: an instance under active sculpt,
+    // or a flat cell that already reads glass. Static opaque terrain (the
+    // overwhelming common case) skips the descent entirely.
+    let flat_attr = fetch_leaf_attr_for(inst, in.leaf_attr_id);
+    let flat_mat = flat_attr.material_packed & 0xFFFFu;
+    // Bounds-check the material lookup. WGSL OOB array reads return a zero
+    // `GpuMaterial` whose `opacity` is below the glass threshold, which would
+    // discard as if it were glass (a leaf pointing past the loaded palette —
+    // a relocation/palette-size bug). Clamp OOB ids to slot 0 so those stay
+    // opaque rather than vanishing.
+    let flat_mat_safe = select(flat_mat, 0u, flat_mat >= arrayLength(&materials));
+    let flat_is_glass = is_glass(materials[flat_mat_safe].opacity);
+
+    var cell_slot = in.leaf_attr_id;
+    if inst.sculpt_count != 0u || flat_is_glass {
         let asset = assets[inst.asset_id];
         let oc_pos = in.local_rest_pos - asset.grid_origin;
         let resolved_slot = lookup_cell_at(asset, oc_pos, in.local_normal);
-        let test_slot = select(in.leaf_attr_id, resolved_slot, resolved_slot != 0u);
-        if is_leaf_removed(inst, test_slot) {
+        if resolved_slot != 0u {
+            cell_slot = resolved_slot;
+        }
+    }
+
+    // Sculpt-carve discard (Phase A) — per-pixel resolved. `is_leaf_removed`
+    // returns false in O(1) when the instance has nothing carved.
+    if inst.sculpt_count != 0u {
+        if is_leaf_removed(inst, cell_slot) {
             discard;
         }
     }
-    let attr = fetch_leaf_attr_for(inst, in.leaf_attr_id);
+
+    // Glass discard on the per-pixel resolved cell: step past transparent
+    // fragments so the opaque hit in `gbuf_position` is the surface BEHIND
+    // the glass (the glass passes capture entry/exit separately).
+    let attr = fetch_leaf_attr_for(inst, cell_slot);
     let mat_id = attr.material_packed & 0xFFFFu;
-    // Bounds-check the material lookup. WGSL OOB array reads return
-    // a zero `GpuMaterial` whose `opacity` is below the glass
-    // threshold, which would cause the fragment to discard as if it
-    // were glass — the pixel falls through to the dark background and
-    // shows up as a thin black ring at painted-region boundaries on
-    // assets whose leaves point at material slots outside the
-    // project's loaded palette. Clamp OOB ids to slot 0 (default
-    // material) so those fragments stay in the opaque path.
-    let mat_id_safe = select(
-        mat_id, 0u, mat_id >= arrayLength(&materials),
-    );
+    let mat_id_safe = select(mat_id, 0u, mat_id >= arrayLength(&materials));
     if is_glass(materials[mat_id_safe].opacity) {
         discard;
     }

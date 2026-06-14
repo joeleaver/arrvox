@@ -389,19 +389,25 @@ struct FsFront {
 
 @fragment
 fn frag_front(in: VsOut) -> FsFront {
-    let cls = classify_glass(in.leaf_attr_id);
-    if cls.material_id == 0xFFFFFFFFu { discard; }
+    // Flat provoking-vertex classify first (cheap). Opaque ⇒ this triangle's
+    // corner cell isn't glass; skip the per-pixel descent (opaque terrain).
+    if classify_glass(in.leaf_attr_id).material_id == 0xFFFFFFFFu { discard; }
 
-    // Per-pixel resolved normal — same path `mesh_resolve` takes
-    // for the primary mesh G-buffer. Look up the actual surface
-    // cell at this fragment's mesh-frame rest position, fall back
-    // to the per-vertex interpolated normal if the descent fails
-    // (cell outside the brick neighborhood, etc.).
+    // The flat cell reads glass — but it is winner-take-all for the whole
+    // triangle. Re-resolve the actual per-pixel cell so an OPAQUE pixel of a
+    // mixed triangle isn't captured as glass (the inverse of the opaque
+    // raster's "specks"). Falls back to the flat id on a descent miss.
     let inst = instances[instance.object_id];
-    if is_leaf_removed(inst, in.leaf_attr_id) { discard; }
     let asset = assets[inst.asset_id];
     let oc_pos = in.local_rest_pos - asset.grid_origin;
     let resolved_slot = lookup_cell_at(asset, oc_pos, in.local_normal);
+    let cell_slot = select(in.leaf_attr_id, resolved_slot, resolved_slot != 0u);
+    let cls = classify_glass(cell_slot);
+    if cls.material_id == 0xFFFFFFFFu { discard; }
+    if is_leaf_removed(inst, cell_slot) { discard; }
+
+    // Per-pixel resolved normal — fall back to the per-vertex interpolated
+    // normal if the descent missed (cell outside the brick neighborhood).
     var local_n: vec3<f32>;
     if resolved_slot != 0u {
         let resolved_attr = leaf_attr_pool[resolved_slot];
@@ -438,11 +444,17 @@ struct FsBack {
 
 @fragment
 fn frag_back(in: VsOut) -> FsBack {
-    let cls = classify_glass(in.leaf_attr_id);
-    if cls.material_id == 0xFFFFFFFFu { discard; }
+    // Mirror frag_front's per-pixel classify so entry/exit agree on which
+    // pixels are glass (a flat-id-only test would pair mismatched faces).
+    if classify_glass(in.leaf_attr_id).material_id == 0xFFFFFFFFu { discard; }
 
     let inst = instances[instance.object_id];
-    if is_leaf_removed(inst, in.leaf_attr_id) { discard; }
+    let asset = assets[inst.asset_id];
+    let oc_pos = in.local_rest_pos - asset.grid_origin;
+    let resolved_slot = lookup_cell_at(asset, oc_pos, in.local_normal);
+    let cell_slot = select(in.leaf_attr_id, resolved_slot, resolved_slot != 0u);
+    if classify_glass(cell_slot).material_id == 0xFFFFFFFFu { discard; }
+    if is_leaf_removed(inst, cell_slot) { discard; }
 
     var out: FsBack;
     out.exit_dist = length(in.world_pos - camera.position.xyz);
