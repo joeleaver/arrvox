@@ -1357,6 +1357,14 @@ impl super::mesher::Mesher {
             // material/colour at vertices shared with procedural
             // neighbours.
             sculpt_slots: Some(&model.sculpt_owned_slots),
+            // QEF-Hermite on full rebuild too (gated like the region path) so
+            // a sculpted/smoothed asset doesn't silently staircase. Empty for
+            // distance-free assets keeps the binary path.
+            dists: if model.has_distances {
+                leaf_attr_pool.dists_as_slice()
+            } else {
+                &[]
+            },
         });
 
         if vertices.is_empty() {

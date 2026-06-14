@@ -81,6 +81,13 @@ pub(super) struct FullExtractArgs<'a> {
     pub(super) halo_cells: &'a [(IVec3, u32)],
     pub(super) halo: u32,
     pub(super) sculpt_slots: Option<&'a rustc_hash::FxHashSet<u32>>,
+    /// Per-slot signed distances (voxel units), parallel to `leaf_attr_pool`
+    /// (`LeafAttrPool::dists_as_slice()`). Non-empty selects the QEF-Hermite
+    /// path so a FULL rebuild of a distance-carrying asset (terrain /
+    /// sculpted) matches the bake and the region re-extract instead of
+    /// silently reverting to the staircased binary path; `&[]` keeps the
+    /// binary surface nets (imports) bit-identical.
+    pub(super) dists: &'a [i16],
 }
 
 /// The CPU-vs-GPU-swappable surface extraction step. Holds no `MeshView` and
@@ -142,20 +149,44 @@ impl SurfaceMesher for CpuSurfaceNets {
     }
 
     fn extract_full(&mut self, a: &FullExtractArgs<'_>) -> (Vec<MeshVertex>, Vec<u32>) {
-        // `extract_surface_mesh_haloed` with `halo = 0` is bit-identical to
-        // the old `extract_surface_mesh`, so both full rebuilds share it.
-        arvx_core::mesh_extract::extract_surface_mesh_haloed(
-            a.octree_nodes,
-            a.octree_depth,
-            a.base_voxel_size,
-            a.grid_origin,
-            a.brick_cells,
-            a.leaf_attr_pool,
-            a.bone_voxel_pool,
-            a.halo_cells,
-            a.halo,
-            a.sculpt_slots,
-        )
+        if a.dists.is_empty() {
+            // Binary surface nets — imports / distance-free assets. `halo = 0`
+            // is bit-identical to the old `extract_surface_mesh`.
+            arvx_core::mesh_extract::extract_surface_mesh_haloed(
+                a.octree_nodes,
+                a.octree_depth,
+                a.base_voxel_size,
+                a.grid_origin,
+                a.brick_cells,
+                a.leaf_attr_pool,
+                a.bone_voxel_pool,
+                a.halo_cells,
+                a.halo,
+                a.sculpt_slots,
+            )
+        } else {
+            // QEF-Hermite — a distance-carrying asset (terrain / sculpted)
+            // must mesh from its stored distances on a FULL rebuild too, or
+            // it silently reverts to the staircased binary path, diverging
+            // from the bake AND the region re-extract (which passes `dists`).
+            // `surface_normal_fn = None` → interpolated `∇D` normals, matching
+            // the region path (the analytic procedural source isn't available
+            // at re-extract time).
+            arvx_core::mesh_extract::extract_surface_mesh_density_haloed(
+                a.octree_nodes,
+                a.octree_depth,
+                a.base_voxel_size,
+                a.grid_origin,
+                a.brick_cells,
+                a.leaf_attr_pool,
+                a.bone_voxel_pool,
+                a.halo_cells,
+                a.halo,
+                a.sculpt_slots,
+                a.dists,
+                None,
+            )
+        }
     }
 }
 
