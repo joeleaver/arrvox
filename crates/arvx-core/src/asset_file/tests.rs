@@ -288,6 +288,93 @@ fn write_artifact_rkp_roundtrip() {
 }
 
 #[test]
+fn write_artifact_rkp_persists_distance_section() {
+    // #14: the voxelizer stores a per-leaf signed distance on every
+    // bake (`set_dist` from the SDF gradient), and `write_artifact_rkp`
+    // must now FORWARD that into the v7 distance section so a reloaded
+    // tile / asset can re-extract & sculpt with Manifold-DC from the
+    // stored field instead of the blur fallback. Before the fix this
+    // path passed `None` for distance_data, silently dropping it.
+    use glam::Vec3;
+
+    let voxel_size = 0.05;
+    let half = Vec3::splat(0.4);
+    let aabb = crate::Aabb::new(-half, half);
+    let radius: f32 = 0.25;
+    let sdf = |positions: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
+        positions
+            .iter()
+            .map(|p| (p.length() - radius, 0u16, 0u16, 0u8, 0u32, None))
+            .collect()
+    };
+    let artifact = crate::voxelize_to_artifact(sdf, &aabb, voxel_size, 0)
+        .expect("voxelize sphere");
+    assert!(
+        !artifact.leaf_attr_dists.is_empty(),
+        "voxelizer must bake per-leaf distances"
+    );
+    assert_eq!(
+        artifact.leaf_attr_dists.len(),
+        artifact.leaf_attrs.len(),
+        "distances must be 1:1 with leaf_attrs"
+    );
+    assert!(
+        artifact.leaf_attr_dists.iter().any(|&q| q != 0),
+        "a sphere's surface leaves carry nonzero signed distances"
+    );
+
+    let tmp = std::env::temp_dir().join(format!(
+        "arvx_dist_roundtrip_{}.arvx",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    write_artifact_rkp(
+        &tmp,
+        &artifact,
+        aabb.min.to_array(),
+        aabb.max.to_array(),
+        voxel_size,
+    )
+    .expect("write_artifact_rkp");
+
+    let mut file = std::fs::File::open(&tmp).expect("open");
+    let mut reader = std::io::BufReader::new(&mut file);
+    let header = read_rkp_header(&mut reader).expect("header");
+    assert!(
+        header.flags & FLAG_HAS_DISTANCE != 0,
+        "FLAG_HAS_DISTANCE must be set when the bake carried distances"
+    );
+    assert!(
+        header.distance_compressed_size > 0,
+        "distance section must be non-empty"
+    );
+
+    // The distance section is written LAST — read every prior section in
+    // order so the sequential reader lands on it.
+    let _ = read_rkp_octree(&mut reader, &header).expect("octree");
+    let _ = read_rkp_voxels(&mut reader, &header).expect("voxels");
+    let _ = read_rkp_normals(&mut reader, &header).expect("normals");
+    let _ = read_rkp_bricks(&mut reader, &header).expect("bricks");
+    let _ = read_rkp_color(&mut reader, &header).expect("color");
+    let _ = read_rkp_skin_meta(&mut reader, &header).expect("skin");
+    let _ = read_rkp_mesh_vertices(&mut reader, &header).expect("mesh verts");
+    let _ = read_rkp_mesh_indices(&mut reader, &header).expect("mesh indices");
+    let _ = read_rkp_meshlet_clusters(&mut reader, &header).expect("clusters");
+    let _ = read_rkp_dag_groups(&mut reader, &header).expect("dag groups");
+    let _ = read_rkp_dag_consumed(&mut reader, &header).expect("dag consumed");
+    let _ = read_rkp_dag_produced(&mut reader, &header).expect("dag produced");
+    let dist_out = read_rkp_distance(&mut reader, &header).expect("distance");
+    let back: &[i16] = bytemuck::cast_slice(&dist_out);
+    assert_eq!(
+        back,
+        artifact.leaf_attr_dists.as_slice(),
+        "persisted distances must round-trip bit-identically"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
 fn write_and_read_octree_roundtrip() {
     let mut buf = Vec::new();
     let mut cursor = Cursor::new(&mut buf);

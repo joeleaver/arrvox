@@ -564,10 +564,15 @@ pub(crate) fn qef_hermite_force_off() -> bool {
 }
 
 /// Bumped whenever the mesher's GEOMETRY OUTPUT changes for the same voxel
-/// input, so on-disk caches keyed by a bake signature (terrain `.arvxtile`,
-/// etc.) auto-invalidate instead of serving stale geometry. History:
-/// `1` = cell-center-plane QEF-Hermite; `2` = Manifold-DC interpolation.
-pub const MESHER_OUTPUT_VERSION: u32 = 2;
+/// input, OR the set of per-tile sections a cached bake must carry for a
+/// correct *re-extract* changes — so on-disk caches keyed by a bake
+/// signature (terrain `.arvxtile`, etc.) auto-invalidate instead of
+/// serving a stale tile. History: `1` = cell-center-plane QEF-Hermite;
+/// `2` = Manifold-DC interpolation; `3` = per-leaf distance section now
+/// persisted, so a reloaded tile re-extracts / sculpts with Manifold-DC
+/// from the stored field instead of the blur fallback (pre-`3` caches
+/// lack the section → re-bake to gain it).
+pub const MESHER_OUTPUT_VERSION: u32 = 3;
 
 /// Manifold-DC interpolation placement ([`manifold_dc_placement`]) — the
 /// PRODUCTION DEFAULT for the QEF/terrain path. It reconstructs each vertex by

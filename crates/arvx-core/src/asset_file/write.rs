@@ -432,7 +432,26 @@ pub fn write_artifact_rkp(
         let file = std::fs::File::create(&tmp)
             .map_err(|e| format!("create {}: {e}", tmp.display()))?;
         let mut writer = std::io::BufWriter::new(file);
-        write_rkp(
+        // v7 per-leaf signed-distance section. Forward the artifact's
+        // quantized dists (indexed 1:1 with `leaf_attrs`, hence with the
+        // header `voxel_count = leaf_attrs.len()`) so a save→reload of a
+        // QEF/Manifold-DC bake can re-extract / sculpt from the stored
+        // field instead of falling back to blur. Empty when the bake
+        // carried no distances (e.g. an old artifact) → no section
+        // written, flag stays unset. `write_rkp_with_progress` writes it
+        // LAST so v4-v6 readers are unaffected.
+        debug_assert!(
+            artifact.leaf_attr_dists.is_empty()
+                || artifact.leaf_attr_dists.len() == voxel_count as usize,
+            "distance section must be 1:1 with leaf_attrs ({} dists vs {voxel_count} voxels)",
+            artifact.leaf_attr_dists.len(),
+        );
+        let distance_bytes: &[u8] = if artifact.leaf_attr_dists.is_empty() {
+            &[]
+        } else {
+            bytemuck::cast_slice(&artifact.leaf_attr_dists)
+        };
+        write_rkp_with_progress(
             &mut writer,
             artifact.octree.as_slice(),
             artifact.octree.depth(),
@@ -445,8 +464,10 @@ pub fn write_artifact_rkp(
             Some(normals_bytes),
             Some(bricks_bytes),
             color_bytes,
-            None,
+            None, // skin_meta
             mesh_sections,
+            if distance_bytes.is_empty() { None } else { Some(distance_bytes) },
+            None, // progress
         )
         .map_err(|e| format!("write .arvx: {e}"))?;
     }

@@ -64,6 +64,14 @@ pub struct LoadedAsset {
     /// assets and mesh-local + truncated for imports — not the runtime
     /// authority.)
     distinct_materials: Vec<u16>,
+    /// True when the v7 distance section was present and non-empty, i.e.
+    /// the bake stored real per-leaf QEF distances (already folded into
+    /// `leaf_attr_pool`'s dist array during the build). Drives
+    /// `VoxelModel.has_distances` so sculpt / halo-refresh region
+    /// re-extract meshes this asset with Manifold-DC from the stored
+    /// field instead of the blur fallback. Mirrors
+    /// `integrate_baked_tile`'s `!artifact.leaf_attr_dists.is_empty()`.
+    has_distances: bool,
 }
 
 impl ArvxSceneManager {
@@ -369,6 +377,23 @@ impl ArvxSceneManager {
             &mut reader, &header,
         )
         .map_err(|e| format!("read dag produced: {e}"))?;
+        // v7 per-leaf signed-distance section — written LAST (after
+        // dag_produced) so v4-v6 readers stop before it; the sequential
+        // reader must read it here, after every other section. Empty for
+        // v4-v6 files and for v7 files baked without distances (blur
+        // fallback). A non-empty section means the bake stored real QEF
+        // distances, so it is the authority for `has_distances` — the
+        // load-path analogue of `integrate_baked_tile`. Folded into the
+        // file-local `leaf_attr_pool` below so `splice_assimilate` carries
+        // the dists into the scene pool with the attrs/colors/bones.
+        let dist_bytes = arvx_core::asset_file::read_rkp_distance(&mut reader, &header)
+            .map_err(|e| format!("read distance: {e}"))?;
+        let file_dists: &[i16] = if dist_bytes.len() >= 2 {
+            bytemuck::cast_slice(&dist_bytes)
+        } else {
+            &[]
+        };
+        let has_distances = !file_dists.is_empty();
         let mesh_lod0_index_count_from_file = header.mesh_lod0_index_count;
         let t_read_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
@@ -431,6 +456,15 @@ impl ArvxSceneManager {
             // the pool's zero-default BoneVoxel stands.
             if let Some(&bv) = file_bones.get(i) {
                 leaf_attr_pool.set_bone(slot, bv);
+            }
+            // v7 per-leaf QEF distance (quantized i16, voxel units),
+            // indexed 1:1 with the file's voxel slots. Empty when the
+            // bake stored no distances → slot keeps its 0 default and the
+            // mesher takes the blur fallback. `.get` guards a short/absent
+            // section; the prefilter tail slots appended below stay 0,
+            // exactly as `integrate_baked_tile` leaves its internal attrs.
+            if let Some(&q) = file_dists.get(i) {
+                leaf_attr_pool.set_dist_quantized(slot, q);
             }
         }
 
@@ -922,6 +956,7 @@ impl ArvxSceneManager {
             skinning,
             cluster_spatial_index,
             distinct_materials,
+            has_distances,
         })
     }
 
@@ -956,6 +991,7 @@ impl ArvxSceneManager {
             skinning,
             cluster_spatial_index,
             distinct_materials,
+            has_distances,
         } = loaded;
 
         // Splice the private leaf_attr pool (attrs + colors + bones) in
@@ -1061,7 +1097,7 @@ impl ArvxSceneManager {
                 // populate this through `integrate_baked_tile`.
                 halo_cells: Vec::new(),
                 distinct_materials: Some(distinct_materials),
-                has_distances: false,
+                has_distances,
             },
             view: MeshView {
                 mesh_vertices,
@@ -1541,5 +1577,85 @@ mod load_roundtrip_tests {
         // Unknown handle → None (caller falls back to the walk).
         let bogus = AssetHandle::from_raw(9999);
         assert_eq!(sm.asset_has_glass_quick(bogus, &glass), None);
+    }
+
+    /// #14: a v7 `.arvx` carrying a distance section (every voxelized
+    /// bake does — `write_artifact_rkp` now forwards the per-leaf dists)
+    /// must load with `has_distances = true` and land the read-back
+    /// distances in the scene leaf_attr pool, so sculpt / halo-refresh
+    /// region re-extract meshes the asset with Manifold-DC from the
+    /// stored field. Before the fix the load path hardcoded
+    /// `has_distances = false`, dropping DC smoothness on every reload.
+    #[test]
+    fn load_sets_has_distances_and_populates_scene_pool() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (path, _) = write_sphere_arvx(tmp.path());
+        let mut sm = ArvxSceneManager::new(1_000_000);
+        let (handle, info) = sm.acquire_asset(&path.to_string_lossy()).expect("acquire");
+
+        let entry = sm.asset_cache.get(handle).unwrap();
+        assert!(
+            entry.model.has_distances,
+            "a v7 .arvx with a distance section must load with has_distances=true",
+        );
+
+        // A sphere's surface leaves carry nonzero signed distances, so
+        // the asset's slot range must contain nonzero dists — not the
+        // all-zero blur default the pre-fix path left behind.
+        let start = info.leaf_attr_slot_start as usize;
+        let end = start + info.leaf_attr_slot_count as usize;
+        let dists = sm.leaf_attr_pool.dists_as_slice();
+        assert!(
+            dists[start..end].iter().any(|&q| q != 0),
+            "scene pool must carry the read-back per-leaf distances",
+        );
+    }
+
+    /// A `.arvx` with NO distance section (an old bake, or any artifact
+    /// written with empty `leaf_attr_dists`) must load with
+    /// `has_distances = false` so the mesher keeps the blur fallback —
+    /// flipping it true on a distance-less asset would QEF-on-zeros and
+    /// mush the surface.
+    #[test]
+    fn load_without_distance_section_leaves_has_distances_false() {
+        let voxel_size = 0.1_f32;
+        let radius = 1.0_f32;
+        let natural = arvx_core::Aabb::new(glam::Vec3::splat(-1.6), glam::Vec3::splat(1.6));
+        let aabb = arvx_core::pad_to_pow2_cubic(&natural, voxel_size);
+        let mut sdf = |ps: &[glam::Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<glam::Vec3>)> {
+            ps.iter()
+                .map(|p| (p.length() - radius, 0u16, 0u16, 0u8, 0u32, None))
+                .collect()
+        };
+        let mut artifact = arvx_core::voxelize_to_artifact(&mut sdf, &aabb, voxel_size, 0)
+            .expect("sphere voxelizes");
+        // Strip the distances → `write_artifact_rkp` omits the v7 section.
+        artifact.leaf_attr_dists.clear();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("no_dist.arvx");
+        arvx_core::asset_file::write_artifact_rkp(
+            &path,
+            &artifact,
+            aabb.min.to_array(),
+            aabb.max.to_array(),
+            voxel_size,
+        )
+        .expect("write");
+
+        let mut sm = ArvxSceneManager::new(1_000_000);
+        let (handle, info) = sm.acquire_asset(&path.to_string_lossy()).expect("acquire");
+        let entry = sm.asset_cache.get(handle).unwrap();
+        assert!(
+            !entry.model.has_distances,
+            "a distance-less .arvx must load with has_distances=false",
+        );
+        let start = info.leaf_attr_slot_start as usize;
+        let end = start + info.leaf_attr_slot_count as usize;
+        let dists = sm.leaf_attr_pool.dists_as_slice();
+        assert!(
+            dists[start..end].iter().all(|&q| q == 0),
+            "no distance section → scene pool dists stay at the zero default",
+        );
     }
 }

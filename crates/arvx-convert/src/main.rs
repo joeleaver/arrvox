@@ -166,6 +166,26 @@ fn rebuild_mesh_sections(path: &std::path::Path) -> Result<(), String> {
     let mut reader = std::io::BufReader::new(&mut file);
     let header: ArvxHeader = read_rkp_header(&mut reader)
         .map_err(|e| format!("read header: {e}"))?;
+    // `--rebuild-mesh` rewrites the mesh sections (and re-bakes as the
+    // v5-style blob, dropping DAG); it does NOT carry the v7 per-leaf
+    // distance section through. Before distances were ever persisted
+    // that was harmless, but a re-baked distance-carrying asset (terrain
+    // `.arvxtile`, or any DC bake) loses its stored field and silently
+    // reverts to blur re-extract / sculpt on the next load. Warn loudly
+    // rather than drop it silently — re-bake from source to keep
+    // Manifold-DC. (Preserving/regenerating distances through this tool
+    // is tracked with the broader arvx-convert / arvx-import distance
+    // support, which is entangled with this path's v5 downgrade.)
+    if header.distance_compressed_size > 0 {
+        eprintln!(
+            "[rebuild-mesh] {}: WARNING — input carries a v7 per-leaf distance \
+             section ({} compressed bytes) that --rebuild-mesh does NOT preserve; \
+             the rebuilt asset will fall back to blur re-extract/sculpt. Re-bake \
+             from source to retain Manifold-DC.",
+            path.display(),
+            header.distance_compressed_size,
+        );
+    }
     let octree_nodes = read_rkp_octree(&mut reader, &header)
         .map_err(|e| format!("read octree: {e}"))?;
     let voxel_data = read_rkp_voxels(&mut reader, &header)

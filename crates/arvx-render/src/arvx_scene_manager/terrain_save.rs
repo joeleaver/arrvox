@@ -48,15 +48,32 @@ impl ArvxSceneManager {
         let brick_start = entry.model.brick_start;
         let brick_count = entry.model.brick_count;
 
-        // ── leaf_attrs + leaf_attr_colors ─────────────────────────
+        // ── leaf_attrs + leaf_attr_colors + leaf_attr_dists ───────
+        // Dists are pulled only when the in-RAM model carries them
+        // (a QEF/Manifold-DC bake or a tile loaded from a v7 `.arvxtile`
+        // with distances). For a blur-only tile `has_distances` is false
+        // → leave the vec empty so the writer omits the section and the
+        // reloaded tile keeps the blur fallback (no spurious QEF-on-zeros
+        // mush). Indexed 1:1 with `leaf_attrs` so the distance section is
+        // 1:1 with the header `voxel_count`.
+        let has_distances = entry.model.has_distances;
+        let pool_dists = self.leaf_attr_pool.dists_as_slice();
         let mut leaf_attrs: Vec<LeafAttr> =
             Vec::with_capacity(leaf_attr_slot_count as usize);
         let mut leaf_attr_colors: Vec<u32> =
             Vec::with_capacity(leaf_attr_slot_count as usize);
+        let mut leaf_attr_dists: Vec<i16> = if has_distances {
+            Vec::with_capacity(leaf_attr_slot_count as usize)
+        } else {
+            Vec::new()
+        };
         for i in 0..leaf_attr_slot_count {
             let slot = leaf_attr_slot_start + i;
             leaf_attrs.push(*self.leaf_attr_pool.get(slot));
             leaf_attr_colors.push(self.leaf_attr_pool.color(slot));
+            if has_distances {
+                leaf_attr_dists.push(pool_dists[slot as usize]);
+            }
         }
 
         // ── brick_cells (remap scene → file-local) ────────────────
@@ -158,8 +175,9 @@ impl ArvxSceneManager {
             grid_origin,
             leaf_attrs,
             leaf_attr_colors,
-            // Saved-tile distance section wired in Stage 5; empty for now.
-            leaf_attr_dists: Vec::new(),
+            // Populated above from the scene pool when the model carries
+            // distances; empty (blur fallback) otherwise.
+            leaf_attr_dists,
             brick_cells: brick_cells_out,
             brick_face_links: brick_face_links_out,
             halo_cells,

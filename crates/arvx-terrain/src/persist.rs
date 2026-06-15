@@ -202,6 +202,22 @@ pub fn read_baked_tile(
         arvx_core::asset_file::read_rkp_dag_produced(&mut reader, &header)
             .map_err(|e| format!("read dag produced: {e}"))?;
 
+    // ── v7 per-leaf signed distances ─────────────────────────────
+    // Written LAST (after dag_produced), so the sequential reader must
+    // read it here, after every other section. Empty for tiles baked
+    // before distance persistence (or by the blur path) → the loaded
+    // tile keeps the blur fallback; non-empty → `integrate_baked_tile`
+    // sets `has_distances` and re-extract / sculpt mesh this tile with
+    // Manifold-DC from the stored field. Indexed 1:1 with `leaf_attrs`.
+    let dist_bytes = arvx_core::asset_file::read_rkp_distance(&mut reader, &header)
+        .map_err(|e| format!("read distance: {e}"))?;
+    let leaf_attr_dists: Vec<i16> = if dist_bytes.len() >= 2 {
+        let q: &[i16] = bytemuck::cast_slice(&dist_bytes);
+        q.iter().take(voxel_count as usize).copied().collect()
+    } else {
+        Vec::new()
+    };
+
     let mesh = MeshSectionsBlob {
         vertices: mesh_vertices_bytes,
         indices: mesh_indices_bytes,
@@ -218,9 +234,10 @@ pub fn read_baked_tile(
         grid_origin: glam::Vec3::from(header.aabb_min),
         leaf_attrs,
         leaf_attr_colors,
-        // Loaded-tile distance section wired in Stage 5; empty → the
-        // loaded tile falls back to the blur mesher (no QEF) for now.
-        leaf_attr_dists: Vec::new(),
+        // Read from the v7 distance section above; empty when absent
+        // (blur fallback). `integrate_baked_tile` derives `has_distances`
+        // from `!leaf_attr_dists.is_empty()`.
+        leaf_attr_dists,
         brick_cells,
         brick_face_links,
         halo_cells: Vec::new(),
@@ -387,5 +404,46 @@ mod tests {
         );
         // Halo deliberately empty in V1 — see read_baked_tile docs.
         assert!(loaded_artifact.halo_cells.is_empty());
+    }
+
+    /// #14: a terrain bake stores a per-leaf signed distance on every
+    /// surface leaf (the QEF/Manifold-DC field). `write_tile_to_path`
+    /// → `write_artifact_rkp` must persist the v7 distance section and
+    /// `read_baked_tile` must read it back bit-identically, so a tile
+    /// loaded from the `.arvxtile` cache re-extracts / sculpts with
+    /// Manifold-DC instead of falling back to blur. Before the fix both
+    /// sides stubbed `leaf_attr_dists` empty.
+    #[test]
+    fn bake_save_read_roundtrip_preserves_distances() {
+        let voxel_size_m = 1.0_f32;
+        let key = TileKey::level0(0, 0, 0);
+        let baked = bake_tile(
+            key,
+            voxel_size_m,
+            &FbmTerrainFn::default().resolve(&arvx_core::NullMaterialLookup),
+            &[],
+            &crate::TerrainRegionSnapshot::new(),
+        )
+        .expect("bake_tile");
+        assert!(
+            !baked.artifact.leaf_attr_dists.is_empty(),
+            "terrain bake must carry per-leaf distances (QEF/Manifold-DC field)",
+        );
+        assert_eq!(
+            baked.artifact.leaf_attr_dists.len(),
+            baked.artifact.leaf_attrs.len(),
+            "distances must be 1:1 with leaf_attrs (the write invariant)",
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let saved_path = save_tile(tmp.path(), key, &baked.artifact, baked.voxel_size_m)
+            .expect("save_tile");
+        let (loaded_artifact, _mesh, _vs) =
+            read_baked_tile(&saved_path).expect("read_baked_tile");
+
+        assert_eq!(
+            loaded_artifact.leaf_attr_dists, baked.artifact.leaf_attr_dists,
+            "persisted distances must round-trip bit-identically",
+        );
     }
 }
