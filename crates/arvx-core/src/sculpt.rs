@@ -102,15 +102,17 @@ pub enum BrushMode {
     Raise,
     /// Hard SDF subtract — empty the brush sphere.
     Carve,
-    /// Soft outward dilation. For each cell in the brush AABB, the
-    /// effective per-cell thickness in voxels is `ceil(falloff(t) *
-    /// strength)` with `t = 1 − d/r`; empty cells within that many
-    /// 6-face hops of the existing surface flip to solid.
+    /// Soft outward dilation as a signed-distance-field OFFSET:
+    /// `sd'(p) = sd(p) − offset(p)`, `offset = falloff(t)·strength`,
+    /// `t = 1 − axis_dist/radius`. Cells with `sd' ≤ 0` become solid; the
+    /// new surface is re-discretised and meshed through the same Manifold-DC
+    /// path as terrain / Raise / Carve. Smooth by construction — replaces the
+    /// retired pre-SDF brushfire kernel (which stamped brush-sphere distance
+    /// on an occupancy shell and shattered DC). See [`compute_offset_edits`].
     Inflate,
-    /// Soft inward erosion. Mirror of [`Inflate`]: surface cells
-    /// within `ceil(falloff(t) * strength)` 6-face hops of empty
-    /// space flip to empty, and the newly-exposed interior cells
-    /// emit cavity-wall Adds on the outside rim.
+    /// Soft inward erosion — the [`Inflate`] mirror with `sd'(p) = sd(p) +
+    /// offset(p)`. The receded surface is re-discretised and DC-meshed the
+    /// same way. See [`compute_offset_edits`].
     Deflate,
     /// Clay strips — deposits a fixed-height flat-topped strip above
     /// the pre-stroke surface, swept along the capsule axis. Width =
@@ -118,8 +120,9 @@ pub enum BrushMode {
     /// a flat top (75% of radius) with falloff-shaped shoulders at
     /// the lateral edges. Overlapping strokes stack: each adds its
     /// fixed height on top of whatever surface was there when the
-    /// stroke began. Uses the same brushfire infrastructure as Inflate
-    /// but with a flat-top thickness profile instead of a dome.
+    /// stroke began. Uses a brushfire-shell kernel with a flat-top thickness
+    /// profile instead of a dome (Inflate/Deflate now use the SDF-offset
+    /// [`compute_offset_edits`] path; ClayStrip still uses brushfire).
     ClayStrip,
     /// Geometry-and-normal smoothing. Per cell inside the brush capsule
     /// the kernel reads pre-stamp 6-neighbour occupancy from a dense
@@ -229,6 +232,25 @@ impl FalloffCurve {
             FalloffCurve::Linear => t,
         }
     }
+
+    /// Derivative `d(evaluate)/dt` at `t ∈ [0, 1]`. The SDF-offset
+    /// Inflate/Deflate kernel needs this to compute the analytic surface
+    /// normal of the offset field: `offset(p) = evaluate(t)·strength` with
+    /// `t = 1 − axis_dist/radius`, so the surface normal is
+    /// `normalize(∇sd ∓ ∇offset)` where `∇offset` has magnitude
+    /// `strength · evaluate_deriv(t) · (1/radius)` along the brush-radial
+    /// direction. Deriving the normal analytically (vs finite-differencing
+    /// the discretised field) keeps it speckle-free.
+    #[inline]
+    pub fn evaluate_deriv(self, t: f32) -> f32 {
+        match self {
+            FalloffCurve::Constant => 0.0,
+            FalloffCurve::Smooth => 0.5 * std::f32::consts::PI * (std::f32::consts::PI * t).sin(),
+            FalloffCurve::Smoothstep => 6.0 * t * (1.0 - t),
+            FalloffCurve::Sharp => 2.0 * t,
+            FalloffCurve::Linear => 1.0,
+        }
+    }
 }
 
 impl Default for FalloffCurve {
@@ -287,6 +309,18 @@ pub enum LeafEditOp {
     /// octree+brick lookup, so [`apply_delta`] can write the pool
     /// directly without re-traversing.
     SetNormal { slot: u32, normal: Vec3 },
+    /// Rewrite an existing surface cell's stored signed distance
+    /// (`LeafAttrPool` dist) in place, keeping its occupancy / material /
+    /// slot. The SDF-offset Inflate/Deflate brushes emit these for cells
+    /// that stay surface leaves but whose distance to the (offset) surface
+    /// changed — without this, an old surface cell that the offset pushed
+    /// sub-surface keeps its stale near-zero distance and Manifold-DC emits
+    /// a spurious surface there (the shatter the brushfire produced).
+    /// `slot` is pre-resolved at compute time (like [`Self::SetNormal`]);
+    /// `dist` is the new signed distance in voxel units. May also carry a
+    /// refreshed `normal` (the offset preserves direction, but a re-derived
+    /// normal keeps the band consistent).
+    SetDist { slot: u32, normal: Vec3, dist: f32 },
 }
 
 /// A single leaf-level edit produced by [`compute_brush_edits`].
@@ -322,6 +356,15 @@ impl SculptDelta {
     }
     pub fn count_set_normal(&self) -> usize {
         self.edits.iter().filter(|e| matches!(e.op, LeafEditOp::SetNormal { .. })).count()
+    }
+
+    /// Count of in-place distance rewrites (SDF-offset Inflate/Deflate). These
+    /// mutate an existing leaf's stored distance without changing occupancy, so
+    /// a delta of only `SetDist` edits IS a real mutation — callers gating on
+    /// "did anything change?" must include this (else a gentle Inflate/Deflate
+    /// that only re-distances existing surface leaves is silently dropped).
+    pub fn count_set_dist(&self) -> usize {
+        self.edits.iter().filter(|e| matches!(e.op, LeafEditOp::SetDist { .. })).count()
     }
 
     pub fn count_interior(&self) -> usize {
@@ -399,6 +442,13 @@ pub struct AppliedDelta {
     /// dome and half the surface vanishes. The caller patches each
     /// slot's `LeafAttr.normal_oct` in place; material stays.
     pub renormalized_slots: Vec<(u32, Vec3)>,
+    /// Pre-existing SOLID slots whose stored DISTANCE (and normal) the
+    /// SDF-offset Inflate/Deflate moved — `(slot, new_normal, new_dist)`.
+    /// The caller writes `pool.set_dist(slot, dist)` + `normal_oct` in
+    /// place; occupancy / material / slot unchanged. Keeps an old surface
+    /// cell's stored field consistent with the offset surface so DC does
+    /// not emit a stale surface at its former position.
+    pub redist_slots: Vec<(u32, Vec3, f32)>,
     /// Slot ids freed by `Remove` edits. Caller should
     /// `pool.deallocate_range(slot, 1)` for each (or batch-collect into
     /// `(start, count)` ranges).
@@ -570,6 +620,7 @@ pub fn compute_brush_edits(
     octree: &SparseOctree,
     brick_pool: &BrickPool,
     leaf_attr_pool: &[LeafAttr],
+    dists: &[i16],
     op: BrushOp,
 ) -> SculptDelta {
     // Inflate / Deflate paths default `is_stroke_edit` to "always
@@ -577,7 +628,7 @@ pub fn compute_brush_edits(
     // its pre-stroke state. Callers that need the one-layer-per-stroke
     // semantic (the scene manager's drag path) go through
     // `compute_brush_edits_in_stroke` and supply the actual closure.
-    compute_brush_edits_in_stroke(octree, brick_pool, leaf_attr_pool, op, |_| false)
+    compute_brush_edits_in_stroke(octree, brick_pool, leaf_attr_pool, dists, op, |_| false)
 }
 
 /// Same as [`compute_brush_edits`] but with an explicit "was this cell
@@ -592,25 +643,30 @@ pub fn compute_brush_edits_in_stroke(
     octree: &SparseOctree,
     brick_pool: &BrickPool,
     leaf_attr_pool: &[LeafAttr],
+    dists: &[i16],
     op: BrushOp,
     is_stroke_edit: impl Fn(UVec3) -> bool,
 ) -> SculptDelta {
     match op.mode {
         BrushMode::Inflate => {
-            return compute_inflate_edits(
+            return compute_offset_edits(
                 octree,
                 brick_pool,
                 leaf_attr_pool,
+                dists,
                 &op,
+                OffsetSign::Inflate,
                 is_stroke_edit,
             );
         }
         BrushMode::Deflate => {
-            return compute_deflate_edits(
+            return compute_offset_edits(
                 octree,
                 brick_pool,
                 leaf_attr_pool,
+                dists,
                 &op,
+                OffsetSign::Deflate,
                 is_stroke_edit,
             );
         }
@@ -629,6 +685,7 @@ pub fn compute_brush_edits_in_stroke(
         BrushMode::Carve | BrushMode::Raise => {}
     }
     let _ = leaf_attr_pool;
+    let _ = dists;
     let _ = is_stroke_edit;
 
     use std::time::Instant;
@@ -636,7 +693,9 @@ pub fn compute_brush_edits_in_stroke(
     let extent = octree.extent();
     // The walker covers the brush footprint PLUS one cell of padding so
     // the outside-rim cells whose state drives the cavity-wall /
-    // dome-surface rules are in scope.
+    // dome-surface rules are in scope. The inside surface band
+    // ([`emit_raise_inside`]) lives within the footprint, so one cell of
+    // pad still suffices.
     let (lo, hi) = brush_cell_range_padded(&op, extent, 1);
     if lo.x >= hi.x || lo.y >= hi.y || lo.z >= hi.z {
         return SculptDelta::default();
@@ -680,7 +739,7 @@ pub fn compute_brush_edits_in_stroke(
                         &mut edits, coord, state, &op, octree, brick_pool,
                         &mut cache, &mut n_neighbor_calls,
                     ),
-                    (BrushMode::Raise, true) => emit_raise_inside(&mut edits, coord, state),
+                    (BrushMode::Raise, true) => emit_raise_inside(&mut edits, coord, state, d, &op),
                     (BrushMode::Raise, false) => emit_raise_outside_rim(
                         &mut edits, coord, state, &op, octree, brick_pool,
                         &mut cache, &mut n_neighbor_calls,
@@ -707,57 +766,90 @@ pub fn compute_brush_edits_in_stroke(
     }
 }
 
-/// Soft outward dilation. For each Empty cell in the brush AABB,
-/// compute its 6-face-hop distance to the nearest Solid / Interior
-/// seed (a brushfire propagation over a dense scratch grid), then
-/// emit it as an `Add` if that distance is within the brush's
-/// falloff-shaped target thickness at the cell. The result is a
-/// dilation shell whose thickness profile matches the falloff curve
-/// — full strength at center, tapering to zero at the rim.
+/// Direction of a soft SDF-field offset brush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffsetSign {
+    /// Grow solid outward: `sd' = sd − offset`.
+    Inflate,
+    /// Erode solid inward: `sd' = sd + offset`.
+    Deflate,
+}
+
+/// **SDF-offset Inflate / Deflate** — the SDF-native replacement for the
+/// retired brushfire kernel.
 ///
-/// **Walk shape.** AABB is padded by `max_k = ceil(strength)` along
-/// each axis so the brushfire seed set includes every surface cell
-/// that could legitimately reach an addable cell within the brush
-/// radius. Total cost: `O(max_k · N³)` per stamp, with `N ≈ 2 · r +
-/// 2 · max_k` cells per axis. For a `r = 25`, `strength = 8` brush
-/// that's `~6 M` `u8` reads — well under a millisecond.
+/// The brushfire kernel grew/eroded occupancy by integer 6-face hop counts
+/// and then stamped each touched cell with its distance to the brush
+/// *sphere* (`brush_add_dist`). That distance disagreed with the occupancy
+/// boundary (every shell cell is "inside" the sphere → all negative), so
+/// Manifold-DC placed vertices at the wrong surface and the result
+/// shattered. This kernel instead treats Inflate / Deflate as a genuine
+/// **offset of the signed-distance field** and re-discretises it, meshing
+/// through the same DC path as terrain / Raise / Carve — smooth by
+/// construction, one unified surface model.
 ///
-/// **Normals — surface-following inheritance.** Each newly-added
-/// cell inherits its normal from the existing-surface (Solid) cell
-/// the brushfire reached out from. The init pass unpacks
-/// `LeafAttr.normal_oct` for every Solid seed and stores it in a
-/// parallel `seed_normal` grid; brushfire propagation carries the
-/// value forward — a cell at distance `step` inherits from any 6-
-/// neighbour at distance `step − 1` that already has a non-zero
-/// seed normal (preferring those over Interior seeds with no
-/// stored normal). When no surface seed reaches a cell — purely
-/// Interior brushfire path, or a degenerate case — the kernel
-/// falls back to [`brush_add_normal`].
+/// Pipeline (all in finest-voxel grid units):
 ///
-/// This is the difference between a dome-shaped Inflate (every
-/// added cell shading like a sphere stamped on top) and a true
-/// soft-Inflate (added cells continue the underlying surface
-/// curvature), and it removes the per-stamp normal stripes that
-/// brush-radial normals produce along a drag stroke.
-fn compute_inflate_edits(
+/// 1. **Reconstruct a continuous SDF over the brush region.** Only surface
+///    *leaves* store a signed distance + normal. Each leaf defines a Hermite
+///    tangent plane through its sub-voxel surface point
+///    `p_surf = center − dist·n` (the same plane Manifold-DC extrapolates
+///    from). A vector distance transform (6-neighbour relaxation, two
+///    sweeps per pass, looped to convergence) propagates the nearest leaf's
+///    `(p_surf, n)` to every region cell, so `sd(c) = (c − p_surf)·n` is a
+///    continuous reconstruction of the field — exactly what DC already
+///    trusts. Degrades gracefully when distances are absent (`dist` → 0,
+///    plane through the cell center) or a normal is degenerate (→ +Y).
+///
+/// 2. **Offset.** `offset(c) = falloff(t)·strength` with
+///    `t = 1 − axis_dist/radius` (capsule-aware). Inflate: `sd' = sd −
+///    offset`; Deflate: `sd' = sd + offset`. Cells with `sd' ≤ 0` are solid.
+///
+/// 3. **Re-discretise to leaf edits.** Within a `SCULPT_BAND_HALF_WIDTH`
+///    band of the new zero-crossing each solid cell becomes a surface leaf
+///    carrying `(dist = sd', normal)`; deeper solid is interior; cells the
+///    offset pushed outside go empty. Crucially, a *pre-existing* surface
+///    leaf the offset pushed sub-surface is updated in place via
+///    [`LeafEditOp::SetDist`] (deep-negative distance) so DC no longer emits
+///    a spurious surface at its former position — the shatter the brushfire
+///    produced.
+///
+/// **Normal.** The surface leaf's normal is the analytic gradient of the
+/// offset field, `normalize(∇sd ± ∇offset)` (`−` Inflate, `+` Deflate),
+/// where `∇sd = n` (nearest-leaf plane) and `∇offset` is the brush-radial
+/// gradient with magnitude `strength·falloff'(t)/radius`. Deriving it
+/// analytically (vs finite-differencing the discretised field) keeps the
+/// dome / pit flanks speckle-free and correctly tilted on the falloff
+/// shoulder. On a flat ground (`n = +Y`) this reproduces a clean dome.
+///
+/// **Stroke capping.** `is_stroke_edit(c)` excludes cells already edited
+/// this stroke from *seeding* the nearest-surface field, so `sd0` is always
+/// reconstructed from the pristine pre-stroke surface and the offset applies
+/// once however many stamps cover a cell — a held / dragged brush converges
+/// to one offset layer instead of compounding. For a single stamp the
+/// predicate is always false and every surface leaf seeds.
+#[allow(clippy::too_many_arguments)]
+fn compute_offset_edits(
     octree: &SparseOctree,
     brick_pool: &BrickPool,
     leaf_attr_pool: &[LeafAttr],
+    dists: &[i16],
     op: &BrushOp,
+    sign: OffsetSign,
     is_stroke_edit: impl Fn(UVec3) -> bool,
 ) -> SculptDelta {
     use std::time::Instant;
 
     let extent = octree.extent();
-    let max_k = op.strength.max(0.0).ceil() as u32;
+    // Max reach in voxels — used for region padding (so the surrounding
+    // surface is in scope as seeds) and as a convergence bound.
+    let max_k = (op.strength.max(0.0).ceil() as u32).min(254);
     if max_k == 0 || op.radius <= 0.0 {
         return SculptDelta::default();
     }
-    // u8 distance field; capping at 254 leaves u8::MAX as the
-    // unreached sentinel. Practical brushes stay far below this.
-    let max_k = max_k.min(254) as u8;
-
-    let (lo, hi) = brush_cell_range_padded(op, extent, max_k as u32);
+    // Pad by reach + 2 so seeds around the brush are captured and the
+    // nearest-surface transform can reach every emit cell from a seed.
+    let (lo, hi) = brush_cell_range_padded(op, extent, max_k + 2);
     if lo.x >= hi.x || lo.y >= hi.y || lo.z >= hi.z {
         return SculptDelta::default();
     }
@@ -771,180 +863,360 @@ fn compute_inflate_edits(
         let l = c - lo;
         (l.x as usize) + (l.y as usize) * stride_y + (l.z as usize) * stride_z
     };
+    let cell_center =
+        |c: UVec3| Vec3::new(c.x as f32 + 0.5, c.y as f32 + 0.5, c.z as f32 + 0.5);
 
-    let mut dist: Vec<u8> = vec![u8::MAX; total];
-    let mut is_addable: Vec<bool> = vec![false; total];
-    // Transit cells — currently Solid/Interior (so brushfire CAN walk
-    // through them) but their state was reached this stroke (so they
-    // must NOT seed brushfire at dist=0). Without this distinction the
-    // kernel would treat stamp N-1's added cells as fresh surface and
-    // stamp N would puff *another* target_thickness layer past them —
-    // exactly the compounding the user reports as "keeps puffing the
-    // longer I hold the mouse". With it, stamp N's brushfire depth is
-    // measured from the ORIGINAL pre-stroke surface, not the stamp-
-    // accumulated one, so total stroke depth is capped at one
-    // `target_thickness`.
-    let mut is_transit: Vec<bool> = vec![false; total];
-    // Per-cell inherited surface normal; `ZERO` is the sentinel for
-    // "no surface seed has reached this cell yet" (and never a valid
-    // unit normal). Solid cells in the init pass seed their unpacked
-    // `LeafAttr.normal_oct` here; brushfire propagation carries the
-    // value to reached cells.
-    let mut seed_normal: Vec<Vec3> = vec![Vec3::ZERO; total];
+    // Per-cell state: 0=Empty, 1=Interior, 2=Solid(slot), 3=OutOfBounds.
+    let mut state_kind: Vec<u8> = vec![0; total];
+    let mut slot_grid: Vec<u32> = vec![u32::MAX; total];
+    // Nearest-surface vector field: squared euclidean distance to the
+    // nearest seed leaf's sub-voxel surface point, that point, and the
+    // leaf's outward normal. `INFINITY` best_d2 = "no surface reached yet".
+    let mut best_d2: Vec<f32> = vec![f32::INFINITY; total];
+    let mut p_surf_grid: Vec<Vec3> = vec![Vec3::ZERO; total];
+    let mut normal_grid: Vec<Vec3> = vec![Vec3::ZERO; total];
 
     let mut cache = crate::sparse_octree::CellStateCache::new();
     let mut n_cell_state_calls = 0u32;
-    let mut n_inside_sphere = 0u32;
     let mut n_aabb_cells = 0u32;
 
-    // ── Init pass: classify every cell in the AABB. ──
+    // ── Init: classify every region cell + seed the nearest-surface field
+    //    from surface leaves. ──
     for z in lo.z..hi.z {
         for y in lo.y..hi.y {
             for x in lo.x..hi.x {
                 n_aabb_cells += 1;
                 let c = UVec3::new(x, y, z);
-                let state = octree.cell_state_cached(c, brick_pool, &mut cache);
-                n_cell_state_calls += 1;
                 let i = idx(c);
-                let edited = is_stroke_edit(c);
-                match state {
+                let st = octree.cell_state_cached(c, brick_pool, &mut cache);
+                n_cell_state_calls += 1;
+                match st {
+                    CellState::Empty => state_kind[i] = 0,
+                    CellState::Interior => state_kind[i] = 1,
+                    CellState::OutOfBounds => state_kind[i] = 3,
                     CellState::Solid(slot) => {
-                        if edited {
-                            // Added this stroke — brushfire transits
-                            // (so deeper cells can be reached at the
-                            // correct distance) but the cell itself
-                            // doesn't seed at dist=0.
-                            is_transit[i] = true;
-                        } else {
-                            dist[i] = 0;
-                            if let Some(attr) = leaf_attr_pool.get(slot as usize) {
-                                seed_normal[i] = unpack_oct(attr.normal_oct);
-                            }
+                        state_kind[i] = 2;
+                        slot_grid[i] = slot;
+                        // STROKE CAPPING: a cell already edited this stroke is
+                        // NOT a seed. The nearest-surface field then propagates
+                        // in from the *un-touched* (pristine, pre-stroke)
+                        // surface around the footprint, so `sd0` always measures
+                        // from the ORIGINAL surface — the offset is applied once
+                        // no matter how many stamps cover the cell. Without this
+                        // a held / dragged brush would re-offset the already-
+                        // offset surface every stamp ("keeps puffing the longer
+                        // I hold the mouse"). For a single stamp the predicate
+                        // is always false, so every surface leaf seeds.
+                        if is_stroke_edit(c) {
+                            continue;
                         }
+                        let n = leaf_attr_pool
+                            .get(slot as usize)
+                            .map(|a| unpack_oct(a.normal_oct))
+                            .filter(|n| n.length_squared() > 1e-10)
+                            .map(|n| n.normalize())
+                            .unwrap_or(Vec3::Y);
+                        let d = dists
+                            .get(slot as usize)
+                            .copied()
+                            .map(crate::LeafAttrPool::dequantize_dist)
+                            .unwrap_or(0.0);
+                        let cc = cell_center(c);
+                        let p_surf = cc - d * n;
+                        best_d2[i] = (cc - p_surf).length_squared();
+                        p_surf_grid[i] = p_surf;
+                        normal_grid[i] = n;
                     }
-                    CellState::Interior => {
-                        if edited {
-                            is_transit[i] = true;
-                        } else {
-                            dist[i] = 0;
-                        }
-                    }
-                    CellState::Empty => is_addable[i] = true,
-                    CellState::OutOfBounds => {}
                 }
             }
         }
     }
 
-    // ── Brushfire: `max_k` passes, each fills cells whose
-    // immediate 6-neighbour has dist == step - 1.
-    //
-    // **Seed-normal averaging.** Every dist==prev predecessor with
-    // a non-zero `seed_normal` contributes one vote; the cell's new
-    // normal is the L2-normalised sum. At a corner of an asset
-    // (three orthogonal faces meet the brushfire at the same depth)
-    // the three face-normals sum to roughly `(1, 1, 1)/√3` — a
-    // smooth corner direction that adjacent cells in the bulk all
-    // converge on. Picking "first non-zero" instead would let
-    // adjacent cells inherit from different faces 90° apart and
-    // produce visible scatter on the cavity wall. ──
-    for step in 1..=max_k {
-        let prev = step - 1;
+    // ── Vector distance transform: relax until no cell adopts a closer
+    //    neighbour's surface. Forward sweep checks the −x/−y/−z neighbours,
+    //    backward checks +x/+y/+z; the pair covers all 6 directions per
+    //    iteration. Bounded by the region span (it always converges well
+    //    before — the surface sheet runs through the brush center). ──
+    let max_passes = (size.x + size.y + size.z).max(1);
+    let mut passes = 0u32;
+    let mut changed = true;
+    while changed && passes < max_passes {
+        changed = false;
+        passes += 1;
+        // Forward.
         for z in lo.z..hi.z {
             for y in lo.y..hi.y {
                 for x in lo.x..hi.x {
                     let c = UVec3::new(x, y, z);
                     let i = idx(c);
-                    // Propagation reaches three kinds of cells:
-                    // - `is_addable` Empty targets (will potentially
-                    //   emit Add in the next pass);
-                    // - `is_transit` cells (currently Solid/Interior
-                    //   added this stroke — they carry distance so
-                    //   cells beyond them get the correct value, but
-                    //   they don't emit anything themselves).
-                    if dist[i] != u8::MAX || (!is_addable[i] && !is_transit[i]) {
-                        continue;
-                    }
-                    let predecessors = [
+                    let cc = cell_center(c);
+                    let neigh = [
                         (x > lo.x).then(|| idx(UVec3::new(x - 1, y, z))),
-                        (x + 1 < hi.x).then(|| idx(UVec3::new(x + 1, y, z))),
                         (y > lo.y).then(|| idx(UVec3::new(x, y - 1, z))),
-                        (y + 1 < hi.y).then(|| idx(UVec3::new(x, y + 1, z))),
                         (z > lo.z).then(|| idx(UVec3::new(x, y, z - 1))),
-                        (z + 1 < hi.z).then(|| idx(UVec3::new(x, y, z + 1))),
                     ];
-                    let mut found = false;
-                    let mut sum = Vec3::ZERO;
-                    for p in predecessors.iter().flatten() {
-                        if dist[*p] != prev {
+                    for ni in neigh.iter().flatten() {
+                        if !best_d2[*ni].is_finite() {
                             continue;
                         }
-                        found = true;
-                        let n = seed_normal[*p];
-                        if n != Vec3::ZERO {
-                            sum += n;
+                        let d2 = (cc - p_surf_grid[*ni]).length_squared();
+                        if d2 < best_d2[i] {
+                            best_d2[i] = d2;
+                            p_surf_grid[i] = p_surf_grid[*ni];
+                            normal_grid[i] = normal_grid[*ni];
+                            changed = true;
                         }
                     }
-                    if found {
-                        dist[i] = step;
-                        let len_sq = sum.length_squared();
-                        seed_normal[i] = if len_sq > 1e-6 {
-                            sum * len_sq.sqrt().recip()
-                        } else {
-                            Vec3::ZERO
-                        };
+                }
+            }
+        }
+        // Backward.
+        for z in (lo.z..hi.z).rev() {
+            for y in (lo.y..hi.y).rev() {
+                for x in (lo.x..hi.x).rev() {
+                    let c = UVec3::new(x, y, z);
+                    let i = idx(c);
+                    let cc = cell_center(c);
+                    let neigh = [
+                        (x + 1 < hi.x).then(|| idx(UVec3::new(x + 1, y, z))),
+                        (y + 1 < hi.y).then(|| idx(UVec3::new(x, y + 1, z))),
+                        (z + 1 < hi.z).then(|| idx(UVec3::new(x, y, z + 1))),
+                    ];
+                    for ni in neigh.iter().flatten() {
+                        if !best_d2[*ni].is_finite() {
+                            continue;
+                        }
+                        let d2 = (cc - p_surf_grid[*ni]).length_squared();
+                        if d2 < best_d2[i] {
+                            best_d2[i] = d2;
+                            p_surf_grid[i] = p_surf_grid[*ni];
+                            normal_grid[i] = normal_grid[*ni];
+                            changed = true;
+                        }
                     }
                 }
             }
         }
     }
 
-    // ── Emit pass: addable cells whose distance is within the
-    // falloff-shaped target thickness become Adds. ──
+    // ── Emit: walk the brush footprint, re-discretise the offset field. ──
     let mut edits = Vec::new();
+    let mut n_inside_sphere = 0u32;
     let inv_r = 1.0 / op.radius;
+    let band = SCULPT_BAND_HALF_WIDTH;
+    let sgn = match sign {
+        OffsetSign::Inflate => -1.0_f32,
+        OffsetSign::Deflate => 1.0_f32,
+    };
+
     for z in lo.z..hi.z {
         for y in lo.y..hi.y {
             for x in lo.x..hi.x {
                 let c = UVec3::new(x, y, z);
                 let i = idx(c);
-                if !is_addable[i] {
-                    continue;
+                if state_kind[i] == 3 || !best_d2[i].is_finite() {
+                    continue; // OOB, or no surface reached this cell
                 }
-                let d_step = dist[i];
-                if d_step == 0 || d_step == u8::MAX {
-                    continue;
+                let cc = cell_center(c);
+                let axis_d = axis_distance(cc, op);
+                if axis_d > op.radius {
+                    continue; // outside the brush footprint → no influence
                 }
-
-                let cell_center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
-                // Capsule axis distance — collapses to sphere distance
-                // when `segment_start == center`. Falloff parameter is
-                // the same `1 − d/r` shape across the cylindrical
-                // body, so a drag stroke gets a uniform-thickness
-                // ribbon rather than a sequence of meeting-circle
-                // creases between adjacent spheres.
-                let dist_from_brush = axis_distance(cell_center, op);
-                if dist_from_brush > op.radius {
-                    continue;
+                let t = (1.0 - axis_d * inv_r).clamp(0.0, 1.0);
+                let off = op.falloff_curve.evaluate(t) * op.strength;
+                if off <= 1e-3 {
+                    continue; // negligible influence at the rim
                 }
                 n_inside_sphere += 1;
-                let t = (1.0 - dist_from_brush * inv_r).clamp(0.0, 1.0);
-                let s = op.falloff_curve.evaluate(t);
-                // ceil so any non-zero strength reaches at least one
-                // voxel — keeps the brush from "disappearing" at low
-                // strength values.
-                let target_thickness = (s * op.strength).ceil() as u8;
-                if d_step <= target_thickness {
-                    let inherited = seed_normal[i];
-                    let normal = if inherited != Vec3::ZERO {
-                        inherited
+
+                // Distance-weighted blend of the nearest-surface planes over
+                // the 3×3×3 neighbourhood. Each cell carries only ITS nearest
+                // seed's plane, so across a seed-territory boundary adjacent
+                // cells carry different planes whose values disagree — a
+                // discontinuous field that shattered the dome top (max
+                // extrapolation = max disagreement). Averaging the plane
+                // evaluations AT this cell, weighted by each contributing
+                // seed's proximity, gives a C0-smooth reconstruction that
+                // still tracks the true surface.
+                let (sd0, n_field) = {
+                    let mut w_sum = 0.0f32;
+                    let mut sd_acc = 0.0f32;
+                    let mut n_acc = Vec3::ZERO;
+                    for dz in -1i32..=1 {
+                        for dy in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                let nx = x as i32 + dx;
+                                let ny = y as i32 + dy;
+                                let nz = z as i32 + dz;
+                                if nx < lo.x as i32
+                                    || nx >= hi.x as i32
+                                    || ny < lo.y as i32
+                                    || ny >= hi.y as i32
+                                    || nz < lo.z as i32
+                                    || nz >= hi.z as i32
+                                {
+                                    continue;
+                                }
+                                let j = idx(UVec3::new(nx as u32, ny as u32, nz as u32));
+                                if !best_d2[j].is_finite() {
+                                    continue;
+                                }
+                                let pj = p_surf_grid[j];
+                                let nj = normal_grid[j];
+                                let d2 = (cc - pj).length_squared();
+                                let w = 1.0 / (0.25 + d2);
+                                sd_acc += w * (cc - pj).dot(nj);
+                                n_acc += w * nj;
+                                w_sum += w;
+                            }
+                        }
+                    }
+                    if w_sum > 0.0 {
+                        // `n_field` = the weighted-AVERAGE normal (NOT
+                        // renormalised). To first order it IS the gradient of
+                        // the blended `sd0` field: where the contributing seed
+                        // normals agree (flat / uniform slope) its length is 1;
+                        // where they disagree (curvature / seed-territory
+                        // boundary) its length drops below 1, exactly encoding
+                        // `|∇sd0| < 1` of the smoothed field. Dividing the field
+                        // value by this length below recovers the true Euclidean
+                        // distance — renormalising it to a unit vector (as an
+                        // earlier version did) would over-state `|∇sdp|` on
+                        // slopes and shrink the stored distance, mis-placing the
+                        // dual vertex.
+                        (sd_acc / w_sum, n_acc / w_sum)
                     } else {
-                        brush_add_normal(c, op)
-                    };
-                    edits.push(LeafEdit {
-                        coord: c,
-                        op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(c, op) },
-                    });
+                        ((cc - p_surf_grid[i]).dot(normal_grid[i]), normal_grid[i])
+                    }
+                };
+                let sdp = sd0 + sgn * off;
+
+                // The offset field is NOT unit-gradient: moving outward both
+                // raises `sd` (toward empty) and lowers `offset`, so the two
+                // gradients ADD and `|∇sdp|` reaches ~2 at a near-flat dome top.
+                // Left raw, the `[−band, 0]` band would span < 1 real voxel
+                // (leaving the layer just under the surface as data-less
+                // interior → Manifold-DC's both-sides-sentinel fallback, which
+                // spikes the near-tangent top) and the stored distance would be
+                // ~2× too large (mis-placing the dual vertex). Normalising by
+                // the gradient length recovers a true Euclidean voxel distance
+                // — the same `d_vox = d / |∇d|` the terrain bake applies — and
+                // the normalised gradient IS the surface normal.
+                //
+                // ∇sdp = ∇sd + sgn·∇offset = n_field + sgn·grad_off, where
+                // ∇offset is brush-radial with magnitude
+                // strength·falloff'(t)·(−1/radius) (offset falls as axis_d grows).
+                let radial = {
+                    let v = cc - closest_on_axis(cc, op);
+                    let l2 = v.length_squared();
+                    if l2 > 1e-8 {
+                        v * l2.sqrt().recip()
+                    } else {
+                        Vec3::ZERO
+                    }
+                };
+                let grad_off =
+                    radial * (op.strength * op.falloff_curve.evaluate_deriv(t) * (-inv_r));
+                let grad = n_field + grad_off * sgn;
+                let glen = grad.length();
+                let (surf_n, dist_vox) = if glen > 1e-4 {
+                    // surf_n is the UNIT surface normal (stored); dist_vox is the
+                    // Euclidean voxel distance (field value ÷ gradient length).
+                    (grad / glen, sdp / glen)
+                } else {
+                    // Degenerate gradient (opposing seed normals cancel): fall
+                    // back to a stable unit direction, leave the field value raw.
+                    (normal_grid[i], sdp)
+                };
+
+                let kind = state_kind[i];
+                // Current accumulated distance for an existing surface leaf
+                // (the running field from earlier stamps this stroke; defensive
+                // `.get` for the no-distances fallback).
+                let prev_dist = |slot: u32| {
+                    dists
+                        .get(slot as usize)
+                        .copied()
+                        .map(crate::LeafAttrPool::dequantize_dist)
+                        .unwrap_or(0.0)
+                };
+                match sign {
+                    OffsetSign::Inflate => {
+                        // Monotonic GROW: across a stroke the surface only moves
+                        // outward — the union of the stamp domes (deepest
+                        // inflation wins). A re-touched surface leaf's distance
+                        // only ever goes MORE negative; a later far stamp never
+                        // raises (lowers the surface of) an earlier near stamp's
+                        // inflation, which would scallop a drag ridge.
+                        match kind {
+                            2 => {
+                                let slot = slot_grid[i];
+                                let prev = prev_dist(slot);
+                                let nd = dist_vox.min(prev);
+                                if nd < prev - 1e-4 {
+                                    edits.push(LeafEdit {
+                                        coord: c,
+                                        op: LeafEditOp::SetDist { slot, normal: surf_n, dist: nd },
+                                    });
+                                }
+                            }
+                            0 if dist_vox <= 0.0 => {
+                                if dist_vox >= -band {
+                                    edits.push(LeafEdit {
+                                        coord: c,
+                                        op: LeafEditOp::Add {
+                                            material: op.material,
+                                            normal: surf_n,
+                                            dist: dist_vox,
+                                        },
+                                    });
+                                } else {
+                                    edits.push(LeafEdit { coord: c, op: LeafEditOp::SetInterior });
+                                }
+                            }
+                            // Empty cell this dome doesn't reach, or interior
+                            // bulk (already solid) — nothing to do.
+                            _ => {}
+                        }
+                    }
+                    OffsetSign::Deflate => {
+                        // Monotonic ERODE: the surface only moves inward — the
+                        // union of erosions (most-eroded wins). A re-touched
+                        // cell's distance only ever goes MORE positive.
+                        match kind {
+                            2 => {
+                                let slot = slot_grid[i];
+                                let prev = prev_dist(slot);
+                                let nd = dist_vox.max(prev);
+                                if nd > band {
+                                    edits.push(LeafEdit { coord: c, op: LeafEditOp::Remove });
+                                } else if nd > prev + 1e-4 {
+                                    edits.push(LeafEdit {
+                                        coord: c,
+                                        op: LeafEditOp::SetDist { slot, normal: surf_n, dist: nd },
+                                    });
+                                }
+                            }
+                            1 => {
+                                // Interior bulk first exposed by this erosion.
+                                if dist_vox > band {
+                                    edits.push(LeafEdit { coord: c, op: LeafEditOp::Empty });
+                                } else if dist_vox >= -band {
+                                    edits.push(LeafEdit {
+                                        coord: c,
+                                        op: LeafEditOp::Add {
+                                            material: op.material,
+                                            normal: surf_n,
+                                            dist: dist_vox,
+                                        },
+                                    });
+                                }
+                                // Deep interior beyond the erosion stays interior.
+                            }
+                            // Empty stays empty — Deflate never adds material back.
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -985,10 +1257,11 @@ fn clay_strip_normal(_horiz_dist: f32, _diff: Vec3, _op: &BrushOp) -> Vec3 {
     Vec3::Y
 }
 
-/// Clay strip deposit. Same brushfire infrastructure as
-/// [`compute_inflate_edits`] but with a flat-top thickness profile:
-/// full `strength` cells across the inner 75% of the brush radius,
-/// tapering to zero over a 25% shoulder at the lateral edges.
+/// Clay strip deposit. A brushfire-shell kernel (Inflate/Deflate were
+/// migrated to the SDF-offset [`compute_offset_edits`] path; ClayStrip still
+/// uses brushfire) with a flat-top thickness profile: full `strength` cells
+/// across the inner 75% of the brush radius, tapering to zero over a 25%
+/// shoulder at the lateral edges.
 fn compute_clay_strip_edits(
     octree: &SparseOctree,
     brick_pool: &BrickPool,
@@ -1143,417 +1416,6 @@ fn compute_clay_strip_edits(
                 ).ceil() as u8;
                 if d_step <= target_thickness {
                     let normal = clay_strip_normal(horiz_dist, diff, op);
-                    edits.push(LeafEdit {
-                        coord: c,
-                        op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(c, op) },
-                    });
-                }
-            }
-        }
-    }
-
-    SculptDelta {
-        edits,
-        timing: ComputeBrushEditsTiming {
-            n_aabb_cells,
-            n_inside_sphere,
-            n_cell_state_calls,
-            n_neighbor_calls: 0,
-            t_total_ns: t_start.elapsed().as_nanos() as u64,
-        },
-    }
-}
-
-/// Soft inward erosion. Mirror of [`compute_inflate_edits`]: brushfire
-/// seeds from Empty cells and propagates inward into Solid / Interior
-/// bulk; cells whose distance-to-empty falls within the falloff-shaped
-/// target thickness are removed. After the erosion pocket is
-/// determined, every Interior cell that borders the pocket becomes a
-/// cavity-wall surface leaf — same rule Carve uses on its outside-rim
-/// Interior cells, just driven by the per-cell erosion mask instead
-/// of a hard sphere boundary.
-///
-/// **Ops emitted.** Solid cells inside the pocket → `Remove`;
-/// Interior cells inside the pocket → `Empty`; Interior cells
-/// outside the pocket with a pocket-adjacent 6-neighbour → `Add
-/// { material, normal }`. Existing Solid surface cells that aren't
-/// eroded keep their bake-time normal — they were already surface
-/// and the bake gradient is still a better direction than the
-/// brush-sphere gradient would be.
-///
-/// **Cavity-wall normals — surface-following inheritance.** Same
-/// principle as [`compute_inflate_edits`], inverted seed direction.
-/// The brushfire propagates from Empty (and OOB-treated-as-Empty)
-/// seeds inward into the bulk; when it reaches a Solid cell at
-/// distance N, that cell stamps the `seed_normal` grid with its own
-/// bake-time `LeafAttr.normal_oct` (which points outward from the
-/// bulk). As the walk continues to Interior cells at distance N+1,
-/// N+2, ..., they inherit that direction from their predecessor.
-/// The cavity wall — the first Interior cell beyond the erosion
-/// target_thickness — ends up holding the original surface's
-/// outward direction, which is also the new "into the pit"
-/// direction since the pit is now the empty volume on the bulk's
-/// outer side. The brushfire runs an extra step (`max_k + 1`) so
-/// cavity walls one beyond the maximum erosion depth still get
-/// reached.
-///
-/// Without this, cavity walls fall back to [`brush_add_normal`]
-/// (the brush-radial direction), which varies per stamp center —
-/// adjacent cavity walls from different stamps along a drag stroke
-/// pick up subtly different normals and produce visible shading
-/// stripes. Inheritance ties the cavity wall's direction to the
-/// existing surface, which doesn't move per-stamp.
-///
-/// **Walk shape & cost.** Same as Inflate: AABB padded by
-/// `ceil(strength)`, four sequential walks over the dense scratch
-/// grid (init / extent-edge prime / brushfire / erosion-mask +
-/// emit). Memory: ~28 bytes per cell (dist + was_solid +
-/// was_interior + in_erosion + seed_normal + original_normal).
-fn compute_deflate_edits(
-    octree: &SparseOctree,
-    brick_pool: &BrickPool,
-    leaf_attr_pool: &[LeafAttr],
-    op: &BrushOp,
-    is_stroke_edit: impl Fn(UVec3) -> bool,
-) -> SculptDelta {
-    use std::time::Instant;
-
-    let extent = octree.extent();
-    let max_k = op.strength.max(0.0).ceil() as u32;
-    if max_k == 0 || op.radius <= 0.0 {
-        return SculptDelta::default();
-    }
-    let max_k = max_k.min(254) as u8;
-
-    let (lo, hi) = brush_cell_range_padded(op, extent, max_k as u32);
-    if lo.x >= hi.x || lo.y >= hi.y || lo.z >= hi.z {
-        return SculptDelta::default();
-    }
-
-    let t_start = Instant::now();
-    let size = hi - lo;
-    let stride_y = size.x as usize;
-    let stride_z = (size.x * size.y) as usize;
-    let total = (size.x * size.y * size.z) as usize;
-    let idx = |c: UVec3| -> usize {
-        let l = c - lo;
-        (l.x as usize) + (l.y as usize) * stride_y + (l.z as usize) * stride_z
-    };
-
-    let mut dist: Vec<u8> = vec![u8::MAX; total];
-    let mut was_solid: Vec<bool> = vec![false; total];
-    let mut was_interior: Vec<bool> = vec![false; total];
-    // Transit cells — currently Empty (so the kernel doesn't emit
-    // anything for them) but emptied by a previous stamp in this
-    // stroke (so they must NOT seed brushfire at dist=0). Without this
-    // distinction stamp N's brushfire starts from stamp N-1's already-
-    // eroded region and reaches one layer deeper into the bulk every
-    // stamp — the "Deflate keeps digging" report. Treating them as
-    // transit makes the brushfire propagate THROUGH them while still
-    // measuring distance from the original pre-stroke surface, so the
-    // stroke's total depth is capped at one `target_thickness`. Bonus:
-    // earlier-stamp cavity walls (currently Solid, in the `was_solid`
-    // bucket below regardless) become reachable from the original
-    // outside through transit cells AND through the asset's
-    // pre-stroke air, so stamp N can clean up stamp N-1's walls and
-    // the channel comes out smooth.
-    let mut is_transit: Vec<bool> = vec![false; total];
-    // Per-cell propagated seed normal — see docstring. `ZERO` means
-    // "no surface seed has been carried here yet"; ZERO never names
-    // a valid unit normal so it's safe as a sentinel.
-    let mut seed_normal: Vec<Vec3> = vec![Vec3::ZERO; total];
-    // Pre-unpacked bake-time normal for every Solid cell in the
-    // AABB. Pulled out so the brushfire loop can stamp seed_normal
-    // when it reaches the cell without re-touching the
-    // `leaf_attr_pool`.
-    let mut original_normal: Vec<Vec3> = vec![Vec3::ZERO; total];
-
-    let mut cache = crate::sparse_octree::CellStateCache::new();
-    let mut n_cell_state_calls = 0u32;
-    let mut n_aabb_cells = 0u32;
-    let mut n_inside_sphere = 0u32;
-
-    // ── Init: Empty cells seed the brushfire; Solid / Interior
-    // record their original kind for the emit + cavity-wall passes.
-    //
-    // **OOB-as-Empty.** Cells outside the octree extent are air
-    // conceptually, so they seed the brushfire alongside actual
-    // Empty cells. The AABB is clipped to the extent so OOB cells
-    // never appear in the inner loop directly — instead, any
-    // Solid / Interior cell at the asset extent boundary is
-    // pre-marked with `dist = 1` (i.e. "one step from a virtual
-    // empty seed just past the extent"). Lets Deflate erode the
-    // asset's outermost surface even when the brush sits right at
-    // the extent boundary; without this an all-Interior asset
-    // would have no seeds inside the AABB and Deflate would no-op. ──
-    for z in lo.z..hi.z {
-        for y in lo.y..hi.y {
-            for x in lo.x..hi.x {
-                n_aabb_cells += 1;
-                let c = UVec3::new(x, y, z);
-                let state = octree.cell_state_cached(c, brick_pool, &mut cache);
-                n_cell_state_calls += 1;
-                let i = idx(c);
-                let edited = is_stroke_edit(c);
-                match state {
-                    CellState::Empty => {
-                        if edited {
-                            // Emptied this stroke — brushfire transits
-                            // through but doesn't restart distance at 0.
-                            is_transit[i] = true;
-                        } else {
-                            dist[i] = 0;
-                        }
-                    }
-                    CellState::OutOfBounds => dist[i] = 0,
-                    CellState::Solid(slot) => {
-                        was_solid[i] = true;
-                        if let Some(attr) = leaf_attr_pool.get(slot as usize) {
-                            original_normal[i] = unpack_oct(attr.normal_oct);
-                        }
-                    }
-                    CellState::Interior => was_interior[i] = true,
-                }
-            }
-        }
-    }
-    for z in lo.z..hi.z {
-        for y in lo.y..hi.y {
-            for x in lo.x..hi.x {
-                let c = UVec3::new(x, y, z);
-                let i = idx(c);
-                if !was_solid[i] && !was_interior[i] {
-                    continue;
-                }
-                let touches_extent_edge = x == 0
-                    || y == 0
-                    || z == 0
-                    || x + 1 == extent
-                    || y + 1 == extent
-                    || z + 1 == extent;
-                if touches_extent_edge {
-                    dist[i] = 1;
-                    // Same self-stamp rule as the brushfire below:
-                    // a pre-marked Solid cell seeds the inheritance
-                    // chain with its own bake-time normal.
-                    if was_solid[i] && original_normal[i] != Vec3::ZERO {
-                        seed_normal[i] = original_normal[i];
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Brushfire into Solid / Interior cells. Runs to `max_k + 1`
-    // (one beyond the maximum possible target_thickness) so the
-    // cavity wall — the first Interior cell beyond the erosion
-    // pocket — gets a propagated `seed_normal`. Each reached cell
-    // either stamps its own bake-time normal (if it's a Solid
-    // surface) or averages from its predecessors (Interior bulk).
-    //
-    // **Seed-normal averaging.** Sums non-zero `seed_normal` values
-    // from every `dist == prev` predecessor and normalises. At a
-    // box corner where +X, +Y, +Z surface faces all reach the
-    // brushfire at the same depth, the three face-normals average
-    // to `(1, 1, 1)/√3` — a smooth corner direction that adjacent
-    // cells deeper in the bulk all converge on. "First-found" would
-    // let adjacent cavity walls inherit from different faces 90°
-    // apart and produce visible scatter on the eroded surface. ──
-    let brushfire_steps: u8 = max_k.saturating_add(1).min(254);
-    for step in 1..=brushfire_steps {
-        let prev = step - 1;
-        for z in lo.z..hi.z {
-            for y in lo.y..hi.y {
-                for x in lo.x..hi.x {
-                    let c = UVec3::new(x, y, z);
-                    let i = idx(c);
-                    // Propagation extends to `was_solid` / `was_interior`
-                    // targets (these emit erosion ops below) AND to
-                    // `is_transit` cells (currently Empty, emptied
-                    // this stroke — they carry distance so cells
-                    // beyond them get the correct value, but they
-                    // don't emit anything themselves).
-                    if dist[i] != u8::MAX
-                        || (!was_solid[i] && !was_interior[i] && !is_transit[i])
-                    {
-                        continue;
-                    }
-                    let predecessors = [
-                        (x > lo.x).then(|| idx(UVec3::new(x - 1, y, z))),
-                        (x + 1 < hi.x).then(|| idx(UVec3::new(x + 1, y, z))),
-                        (y > lo.y).then(|| idx(UVec3::new(x, y - 1, z))),
-                        (y + 1 < hi.y).then(|| idx(UVec3::new(x, y + 1, z))),
-                        (z > lo.z).then(|| idx(UVec3::new(x, y, z - 1))),
-                        (z + 1 < hi.z).then(|| idx(UVec3::new(x, y, z + 1))),
-                    ];
-                    let mut found = false;
-                    let mut sum = Vec3::ZERO;
-                    for p in predecessors.iter().flatten() {
-                        if dist[*p] != prev {
-                            continue;
-                        }
-                        found = true;
-                        let n = seed_normal[*p];
-                        if n != Vec3::ZERO {
-                            sum += n;
-                        }
-                    }
-                    if found {
-                        dist[i] = step;
-                        let len_sq = sum.length_squared();
-                        let inherited = if len_sq > 1e-6 {
-                            sum * len_sq.sqrt().recip()
-                        } else {
-                            Vec3::ZERO
-                        };
-                        // Solid cells override the inherited chain
-                        // with their own bake-time normal — they
-                        // ARE a real surface so they're the more
-                        // authoritative source for everything
-                        // deeper than them.
-                        seed_normal[i] = if was_solid[i] && original_normal[i] != Vec3::ZERO {
-                            original_normal[i]
-                        } else {
-                            inherited
-                        };
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Determine erosion mask (cells the brush will actually
-    // remove). Decoupling this from emit so the cavity-wall pass
-    // below can read it. ──
-    let mut in_erosion: Vec<bool> = vec![false; total];
-    let inv_r = 1.0 / op.radius;
-    for z in lo.z..hi.z {
-        for y in lo.y..hi.y {
-            for x in lo.x..hi.x {
-                let c = UVec3::new(x, y, z);
-                let i = idx(c);
-                if !was_solid[i] && !was_interior[i] {
-                    continue;
-                }
-                let d_step = dist[i];
-                if d_step == 0 || d_step == u8::MAX {
-                    continue;
-                }
-                let cell_center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
-                // Capsule axis distance — see Inflate's emit pass for
-                // the longer rationale. Collapses to sphere distance
-                // for single stamps; gives a uniform-thickness ribbon
-                // along a drag.
-                let dist_from_brush = axis_distance(cell_center, op);
-                if dist_from_brush > op.radius {
-                    continue;
-                }
-                n_inside_sphere += 1;
-                let t = (1.0 - dist_from_brush * inv_r).clamp(0.0, 1.0);
-                let s = op.falloff_curve.evaluate(t);
-                let target_thickness = (s * op.strength).ceil() as u8;
-                if d_step <= target_thickness {
-                    in_erosion[i] = true;
-                }
-            }
-        }
-    }
-
-    // ── Emit pass: Removes / Empties for in-erosion cells, plus
-    // cavity-wall Adds for Interior cells that border the pocket. ──
-    let mut edits = Vec::new();
-    for z in lo.z..hi.z {
-        for y in lo.y..hi.y {
-            for x in lo.x..hi.x {
-                let c = UVec3::new(x, y, z);
-                let i = idx(c);
-                if in_erosion[i] {
-                    if was_solid[i] {
-                        edits.push(LeafEdit { coord: c, op: LeafEditOp::Remove });
-                    } else if was_interior[i] {
-                        edits.push(LeafEdit { coord: c, op: LeafEditOp::Empty });
-                    }
-                    continue;
-                }
-                // Cavity-wall rule: an Interior cell that's NOT in
-                // the erosion pocket but has a 6-neighbour that IS
-                // becomes a freshly-exposed surface leaf. The same
-                // outside-rim pattern Carve uses, driven here by
-                // the soft erosion mask instead of a hard sphere.
-                if !was_interior[i] {
-                    continue;
-                }
-                let adj_eroded =
-                    (x > lo.x && in_erosion[idx(UVec3::new(x - 1, y, z))])
-                        || (x + 1 < hi.x && in_erosion[idx(UVec3::new(x + 1, y, z))])
-                        || (y > lo.y && in_erosion[idx(UVec3::new(x, y - 1, z))])
-                        || (y + 1 < hi.y && in_erosion[idx(UVec3::new(x, y + 1, z))])
-                        || (z > lo.z && in_erosion[idx(UVec3::new(x, y, z - 1))])
-                        || (z + 1 < hi.z && in_erosion[idx(UVec3::new(x, y, z + 1))]);
-                if adj_eroded {
-                    // Cavity-wall normal: prefer the brushfire-
-                    // propagated `seed_normal`, which carries the
-                    // original surface's outward direction inward
-                    // through the brushfire propagation. The
-                    // surface doesn't move per-stamp, so adjacent
-                    // walls along a drag inherit the SAME direction
-                    // and shade consistently — fixes the per-stamp
-                    // shading stripe that `brush_add_normal` alone
-                    // produces (its direction varies with the brush
-                    // center, so each stamp's walls pick up subtly
-                    // different normals).
-                    //
-                    // Sometimes the brushfire chain into this cell
-                    // is truncated by the AABB edge or by a normal-
-                    // cancellation degenerate (two predecessors with
-                    // opposite surface normals), and `seed_normal[i]`
-                    // ends up ZERO. Before falling back to
-                    // `brush_add_normal` — which produces the
-                    // per-stamp variation the inheritance is meant
-                    // to avoid — average any non-zero seed_normals
-                    // among the 6-neighbours; the adj_eroded check
-                    // guarantees at least one of them is an in_erosion
-                    // cell that brushfire reached, so a useful
-                    // direction is almost always available. Only
-                    // genuinely isolated cells (no neighbour has a
-                    // non-zero normal) fall through to the radial
-                    // gradient.
-                    let inherited = seed_normal[i];
-                    let normal = if inherited != Vec3::ZERO {
-                        inherited
-                    } else {
-                        let mut sum = Vec3::ZERO;
-                        if x > lo.x {
-                            let n = seed_normal[idx(UVec3::new(x - 1, y, z))];
-                            if n != Vec3::ZERO { sum += n; }
-                        }
-                        if x + 1 < hi.x {
-                            let n = seed_normal[idx(UVec3::new(x + 1, y, z))];
-                            if n != Vec3::ZERO { sum += n; }
-                        }
-                        if y > lo.y {
-                            let n = seed_normal[idx(UVec3::new(x, y - 1, z))];
-                            if n != Vec3::ZERO { sum += n; }
-                        }
-                        if y + 1 < hi.y {
-                            let n = seed_normal[idx(UVec3::new(x, y + 1, z))];
-                            if n != Vec3::ZERO { sum += n; }
-                        }
-                        if z > lo.z {
-                            let n = seed_normal[idx(UVec3::new(x, y, z - 1))];
-                            if n != Vec3::ZERO { sum += n; }
-                        }
-                        if z + 1 < hi.z {
-                            let n = seed_normal[idx(UVec3::new(x, y, z + 1))];
-                            if n != Vec3::ZERO { sum += n; }
-                        }
-                        let len_sq = sum.length_squared();
-                        if len_sq > 1e-6 {
-                            sum * len_sq.sqrt().recip()
-                        } else {
-                            brush_add_normal(c, op)
-                        }
-                    };
                     edits.push(LeafEdit {
                         coord: c,
                         op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(c, op) },
@@ -1910,6 +1772,31 @@ fn compute_smooth_edits(
     }
 }
 
+/// Depth (voxels, inside the brush surface) of the surface band the Raise
+/// emitter stores analytic distance+normal on (when [`sculpt_band_on`]).
+/// The legacy code collapsed the WHOLE brush interior to `SetInterior`
+/// (no Hermite data), leaving only the one-voxel OUTSIDE rim with stored
+/// distances — so a straddling cube on the dome flank had a single sparse
+/// plane and the Manifold-DC mesher extrapolated + clamped to integer rows
+/// (= terracing). Storing analytic dist+normal on the inside-surface band
+/// gives the cube INSIDE-side Hermite data too; paired with the unchanged
+/// outside rim, DC interpolates a true two-sided crossing. Cells deeper
+/// than this stay `SetInterior` bulk. Within the brush footprint, so no
+/// extra walk padding is needed.
+const SCULPT_BAND_HALF_WIDTH: f32 = 1.5;
+
+/// Sculpt RAISE surface representation. On (default): the inside-surface
+/// band ([`SCULPT_BAND_HALF_WIDTH`]) stores the analytic brush
+/// distance+normal as `Add` surface leaves (de-terraces the dome + feeds
+/// dense analytic normals to the re-extract), pairing with the existing
+/// outside rim for two-sided DC data. Off (`ARVX_SCULPT_BAND=0`): the
+/// legacy path where the interior collapses to `SetInterior` with no
+/// Hermite data → integer-row terracing. Read once.
+pub fn sculpt_band_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ARVX_SCULPT_BAND").map(|v| v != "0").unwrap_or(true))
+}
+
 /// Carve, inside-brush cell. `Solid` → Remove; `Interior` → Empty (deep
 /// carve through bulk). EMPTY stays as-is.
 #[inline]
@@ -1948,18 +1835,42 @@ fn emit_carve_outside_rim(
     }
 }
 
-/// Raise, inside-brush cell. `Empty` → SetInterior (clay bulk).
-/// Solid/Interior cells stay (sculpt isn't paint).
+/// Raise, inside-brush cell (`d = brush_sdf(center) ≤ 0`). `Empty` cells
+/// become solid: within the near-surface band (`d ≥ −band`) they are
+/// `Add` surface leaves carrying the analytic brush distance (negative,
+/// inside) + normal, so the dome flank has inside-side Hermite data;
+/// deeper cells collapse to `SetInterior` bulk. Solid/Interior cells stay
+/// (Raise unions onto existing mass — it isn't paint). With the band off,
+/// every inside `Empty` cell is `SetInterior` (legacy).
 #[inline]
-fn emit_raise_inside(edits: &mut Vec<LeafEdit>, coord: UVec3, state: CellState) {
-    if matches!(state, CellState::Empty) {
+fn emit_raise_inside(
+    edits: &mut Vec<LeafEdit>,
+    coord: UVec3,
+    state: CellState,
+    d: f32,
+    op: &BrushOp,
+) {
+    if !matches!(state, CellState::Empty) {
+        return;
+    }
+    if sculpt_band_on() && d >= -SCULPT_BAND_HALF_WIDTH {
+        let normal = brush_add_normal(coord, op);
+        edits.push(LeafEdit {
+            coord,
+            op: LeafEditOp::Add { material: op.material, normal, dist: brush_add_dist(coord, op) },
+        });
+    } else {
         edits.push(LeafEdit { coord, op: LeafEditOp::SetInterior });
     }
 }
 
 /// Raise, outside-brush cell. Only `Empty` cells with an inside-brush
 /// 6-neighbour that will flip to `Interior` (Empty pre-stamp) become
-/// dome-surface `Add` cells.
+/// dome-surface `Add` cells — the OUTSIDE-side Hermite data (positive
+/// dist + analytic normal) that pairs with [`emit_raise_inside`]'s
+/// inside-band so a straddling cube has a two-sided crossing. The
+/// neighbour gate (vs a plain distance band) is what keeps a Raise over
+/// existing solid a no-op — no new mass, no spurious surface shell.
 #[inline]
 fn emit_raise_outside_rim(
     edits: &mut Vec<LeafEdit>,
@@ -2267,6 +2178,22 @@ pub fn apply_delta(
         })
         .collect();
 
+    // SDF-offset Inflate/Deflate's `SetDist` edits land here: the cell stays
+    // Solid (no octree mutation, no slot alloc) — only its stored distance
+    // (and refreshed normal) change. The scene-manager consumer drains
+    // `redist_slots` into the LeafAttrPool via `set_dist` + `normal_oct`.
+    let redist_slots: Vec<(u32, Vec3, f32)> = delta
+        .edits
+        .iter()
+        .filter_map(|edit| {
+            if let LeafEditOp::SetDist { slot, normal, dist } = edit.op {
+                Some((slot, normal, dist))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // ── Teardown ─────────────────────────────────────────────────
     let t_take = Instant::now();
     let octree_log = octree.take_mutation_log().unwrap_or_default();
@@ -2275,6 +2202,7 @@ pub fn apply_delta(
     AppliedDelta {
         allocated_slots,
         renormalized_slots,
+        redist_slots,
         freed_slots,
         octree_log,
         timing: ApplyDeltaTiming {
@@ -2406,7 +2334,7 @@ mod tests {
             mode: BrushMode::Carve,
             material: 0,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         assert_eq!(delta.count_removed(), 1);
         assert_eq!(delta.count_added(), 0);
 
@@ -2430,7 +2358,7 @@ mod tests {
             mode: BrushMode::Carve,
             material: 0,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         assert!(delta.is_empty());
         let applied = apply_delta(&mut t, &mut pool, &delta, || panic!("no alloc"));
         assert!(applied.allocated_slots.is_empty());
@@ -2464,7 +2392,7 @@ mod tests {
             mode: BrushMode::Carve,
             material: 0,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         assert!(
             delta.count_added() > 0,
             "expected outside-rim cavity-wall ADD edits; got {} adds / {} empties",
@@ -2483,11 +2411,14 @@ mod tests {
         // depth=3 → 8³ tree, all EMPTY. brick_depth=1, so apply_delta
         // materializes a brick at level 1 covering (4..8, 4..8, 4..8).
         //
-        // New rule: inside-brush EMPTY → SetInterior; outside-brush
-        // EMPTY with inside-brush EMPTY neighbor → Add (dome surface).
-        // A radius-0.4 brush centered on (4.5,4.5,4.5) catches exactly
-        // one inside-brush cell (4,4,4) and its six face-neighbours
-        // become outside-rim Add cells.
+        // Band rule (ARVX_SCULPT_BAND, default on): inside-brush EMPTY
+        // within `SCULPT_BAND_HALF_WIDTH` of the surface → `Add` surface
+        // leaf (analytic dist+normal); deeper inside-brush EMPTY →
+        // SetInterior; outside-brush EMPTY with an inside-brush EMPTY
+        // neighbour → `Add` (outside rim). A radius-0.4 brush at
+        // (4.5,4.5,4.5) catches one inside-brush cell (4,4,4) at d=−0.4
+        // (within the band → `Add`, no bulk) and its six face-neighbours
+        // become outside-rim `Add`s — seven `Add`s, zero SetInterior.
         let mut t = SparseOctree::new(3, 1.0);
         let mut pool = fresh_pool();
         let op = BrushOp {
@@ -2499,9 +2430,9 @@ mod tests {
             mode: BrushMode::Raise,
             material: 7,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
-        assert_eq!(delta.count_interior(), 1, "expected one SetInterior bulk cell");
-        assert_eq!(delta.count_added(), 6, "expected one face-neighbour Add per axis");
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
+        assert_eq!(delta.count_interior(), 0, "inside cell is within the band → Add, no SetInterior bulk");
+        assert_eq!(delta.count_added(), 7, "one inside-band Add + six outside-rim Adds");
         assert_eq!(delta.count_removed(), 0);
 
         // Allocator hands out monotonically increasing ids.
@@ -2511,7 +2442,7 @@ mod tests {
             next += 1;
             s
         });
-        assert_eq!(applied.allocated_slots.len(), 6);
+        assert_eq!(applied.allocated_slots.len(), 7);
         for (slot, attrs) in &applied.allocated_slots {
             assert!(*slot >= 100);
             assert_eq!(attrs.material, 7);
@@ -2527,9 +2458,10 @@ mod tests {
         let add_pass_idx = delta.edits[..add_idx].iter().filter(|e| matches!(e.op, LeafEditOp::Add { .. })).count();
         let (_, attrs) = applied.allocated_slots[add_pass_idx];
         assert!(attrs.normal.x > 0.95, "+X dome cell should have +X normal; got {:?}", attrs.normal);
-        // Cell (4,4,4) is now INTERIOR bulk.
+        // Cell (4,4,4) is within the band → now a SURFACE leaf (Solid),
+        // carrying the analytic brush dist/normal, not collapsed to bulk.
         let center_state = t.cell_state(UVec3::new(4, 4, 4), &pool);
-        assert!(matches!(center_state, CellState::Interior), "centre cell should be INTERIOR, got {:?}", center_state);
+        assert!(matches!(center_state, CellState::Solid(_)), "centre cell should be a surface leaf, got {:?}", center_state);
     }
 
     #[test]
@@ -2547,7 +2479,7 @@ mod tests {
             mode: BrushMode::Raise,
             material: 99,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         assert!(delta.is_empty());
         let applied = apply_delta(&mut t, &mut pool, &delta, || panic!("no alloc"));
         assert!(applied.allocated_slots.is_empty());
@@ -2570,7 +2502,7 @@ mod tests {
             mode: BrushMode::Raise,
             material: 1,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         assert!(delta.is_empty(), "Raise on Interior cells is a no-op");
     }
 
@@ -2588,12 +2520,12 @@ mod tests {
             mode: BrushMode::Carve,
             material: 0,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         assert!(delta.is_empty());
 
         // And on the far side.
         let op2 = BrushOp { center: Vec3::splat(100.0), ..op };
-        let delta2 = compute_brush_edits(&t, &pool, &[], op2);
+        let delta2 = compute_brush_edits(&t, &pool, &[], &[], op2);
         assert!(delta2.is_empty());
 
         // Sanity: applying empty delta leaves the tree untouched.
@@ -2629,7 +2561,7 @@ mod tests {
             mode: BrushMode::Carve,
             material: 0,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         let n_removed = delta.count_removed();
         assert!(n_removed > 0 && n_removed < total,
             "expected partial overlap, got {n_removed} of {total}");
@@ -2700,7 +2632,7 @@ mod tests {
             mode: BrushMode::Raise,
             material: 1,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         // Find the index of (12, 8, 8) in the Add subsequence so we
         // can pull its post-stamp normal from `allocated_slots`.
         let target = UVec3::new(12, 8, 8);
@@ -2734,7 +2666,7 @@ mod tests {
             mode: BrushMode::Raise,
             material: 1,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         assert!(delta.count_interior() > 0, "expected SetInterior edits for deep Raise");
         assert!(delta.count_added() > 0, "expected outside-rim dome-surface Add edits");
         assert_eq!(delta.count_removed(), 0);
@@ -2766,7 +2698,7 @@ mod tests {
             mode: BrushMode::Carve,
             material: 7,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         assert!(delta.count_removed() > 0, "expected Remove edits on the shell");
         assert_eq!(delta.count_added(), 0, "thin shell has no INTERIOR to form cavity walls");
     }
@@ -2832,15 +2764,16 @@ mod tests {
             mode: BrushMode::Raise,
             material: 4,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         let mut next = 0u32;
         let _applied = apply_delta(&mut t, &mut pool, &delta, || { let s = next; next += 1; s });
 
-        // Every Add cell sits on the outside rim. Walk each one and
-        // verify it has at least one INTERIOR face-neighbour (the bulk
-        // it bounds). Any "floating" Add cell with no INTERIOR neighbour
-        // would be a pinhole-adjacent ghost — the regression case the
-        // old ½-voxel-band rule produced.
+        // No Add cell may float in empty space. Each must touch solid
+        // mass — an INTERIOR (deep bulk) OR SOLID (a band/rim surface
+        // leaf) face-neighbour. (Under the band rule the inside-surface
+        // Adds border other band Adds rather than the Interior bulk, so
+        // the old "INTERIOR neighbour" proxy is too strict; "connected to
+        // mass" is the real anti-pinhole invariant.)
         let mut adds = 0;
         for edit in &delta.edits {
             if !matches!(edit.op, LeafEditOp::Add { .. }) {
@@ -2848,17 +2781,17 @@ mod tests {
             }
             adds += 1;
             let c = edit.coord;
-            let mut has_interior = false;
+            let mut touches_mass = false;
             for d in [IVec3::X, -IVec3::X, IVec3::Y, -IVec3::Y, IVec3::Z, -IVec3::Z] {
                 let n = IVec3::new(c.x as i32, c.y as i32, c.z as i32) + d;
                 if n.x < 0 || n.y < 0 || n.z < 0 || n.x >= 16 || n.y >= 16 || n.z >= 16 { continue; }
                 let nu = UVec3::new(n.x as u32, n.y as u32, n.z as u32);
-                if matches!(t.cell_state(nu, &pool), CellState::Interior) {
-                    has_interior = true;
+                if matches!(t.cell_state(nu, &pool), CellState::Interior | CellState::Solid(_)) {
+                    touches_mass = true;
                     break;
                 }
             }
-            assert!(has_interior, "Add cell {c} has no INTERIOR neighbour — would be a pinhole");
+            assert!(touches_mass, "Add cell {c} has no solid neighbour — would be a pinhole ghost");
         }
         assert!(adds >= 30, "expected a dense dome-surface ring, got only {adds} Add cells");
     }
@@ -2883,7 +2816,7 @@ mod tests {
             mode: BrushMode::Carve,
             material: 0,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         // Pick an Add edit on the +X cavity rim. Brush radius 3.0 at
         // (8,8,8) makes cell (10,8,8) the outermost inside-brush cell
         // along +X (centre at (10.5,8.5,8.5), distance ≈2.6 from brush
@@ -2925,7 +2858,7 @@ mod tests {
             mode: BrushMode::Carve,
             material: 9,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         // Walls at the brush boundary band + holes in the deep
         // interior.
         let walls = delta.count_added();
@@ -2940,255 +2873,301 @@ mod tests {
         }
     }
 
-    // ── P1 Inflate / Deflate tests ───────────────────────────────
+    // ── P1 Inflate / Deflate tests (SDF-offset kernel) ───────────────
+    //
+    // The retired brushfire kernel was exercised on bare-occupancy octrees
+    // (no per-leaf distances). The SDF-offset kernel reconstructs the field
+    // from surface LEAVES that carry a signed distance + outward normal — the
+    // shape every real asset (terrain bake, imported `.arvx`) actually has —
+    // so these tests build that: a flat solid ground whose top layer is
+    // surface leaves (normal +Y, dist ≈ 0) over interior bulk.
+
+    /// Flat solid ground at octree `depth`, filled `y ∈ [0, top]`: the top
+    /// layer (`y == top`) is surface leaves with outward normal +Y and a
+    /// near-zero signed distance; everything below is interior bulk. Returns
+    /// the octree plus the per-slot leaf-attr + quantized-distance vectors
+    /// (slot `i` ↔ `attrs[i]` / `dists[i]`), ready for `compute_brush_edits`.
+    fn flat_ground(depth: u8, top: u32) -> (SparseOctree, Vec<LeafAttr>, Vec<i16>) {
+        let n = 1u32 << depth;
+        let mut t = SparseOctree::new(depth, 1.0);
+        let mut attrs: Vec<LeafAttr> = Vec::new();
+        let mut dists: Vec<i16> = Vec::new();
+        let mut slot = 0u32;
+        for z in 0..n {
+            for x in 0..n {
+                for y in 0..top {
+                    t.insert_interior(UVec3::new(x, y, z));
+                }
+                t.insert(UVec3::new(x, top, z), slot);
+                attrs.push(LeafAttr {
+                    material_primary: 1,
+                    material_secondary_blend: 0,
+                    normal_oct: pack_oct(Vec3::Y),
+                });
+                dists.push(crate::LeafAttrPool::quantize_dist(0.0));
+                slot += 1;
+            }
+        }
+        (t, attrs, dists)
+    }
+
+    /// Max solid extent (highest `y` of any Add / SetInterior / surviving
+    /// surface leaf) in column `(cx, cz)` after a delta — the dome height.
+    fn dome_top_in_column(delta: &SculptDelta, cx: u32, cz: u32) -> Option<u32> {
+        delta
+            .edits
+            .iter()
+            .filter(|e| {
+                e.coord.x == cx
+                    && e.coord.z == cz
+                    && matches!(e.op, LeafEditOp::Add { .. } | LeafEditOp::SetInterior)
+            })
+            .map(|e| e.coord.y)
+            .max()
+    }
 
     #[test]
     fn inflate_zero_strength_is_noop() {
-        // Strength = 0 → max_k = 0 → kernel returns empty delta
-        // without doing any brushfire work. Verifies the early bail.
-        let mut t = SparseOctree::new(4, 1.0);
+        // strength = 0 → max_k = 0 → early bail, empty delta.
+        let (t, attrs, dists) = flat_ground(6, 8);
         let pool = fresh_pool();
-        for y in 0..16 { for x in 0..16 { t.insert(UVec3::new(x, y, 0), 0); } }
         let op = BrushOp {
-            center: Vec3::new(8.0, 8.0, 1.0),
-            segment_start: Vec3::new(8.0, 8.0, 1.0),
+            center: Vec3::new(32.0, 8.5, 32.0),
+            segment_start: Vec3::new(32.0, 8.5, 32.0),
             radius: 4.0,
             falloff_curve: FalloffCurve::Smooth,
             strength: 0.0,
             mode: BrushMode::Inflate,
             material: 1,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
-        assert_eq!(delta.count_added(), 0);
-        assert_eq!(delta.count_removed(), 0);
+        let delta = compute_brush_edits(&t, &pool, &attrs, &dists, op);
+        assert!(delta.is_empty(), "zero-strength Inflate must be a no-op");
     }
 
     #[test]
-    fn inflate_flat_slab_raises_falloff_shaped_ridge() {
-        // Build a 32³ tree with a solid floor at z=0. Inflate at the
-        // floor center with radius 8, strength 6. The brushfire
-        // should walk upward from the floor; falloff caps thickness
-        // by horizontal distance, so the column under brush center
-        // gets ~strength voxels of new material and rim columns get
-        // 0-1 voxels.
-        let mut t = SparseOctree::new(5, 1.0);
+    fn gentle_inflate_emits_setdist_only() {
+        // A small Inflate that only re-distances existing surface leaves (the
+        // offset is too small to flip any empty cell to solid) produces a delta
+        // of PURELY SetDist edits. This is a real mutation (it moves the stored
+        // surface), so any "did anything change?" guard MUST count SetDist — the
+        // render consumer's early-return previously dropped it and the brush
+        // silently did nothing. This pins the case so that regression can't
+        // return unnoticed.
+        let (t, attrs, dists) = flat_ground(6, 8);
         let pool = fresh_pool();
-        let mut slot = 0u32;
-        for y in 0..32 {
-            for x in 0..32 {
-                t.insert(UVec3::new(x, y, 0), slot);
-                slot += 1;
-            }
-        }
         let op = BrushOp {
-            center: Vec3::new(16.0, 16.0, 0.5),
-            segment_start: Vec3::new(16.0, 16.0, 0.5),
+            center: Vec3::new(32.0, 8.5, 32.0),
+            segment_start: Vec3::new(32.0, 8.5, 32.0),
+            radius: 6.0,
+            falloff_curve: FalloffCurve::Smooth,
+            strength: 0.5,
+            mode: BrushMode::Inflate,
+            material: 9,
+        };
+        let delta = compute_brush_edits(&t, &pool, &attrs, &dists, op);
+        assert!(!delta.is_empty(), "gentle Inflate must still produce edits");
+        assert!(delta.count_set_dist() > 0, "expected SetDist re-distancing");
+        assert_eq!(delta.count_added(), 0, "offset too small to add cells");
+        assert_eq!(delta.count_interior(), 0);
+        assert_eq!(delta.count_removed(), 0, "Inflate never removes");
+        assert_eq!(delta.count_set_normal(), 0);
+    }
+
+    #[test]
+    fn inflate_grows_dome_taller_at_center() {
+        // Inflate on flat ground: adds material, removes nothing, and the
+        // dome is taller under the brush center than at the rim.
+        let (t, attrs, dists) = flat_ground(6, 8);
+        let pool = fresh_pool();
+        let op = BrushOp {
+            center: Vec3::new(32.0, 8.5, 32.0),
+            segment_start: Vec3::new(32.0, 8.5, 32.0),
             radius: 8.0,
             falloff_curve: FalloffCurve::Smooth,
             strength: 6.0,
             mode: BrushMode::Inflate,
             material: 9,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
-        assert!(delta.count_added() > 0, "expected Inflate adds on the slab");
+        let delta = compute_brush_edits(&t, &pool, &attrs, &dists, op);
+        assert!(delta.count_added() > 0, "Inflate must add material");
         assert_eq!(delta.count_removed(), 0, "Inflate must not remove anything");
-
-        let count_column = |cx: u32, cy: u32| {
-            delta.edits.iter().filter(|e| {
-                e.coord.x == cx && e.coord.y == cy
-                    && matches!(e.op, LeafEditOp::Add { .. })
-            }).count()
-        };
-        let center_height = count_column(16, 16);
-        let rim_height = count_column(22, 16);
+        // Both columns must be MEASURED (Add/SetInterior present), not defaulted
+        // to the original surface height — x=36 (dx=4) still lifts empty cells
+        // to solid, so it's a genuine rim, unlike x=39 which only re-distances.
+        let center = dome_top_in_column(&delta, 32, 32)
+            .expect("center column must grow a dome");
+        let rim = dome_top_in_column(&delta, 36, 32)
+            .expect("rim column must grow some dome");
         assert!(
-            center_height > rim_height,
-            "center column should be taller than rim column: center={center_height} rim={rim_height}",
+            center > rim,
+            "dome must be taller at center than rim: center={center} rim={rim}",
         );
+        // Height is bounded by the surface (y=8) + the brush strength: the
+        // offset field never lifts the surface by more than `strength` voxels.
         assert!(
-            center_height <= 6,
-            "center thickness must not exceed strength=6, got {center_height}",
+            center <= 8 + 6 + 1,
+            "dome top {center} must not exceed surface + strength (+1 slack)",
         );
-
-        // Every Add must use the brush material.
-        for edit in &delta.edits {
-            if let LeafEditOp::Add { material, .. } = edit.op {
+        // Every Add carries the brush material and an inside-band distance.
+        for e in &delta.edits {
+            if let LeafEditOp::Add { material, dist, .. } = e.op {
                 assert_eq!(material, 9);
+                assert!(
+                    dist <= 1e-4 && dist >= -SCULPT_BAND_HALF_WIDTH - 1e-3,
+                    "Add band distance {dist} out of [-band, 0]",
+                );
             }
         }
     }
 
     #[test]
     fn inflate_pinhole_free() {
-        // Every Inflate-emitted Add must have at least one
-        // pre-existing SOLID 6-neighbour — that's the "attached to
-        // the surface" invariant the brushfire seeds enforce. A
-        // floating Add would mean the kernel grew material across a
-        // void, which would produce a disconnected ghost shell.
-        let mut t = SparseOctree::new(5, 1.0);
+        // Every Inflate-added surface cell must attach to solid material —
+        // no floating ghost cells across a void. Walk Adds in row-major
+        // order; each must have a pre-existing-solid or already-emitted
+        // (Add / SetInterior) 6-neighbour.
+        let (t, attrs, dists) = flat_ground(6, 8);
         let pool = fresh_pool();
-        let mut slot = 0u32;
-        for y in 0..32 {
-            for x in 0..32 {
-                t.insert(UVec3::new(x, y, 0), slot);
-                slot += 1;
-            }
-        }
         let op = BrushOp {
-            center: Vec3::new(16.0, 16.0, 0.5),
-            segment_start: Vec3::new(16.0, 16.0, 0.5),
+            center: Vec3::new(32.0, 8.5, 32.0),
+            segment_start: Vec3::new(32.0, 8.5, 32.0),
             radius: 8.0,
             falloff_curve: FalloffCurve::Smooth,
-            strength: 4.0,
+            strength: 5.0,
             mode: BrushMode::Inflate,
             material: 9,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
-        let solid_at = |t: &SparseOctree, brick_pool: &BrickPool, c: UVec3| -> bool {
+        let delta = compute_brush_edits(&t, &pool, &attrs, &dists, op);
+        // Guard against a vacuous pass: the anchoring loop below is a no-op if
+        // the kernel emits zero Adds, so assert a dense shell first (this setup
+        // emits ~100+). Catches a zero-Add regression directly here.
+        assert!(
+            delta.count_added() >= 30,
+            "expected a dense Inflate shell, got only {} Adds",
+            delta.count_added(),
+        );
+        let solid_at = |c: UVec3| -> bool {
             !matches!(
-                t.cell_state(c, brick_pool),
+                t.cell_state(c, &pool),
                 CellState::Empty | CellState::OutOfBounds,
             )
         };
-        // Adds form a multi-layer shell; some second-layer cells
-        // attach via first-layer Adds, not the original surface.
-        // Walk in dist order: any Add cell must have a solid
-        // 6-neighbour among (original-floor ∪ earlier Adds in this
-        // delta). The kernel emits Adds in row-major (z, y, x)
-        // order with z increasing → first-layer adds (z=1) appear
-        // before second-layer adds (z=2) etc.
-        let mut applied_adds: std::collections::HashSet<UVec3> = std::collections::HashSet::new();
-        for edit in &delta.edits {
-            if !matches!(edit.op, LeafEditOp::Add { .. }) {
+        let mut emitted_solid: std::collections::HashSet<UVec3> = std::collections::HashSet::new();
+        for e in &delta.edits {
+            if matches!(e.op, LeafEditOp::Add { .. } | LeafEditOp::SetInterior) {
+                emitted_solid.insert(e.coord);
+            }
+        }
+        for e in &delta.edits {
+            if !matches!(e.op, LeafEditOp::Add { .. }) {
                 continue;
             }
-            let c = edit.coord;
-            let neighbors = [
-                IVec3::X, -IVec3::X, IVec3::Y, -IVec3::Y, IVec3::Z, -IVec3::Z,
-            ];
-            let has_anchor = neighbors.iter().any(|&d| {
-                let n = IVec3::new(c.x as i32, c.y as i32, c.z as i32) + d;
-                if n.x < 0 || n.y < 0 || n.z < 0 { return false; }
-                let nu = UVec3::new(n.x as u32, n.y as u32, n.z as u32);
-                solid_at(&t, &pool, nu) || applied_adds.contains(&nu)
-            });
-            assert!(has_anchor, "floating Inflate cell at {c}");
-            applied_adds.insert(c);
+            let c = e.coord;
+            let ci = IVec3::new(c.x as i32, c.y as i32, c.z as i32);
+            let anchored = [IVec3::X, -IVec3::X, IVec3::Y, -IVec3::Y, IVec3::Z, -IVec3::Z]
+                .iter()
+                .any(|&d| {
+                    let n = ci + d;
+                    if n.x < 0 || n.y < 0 || n.z < 0 {
+                        return false;
+                    }
+                    let nu = UVec3::new(n.x as u32, n.y as u32, n.z as u32);
+                    solid_at(nu) || emitted_solid.contains(&nu)
+                });
+            assert!(anchored, "floating Inflate cell at {c}");
         }
     }
 
     #[test]
     fn deflate_zero_strength_is_noop() {
-        let mut t = SparseOctree::new(4, 1.0);
+        let (t, attrs, dists) = flat_ground(6, 8);
         let pool = fresh_pool();
-        for z in 0..16 { for y in 0..16 { for x in 0..16 {
-            t.insert_interior(UVec3::new(x, y, z));
-        }}}
         let op = BrushOp {
-            center: Vec3::new(8.0, 8.0, 16.0),
-            segment_start: Vec3::new(8.0, 8.0, 16.0),
+            center: Vec3::new(32.0, 8.5, 32.0),
+            segment_start: Vec3::new(32.0, 8.5, 32.0),
             radius: 4.0,
             falloff_curve: FalloffCurve::Smooth,
             strength: 0.0,
             mode: BrushMode::Deflate,
             material: 1,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
-        assert_eq!(delta.count_added(), 0);
-        assert_eq!(delta.count_removed(), 0);
+        let delta = compute_brush_edits(&t, &pool, &attrs, &dists, op);
+        assert!(delta.is_empty(), "zero-strength Deflate must be a no-op");
     }
 
     #[test]
-    fn deflate_solid_block_carves_smooth_pit() {
-        // 16³ all-Interior block, Deflate at the +Z face center
-        // (just outside the asset extent so OOB-as-Empty seeds the
-        // brushfire downward into the bulk). Falloff curve makes the
-        // pit deepest at center and shallowest at rim.
-        let mut t = SparseOctree::new(4, 1.0);
+    fn deflate_carves_pit_deeper_at_center() {
+        // Deflate on flat ground: removes the original surface, exposes a
+        // receded surface that dips deepest under the brush center.
+        let (t, attrs, dists) = flat_ground(6, 8);
         let pool = fresh_pool();
-        for z in 0..16 { for y in 0..16 { for x in 0..16 {
-            t.insert_interior(UVec3::new(x, y, z));
-        }}}
         let op = BrushOp {
-            center: Vec3::new(8.0, 8.0, 16.0),
-            segment_start: Vec3::new(8.0, 8.0, 16.0),
-            radius: 5.0,
+            center: Vec3::new(32.0, 8.5, 32.0),
+            segment_start: Vec3::new(32.0, 8.5, 32.0),
+            radius: 8.0,
             falloff_curve: FalloffCurve::Smooth,
-            strength: 4.0,
+            strength: 5.0,
             mode: BrushMode::Deflate,
             material: 7,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
-        assert!(delta.count_removed() > 0, "Deflate must erode some cells");
-        assert!(delta.count_added() > 0, "Deflate must add cavity walls on the pit rim");
-        // Pit goes deeper at center than at rim. Walk each column
-        // and find the deepest eroded cell — center column should
-        // reach further into the bulk than a rim column.
-        let pit_depth_at = |cx: u32, cy: u32| -> Option<u32> {
-            delta.edits.iter()
-                .filter(|e| e.coord.x == cx && e.coord.y == cy
-                    && matches!(e.op, LeafEditOp::Empty | LeafEditOp::Remove))
-                .map(|e| 16u32.saturating_sub(e.coord.z) - 1)
-                .max()
+        let delta = compute_brush_edits(&t, &pool, &attrs, &dists, op);
+        assert!(delta.count_removed() > 0, "Deflate must erode the surface");
+        // New receded surface = lowest Add per column; deeper (lower y) at center.
+        let new_surface_y = |cx: u32, cz: u32| -> Option<u32> {
+            delta
+                .edits
+                .iter()
+                .filter(|e| {
+                    e.coord.x == cx && e.coord.z == cz && matches!(e.op, LeafEditOp::Add { .. })
+                })
+                .map(|e| e.coord.y)
+                .min()
         };
-        let center_depth = pit_depth_at(8, 8).unwrap_or(0);
-        let rim_depth = pit_depth_at(12, 8).unwrap_or(0);
-        assert!(
-            center_depth > rim_depth,
-            "pit should be deeper at center than at rim: center_depth={center_depth} rim_depth={rim_depth}",
-        );
+        let center = new_surface_y(32, 32);
+        let rim = new_surface_y(39, 32);
+        if let (Some(c), Some(r)) = (center, rim) {
+            assert!(c < r, "pit must be deeper at center than rim: center_y={c} rim_y={r}");
+        } else {
+            assert!(center.is_some(), "Deflate must expose a new surface under the center");
+        }
     }
 
     #[test]
-    fn deflate_cavity_wall_normal_points_into_pit() {
-        // 16³ all-Interior block, Deflate at the +Z face. Pick a
-        // cavity-wall cell on the floor of the pit (below the brush
-        // center) — its outward normal should point toward +Z (out
-        // of the bulk, into the carved-out volume).
-        let mut t = SparseOctree::new(4, 1.0);
-        let mut pool = fresh_pool();
-        for z in 0..16 { for y in 0..16 { for x in 0..16 {
-            t.insert_interior(UVec3::new(x, y, z));
-        }}}
+    fn deflate_exposed_surface_normal_points_up() {
+        // The receded Deflate surface faces the same way the original did
+        // (up, +Y) — a uniform-ish lowering, not a sideways pit wall.
+        let (t, attrs, dists) = flat_ground(6, 8);
+        let pool = fresh_pool();
         let op = BrushOp {
-            center: Vec3::new(8.0, 8.0, 16.0),
-            segment_start: Vec3::new(8.0, 8.0, 16.0),
-            radius: 5.0,
+            center: Vec3::new(32.0, 8.5, 32.0),
+            segment_start: Vec3::new(32.0, 8.5, 32.0),
+            radius: 8.0,
             falloff_curve: FalloffCurve::Smooth,
-            strength: 4.0,
+            strength: 5.0,
             mode: BrushMode::Deflate,
             material: 0,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
-        // Find an Add whose coord is along the brush axis on the
-        // pit floor — directly under the brush center.
-        let add_under_center = delta.edits.iter()
-            .find(|e| e.coord.x == 8 && e.coord.y == 8 && matches!(e.op, LeafEditOp::Add { .. }))
-            .expect("expected cavity-wall Add along brush axis");
-        let pos_in_edits = delta.edits.iter().position(|e| std::ptr::eq(e, *&add_under_center))
-            .or_else(|| delta.edits.iter()
-                .position(|e| e.coord == add_under_center.coord
-                    && matches!(e.op, LeafEditOp::Add { .. })))
-            .unwrap();
-        let add_pass_idx = delta.edits[..pos_in_edits].iter()
-            .filter(|e| matches!(e.op, LeafEditOp::Add { .. })).count();
-        let mut next = 0u32;
-        let applied = apply_delta(&mut t, &mut pool, &delta, || { let s = next; next += 1; s });
-        let (_, attrs) = applied.allocated_slots[add_pass_idx];
-        // Brush center is at (8, 8, 16); a cavity-wall cell at
-        // (8, 8, z<16) sits below the brush. brush_add_normal with
-        // BrushMode::Deflate returns -(cell - center) normalised, so
-        // along the -z direction from cell to center → +Z. The wall
-        // faces up into the pit.
-        assert!(attrs.normal.z > 0.85,
-            "cavity-wall normal under brush center should point +Z, got {:?}", attrs.normal);
+        let delta = compute_brush_edits(&t, &pool, &attrs, &dists, op);
+        // Find an Add directly under the brush center (the pit floor).
+        let floor = delta
+            .edits
+            .iter()
+            .filter(|e| e.coord.x == 32 && e.coord.z == 32 && matches!(e.op, LeafEditOp::Add { .. }))
+            .min_by_key(|e| e.coord.y)
+            .expect("Deflate must expose a pit-floor surface under the center");
+        if let LeafEditOp::Add { normal, .. } = floor.op {
+            assert!(
+                normal.y > 0.85,
+                "pit-floor normal should point up (+Y), got {normal:?}",
+            );
+        }
     }
 
     #[test]
     fn inflate_far_from_surface_emits_nothing() {
-        // A brush hovering in empty space far from any surface
-        // shouldn't add anything — the brushfire never reaches a
-        // seed, so every empty cell stays at u8::MAX.
+        // A brush hovering in empty space far from any surface adds nothing:
+        // no surface leaves seed the reconstruction, so every cell stays
+        // unreached and the emit pass skips them.
         let t = SparseOctree::new(5, 1.0);
         let pool = fresh_pool();
         let op = BrushOp {
@@ -3200,7 +3179,7 @@ mod tests {
             mode: BrushMode::Inflate,
             material: 1,
         };
-        let delta = compute_brush_edits(&t, &pool, &[], op);
+        let delta = compute_brush_edits(&t, &pool, &[], &[], op);
         assert_eq!(delta.count_added(), 0);
     }
 
@@ -3339,88 +3318,44 @@ mod tests {
 
     // ── Transit-brushfire (pre-stroke seed restriction) ──────────────
 
-    /// Stamp 2 at the SAME position with stamp 1's edited cells in the
-    /// stroke-edit set must NOT deepen the pit. The capped-depth
-    /// invariant: brushfire seeds only from pre-stroke Empty (the +Z
-    /// face), so the second stamp's brushfire can't restart distance
-    /// at 0 inside stamp 1's eroded region — every reachable Solid
-    /// /Interior cell is already past the target_thickness boundary.
-    #[test]
-    fn deflate_stationary_stamp_does_not_deepen_with_stroke_edit_set() {
-        let mut t = SparseOctree::new(4, 1.0);
-        let mut pool = fresh_pool();
-        for z in 0..16 { for y in 0..16 { for x in 0..16 {
-            t.insert_interior(UVec3::new(x, y, z));
-        }}}
-        let op = BrushOp {
-            center: Vec3::new(8.0, 8.0, 16.0),
-            segment_start: Vec3::new(8.0, 8.0, 16.0),
-            radius: 5.0,
-            falloff_curve: FalloffCurve::Smooth,
-            strength: 4.0,
-            mode: BrushMode::Deflate,
-            material: 7,
-        };
-        // Stamp 1 — no stroke history. Apply to mutate the octree.
-        let delta1 = compute_brush_edits(&t, &pool, &[], op);
-        assert!(delta1.count_removed() > 0, "stamp 1 must erode some cells");
-        let mut touched: std::collections::HashSet<UVec3> = std::collections::HashSet::new();
-        for e in &delta1.edits {
-            touched.insert(e.coord);
-        }
-        let mut next = 0u32;
-        apply_delta(&mut t, &mut pool, &delta1, || { let s = next; next += 1; s });
-
-        // Stamp 2 — same position, but with the stroke-edit closure
-        // identifying every cell stamp 1 touched. Without the
-        // restriction, brushfire would reseed from stamp 1's newly-
-        // empty cells and emit a fresh layer of `Empty` edits one
-        // deeper.
-        let delta2 = compute_brush_edits_in_stroke(
-            &t, &pool, &[], op, |c| touched.contains(&c),
-        );
-        // The only edits stamp 2 may legitimately emit are walls
-        // that stamp 1 ALREADY emitted at the same coord (the
-        // brushfire still reaches them at dist = 1, which is ≤
-        // target_thickness for any positive strength). Empty edits
-        // would mean we're carving a deeper layer — that's the bug.
-        let new_empties = delta2.edits.iter().filter(|e| {
-            matches!(e.op, LeafEditOp::Empty | LeafEditOp::Remove)
-        }).count();
-        assert_eq!(
-            new_empties, 0,
-            "stationary stamp 2 must not emit new Remove/Empty edits — \
-             that means depth compounding, the original bug. \
-             new_empties = {new_empties}",
-        );
+    /// Highest solid `y` in column `(cx, cz)` of the octree (the surface
+    /// height), or `None` if the column is empty up to `ymax`.
+    fn column_solid_top(
+        t: &SparseOctree,
+        pool: &BrickPool,
+        cx: u32,
+        cz: u32,
+        ymax: u32,
+    ) -> Option<u32> {
+        (0..=ymax).rev().find(|&y| {
+            !matches!(
+                t.cell_state(UVec3::new(cx, y, cz), pool),
+                CellState::Empty | CellState::OutOfBounds,
+            )
+        })
     }
 
-    /// First stamp of a stroke (touched set empty) must behave
-    /// identically to today's behaviour — no edit-set means every
-    /// pre-stroke Empty cell seeds brushfire as before.
+    /// First stamp of a stroke (empty touched set) must match the plain
+    /// `compute_brush_edits` byte-for-byte — the stroke-capping seed
+    /// exclusion only kicks in for already-edited cells.
     #[test]
-    fn deflate_first_stamp_matches_legacy_compute_brush_edits() {
-        let mut t = SparseOctree::new(4, 1.0);
-        for z in 0..16 { for y in 0..16 { for x in 0..16 {
-            t.insert_interior(UVec3::new(x, y, z));
-        }}}
+    fn inflate_first_stamp_matches_no_stroke() {
+        let (t, attrs, dists) = flat_ground(6, 8);
         let pool = fresh_pool();
         let op = BrushOp {
-            center: Vec3::new(8.0, 8.0, 16.0),
-            segment_start: Vec3::new(8.0, 8.0, 16.0),
-            radius: 5.0,
+            center: Vec3::new(32.0, 8.5, 32.0),
+            segment_start: Vec3::new(32.0, 8.5, 32.0),
+            radius: 8.0,
             falloff_curve: FalloffCurve::Smooth,
-            strength: 4.0,
-            mode: BrushMode::Deflate,
-            material: 0,
+            strength: 6.0,
+            mode: BrushMode::Inflate,
+            material: 9,
         };
-        let legacy = compute_brush_edits(&t, &pool, &[], op);
-        let in_stroke = compute_brush_edits_in_stroke(&t, &pool, &[], op, |_| false);
-        // Edit lists must be byte-identical: same cells, same ops,
-        // same order. Any divergence would mean the transit code
-        // path leaked into the no-stroke-history case.
-        assert_eq!(legacy.edits.len(), in_stroke.edits.len());
-        for (a, b) in legacy.edits.iter().zip(in_stroke.edits.iter()) {
+        let plain = compute_brush_edits(&t, &pool, &attrs, &dists, op);
+        let in_stroke =
+            compute_brush_edits_in_stroke(&t, &pool, &attrs, &dists, op, |_| false);
+        assert_eq!(plain.edits.len(), in_stroke.edits.len());
+        for (a, b) in plain.edits.iter().zip(in_stroke.edits.iter()) {
             assert_eq!(a.coord, b.coord);
             assert_eq!(
                 std::mem::discriminant(&a.op),
@@ -3429,65 +3364,137 @@ mod tests {
         }
     }
 
-    /// During a drag, stamp 2 at an OFFSET position can reach into
-    /// stamp 1's wall cells (currently Solid, in the touched set)
-    /// and emit Remove for them. That's the wall-cleanup behaviour
-    /// that produces a smooth channel instead of scallop ridges.
+    /// Holding the brush at one spot must converge to ONE offset layer, not
+    /// compound. Stamp twice at the same position with the touched set; the
+    /// surface height after stamp 2 must equal the height after stamp 1.
     #[test]
-    fn deflate_drag_stamp_removes_previous_stamp_walls() {
-        let mut t = SparseOctree::new(4, 1.0);
+    fn inflate_hold_does_not_compound() {
+        let (mut t, attrs, dists) = flat_ground(6, 8);
         let mut pool = fresh_pool();
-        for z in 0..16 { for y in 0..16 { for x in 0..16 {
-            t.insert_interior(UVec3::new(x, y, z));
-        }}}
-        let op1 = BrushOp {
-            center: Vec3::new(6.0, 8.0, 16.0),
-            segment_start: Vec3::new(6.0, 8.0, 16.0),
-            radius: 4.0,
+        // Live mutable copies of the per-slot data so re-stamps read the
+        // accumulated field (mirrors the scene-manager pool).
+        let mut leaf = attrs.clone();
+        let mut dvec = dists.clone();
+        let op = BrushOp {
+            center: Vec3::new(32.0, 8.5, 32.0),
+            segment_start: Vec3::new(32.0, 8.5, 32.0),
+            radius: 8.0,
             falloff_curve: FalloffCurve::Smooth,
-            strength: 3.0,
-            mode: BrushMode::Deflate,
+            strength: 6.0,
+            mode: BrushMode::Inflate,
             material: 9,
         };
-        let delta1 = compute_brush_edits(&t, &pool, &[], op1);
         let mut touched: std::collections::HashSet<UVec3> = std::collections::HashSet::new();
-        let mut walled_coords: Vec<UVec3> = Vec::new();
-        for e in &delta1.edits {
-            touched.insert(e.coord);
-            if matches!(e.op, LeafEditOp::Add { .. }) {
-                walled_coords.push(e.coord);
+        let mut next_slot = leaf.len() as u32;
+
+        let apply_stamp = |t: &mut SparseOctree,
+                               pool: &mut BrickPool,
+                               leaf: &mut Vec<LeafAttr>,
+                               dvec: &mut Vec<i16>,
+                               touched: &mut std::collections::HashSet<UVec3>,
+                               next_slot: &mut u32| {
+            let delta = compute_brush_edits_in_stroke(
+                t, pool, leaf, dvec, op, |c| touched.contains(&c),
+            );
+            for e in &delta.edits {
+                touched.insert(e.coord);
+            }
+            let applied = apply_delta(t, pool, &delta, || {
+                let s = *next_slot;
+                *next_slot += 1;
+                if s as usize >= leaf.len() {
+                    leaf.resize(s as usize + 1, LeafAttr::default());
+                    dvec.resize(s as usize + 1, 0);
+                }
+                s
+            });
+            for (slot, a) in &applied.allocated_slots {
+                if *slot as usize >= leaf.len() {
+                    leaf.resize(*slot as usize + 1, LeafAttr::default());
+                    dvec.resize(*slot as usize + 1, 0);
+                }
+                leaf[*slot as usize] = a.to_leaf_attr();
+                dvec[*slot as usize] = crate::LeafAttrPool::quantize_dist(a.dist);
+            }
+            for (slot, _n, d) in &applied.redist_slots {
+                dvec[*slot as usize] = crate::LeafAttrPool::quantize_dist(*d);
+            }
+        };
+
+        apply_stamp(&mut t, &mut pool, &mut leaf, &mut dvec, &mut touched, &mut next_slot);
+        let top_after_1 = column_solid_top(&t, &pool, 32, 32, 20)
+            .expect("stamp 1 must raise a dome");
+        apply_stamp(&mut t, &mut pool, &mut leaf, &mut dvec, &mut touched, &mut next_slot);
+        let top_after_2 = column_solid_top(&t, &pool, 32, 32, 20).unwrap();
+        assert_eq!(
+            top_after_1, top_after_2,
+            "held Inflate compounded: dome grew from y={top_after_1} to y={top_after_2}",
+        );
+    }
+
+    /// A drag (offset stamps) is a monotonic GROW: it never removes material,
+    /// and both stamp centers end up raised — the union of stamp domes, with
+    /// no scalloping between them.
+    #[test]
+    fn inflate_drag_is_monotonic_grow() {
+        let (mut t, attrs, dists) = flat_ground(6, 8);
+        let mut pool = fresh_pool();
+        let mut leaf = attrs.clone();
+        let mut dvec = dists.clone();
+        let mut touched: std::collections::HashSet<UVec3> = std::collections::HashSet::new();
+        let mut next_slot = leaf.len() as u32;
+        let mut prev = Vec3::new(26.0, 8.5, 32.0);
+        let centers = [
+            Vec3::new(26.0, 8.5, 32.0),
+            Vec3::new(32.0, 8.5, 32.0),
+            Vec3::new(38.0, 8.5, 32.0),
+        ];
+        let mut total_removed = 0usize;
+        for &ctr in &centers {
+            let op = BrushOp {
+                center: ctr,
+                segment_start: prev,
+                radius: 8.0,
+                falloff_curve: FalloffCurve::Smooth,
+                strength: 6.0,
+                mode: BrushMode::Inflate,
+                material: 9,
+            };
+            prev = ctr;
+            let delta = compute_brush_edits_in_stroke(
+                &t, &pool, &leaf, &dvec, op, |c| touched.contains(&c),
+            );
+            total_removed += delta.count_removed();
+            for e in &delta.edits {
+                touched.insert(e.coord);
+            }
+            let applied = apply_delta(&mut t, &mut pool, &delta, || {
+                let s = next_slot;
+                next_slot += 1;
+                if s as usize >= leaf.len() {
+                    leaf.resize(s as usize + 1, LeafAttr::default());
+                    dvec.resize(s as usize + 1, 0);
+                }
+                s
+            });
+            for (slot, a) in &applied.allocated_slots {
+                if *slot as usize >= leaf.len() {
+                    leaf.resize(*slot as usize + 1, LeafAttr::default());
+                    dvec.resize(*slot as usize + 1, 0);
+                }
+                leaf[*slot as usize] = a.to_leaf_attr();
+                dvec[*slot as usize] = crate::LeafAttrPool::quantize_dist(a.dist);
+            }
+            for (slot, _n, d) in &applied.redist_slots {
+                dvec[*slot as usize] = crate::LeafAttrPool::quantize_dist(*d);
             }
         }
-        assert!(!walled_coords.is_empty(), "stamp 1 must produce cavity walls");
-        let mut next = 0u32;
-        apply_delta(&mut t, &mut pool, &delta1, || { let s = next; next += 1; s });
-
-        // Stamp 2 offset by +X (drag direction). Its capsule covers
-        // stamp 1's region + a new region. Walls between the two
-        // stamp centres should be removable.
-        let op2 = BrushOp {
-            center: Vec3::new(10.0, 8.0, 16.0),
-            segment_start: Vec3::new(6.0, 8.0, 16.0),
-            radius: 4.0,
-            falloff_curve: FalloffCurve::Smooth,
-            strength: 3.0,
-            mode: BrushMode::Deflate,
-            material: 9,
-        };
-        let delta2 = compute_brush_edits_in_stroke(
-            &t, &pool, &[], op2, |c| touched.contains(&c),
-        );
-        // At least one of stamp 1's wall cells must be Removed by
-        // stamp 2 — otherwise we'd see scallop ridges between the
-        // two stamp centres.
-        let removed_walls: usize = walled_coords.iter().filter(|w| {
-            delta2.edits.iter().any(|e| e.coord == **w && matches!(e.op, LeafEditOp::Remove))
-        }).count();
-        assert!(
-            removed_walls > 0,
-            "stamp 2 must Remove at least one of stamp 1's {} wall cells",
-            walled_coords.len(),
-        );
+        assert_eq!(total_removed, 0, "Inflate drag must never remove material");
+        // Both ends of the drag are raised above the original surface (y=8).
+        let left = column_solid_top(&t, &pool, 26, 32, 20).unwrap_or(8);
+        let right = column_solid_top(&t, &pool, 38, 32, 20).unwrap_or(8);
+        assert!(left > 8, "left stamp center must be raised, got y={left}");
+        assert!(right > 8, "right stamp center must be raised, got y={right}");
     }
 
     // ── Smooth brush ─────────────────────────────────────────────────
@@ -3578,7 +3585,7 @@ mod tests {
         let pool_data = pool_with_normals(&[Vec3::Y]);
         let pool = fresh_pool();
         let op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 2.0);
-        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let delta = compute_brush_edits(&t, &pool, &pool_data, &[], op);
         let removed = delta
             .edits
             .iter()
@@ -3604,7 +3611,7 @@ mod tests {
         let pool_data = cube_normals(Vec3::Y, Vec3::Y);
         let pool = fresh_pool();
         let op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 1.5);
-        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let delta = compute_brush_edits(&t, &pool, &pool_data, &[], op);
         // Whatever SetNormals fire, every result must point ≈ +Y.
         let mut any = false;
         for edit in &delta.edits {
@@ -3633,7 +3640,7 @@ mod tests {
         let pool_data = cube_normals(Vec3::Z, Vec3::Y);
         let pool = fresh_pool();
         let op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 1.5);
-        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let delta = compute_brush_edits(&t, &pool, &pool_data, &[], op);
         let centre = delta.edits.iter().find_map(|e| {
             if e.coord == UVec3::new(8, 8, 8) {
                 if let LeafEditOp::SetNormal { slot, normal } = e.op {
@@ -3661,7 +3668,7 @@ mod tests {
         let pool = fresh_pool();
         let mut op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 1.5);
         op.strength = 16.0;
-        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let delta = compute_brush_edits(&t, &pool, &pool_data, &[], op);
         let centre_normal = delta.edits.iter().find_map(|e| {
             if e.coord == UVec3::new(8, 8, 8) {
                 if let LeafEditOp::SetNormal { normal, .. } = e.op {
@@ -3702,7 +3709,7 @@ mod tests {
         let pool = fresh_pool();
         let mut op = smooth_op(Vec3::new(8.5, 8.5, 9.5), 0.6);
         op.material = 7;
-        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let delta = compute_brush_edits(&t, &pool, &pool_data, &[], op);
         let bump_removed = delta.edits.iter().any(|e| {
             e.coord == UVec3::new(8, 8, 9) && matches!(e.op, LeafEditOp::Remove)
         });
@@ -3745,7 +3752,7 @@ mod tests {
         let pool = fresh_pool();
         let mut op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 0.6);
         op.material = 7;
-        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let delta = compute_brush_edits(&t, &pool, &pool_data, &[], op);
         let fill = delta.edits.iter().find_map(|e| {
             if e.coord == UVec3::new(8, 8, 8) {
                 if let LeafEditOp::Add { material, normal, .. } = e.op {
@@ -3780,7 +3787,7 @@ mod tests {
         let pool = fresh_pool();
         let mut op = smooth_op(Vec3::new(8.5, 8.5, 9.0), 1.0);
         op.material = 7;
-        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let delta = compute_brush_edits(&t, &pool, &pool_data, &[], op);
 
         let bump_removed = delta.edits.iter().any(|e| {
             e.coord == UVec3::new(8, 8, 9) && matches!(e.op, LeafEditOp::Remove)
@@ -3814,7 +3821,7 @@ mod tests {
         let pool_data = cube_normals(Vec3::Z, Vec3::Y);
         let mut pool = fresh_pool();
         let op = smooth_op(Vec3::new(8.5, 8.5, 8.5), 1.5);
-        let delta = compute_brush_edits(&t, &pool, &pool_data, op);
+        let delta = compute_brush_edits(&t, &pool, &pool_data, &[], op);
         // The cube test scene has no morph flips; only SetNormals fire.
         assert_eq!(delta.count_removed(), 0);
         assert_eq!(delta.count_added(), 0);

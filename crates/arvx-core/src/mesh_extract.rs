@@ -588,6 +588,25 @@ pub(crate) fn manifold_dc_on() -> bool {
     *ON.get_or_init(|| std::env::var("ARVX_MESH_DC").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Sculpt re-extract SHADING NORMAL source. When on (default), the QEF/DC
+/// region path shades from the averaged stored per-leaf analytic normals
+/// (`normal_sum`) — the exact `brush_add_normal` the sculpt wrote — instead
+/// of `-∇D` of the BINARY-occupancy blur, which speckles on gentle slopes
+/// (the blur gradient swings cell-to-cell faster than R=2 can smooth). This
+/// is only smooth once the sculpt brush stores a DENSE band of analytic
+/// normals across the surface (see `ARVX_SCULPT_BAND`); with the legacy
+/// one-voxel rim the corner average is sparse and facets, which is why the
+/// region path historically used `-∇D`. Rollback to `-∇D` with
+/// `ARVX_SCULPT_ANALYTIC_NORMAL=0`. Read once.
+pub fn sculpt_analytic_normal_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ARVX_SCULPT_ANALYTIC_NORMAL")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 thread_local! {
     /// Per-thread force-OFF for the QEF-Hermite mesher (default `false` =
     /// allow QEF when a distance pool is present). The terrain seam tests
@@ -2075,11 +2094,24 @@ where
                     None => {
                         let vertex = if use_qef {
                             // Sign topology + QEF-Hermite position from the
-                            // stored distance, but the smooth interpolated
-                            // `∇D` SHADING NORMAL (the per-leaf corner average
-                            // facets → speckle). `density_grid_fn = None`
-                            // keeps classification + position on the sign/QEF
-                            // path; only the normal comes from `∇D`.
+                            // stored distance. SHADING NORMAL: by default
+                            // (`ARVX_SCULPT_ANALYTIC_NORMAL`) `normal_fn = None`
+                            // so `build_cube_vertex` averages the stored
+                            // per-leaf analytic normals (`normal_sum`) — the
+                            // exact `brush_add_normal` the sculpt wrote — which
+                            // is smooth once a dense band of leaves carries them
+                            // (`ARVX_SCULPT_BAND`). Rollback passes the legacy
+                            // `-∇D` of the binary-occupancy blur (speckles on
+                            // gentle slopes; only correct where the corner
+                            // average is too sparse to use). `density_grid_fn =
+                            // None` keeps classification + position on the
+                            // sign/QEF path regardless.
+                            let normal_fn: Option<&dyn Fn(Vec3) -> Vec3> =
+                                if sculpt_analytic_normal_on() {
+                                    None
+                                } else {
+                                    Some(&outward_normal)
+                                };
                             build_cube_vertex(
                                 cube,
                                 cell_lookup,
@@ -2089,7 +2121,7 @@ where
                                 bone_voxel_pool,
                                 sculpt_slots,
                                 None::<&fn(Vec3) -> f32>,
-                                Some(&outward_normal),
+                                normal_fn,
                                 None::<&fn(Vec3) -> f32>,
                                 None::<&fn(Vec3) -> Vec3>,
                                 iso,

@@ -79,11 +79,17 @@ impl SculptDiff {
         self.edits.len()
     }
 
-    /// Append every edit in `delta` except [`LeafEditOp::SetNormal`]
-    /// (whose `slot` field can't be replayed onto a fresh octree).
+    /// Append every edit in `delta` except [`LeafEditOp::SetNormal`] and
+    /// [`LeafEditOp::SetDist`] — both carry a `slot` field that can't be
+    /// replayed onto a fresh octree (a stale per-octree slot id would index
+    /// the wrong leaf, or panic out of range). Only replay-stable occupancy
+    /// ops (Add / Remove / Empty / SetInterior) persist into the diff.
     pub fn append_delta(&mut self, delta: &SculptDelta) {
         for edit in &delta.edits {
-            if matches!(edit.op, LeafEditOp::SetNormal { .. }) {
+            if matches!(
+                edit.op,
+                LeafEditOp::SetNormal { .. } | LeafEditOp::SetDist { .. }
+            ) {
                 continue;
             }
             self.edits.push(*edit);
@@ -184,7 +190,15 @@ impl AggOp {
             LeafEditOp::Add { material, normal, .. } => Some(AggOp::Add { material, normal }),
             LeafEditOp::SetInterior => Some(AggOp::Interior),
             LeafEditOp::Remove | LeafEditOp::Empty => Some(AggOp::Empty),
-            LeafEditOp::SetNormal { .. } => None,
+            // SetNormal / SetDist both carry a pre-resolved per-octree slot id
+            // that does not survive replay onto a freshly-baked octree, so the
+            // bake-replay diff drops them (same contract as the Add `dist`,
+            // which also resets to 0.0 on replay — replayed sculpt is
+            // occupancy-correct but re-extracts at the cell center until
+            // re-sculpted). The SDF-offset Inflate/Deflate's in-place distance
+            // updates are an in-session smoothness optimisation, not a
+            // persisted geometry change.
+            LeafEditOp::SetNormal { .. } | LeafEditOp::SetDist { .. } => None,
         }
     }
 
@@ -274,6 +288,31 @@ mod tests {
                 op: LeafEditOp::SetNormal {
                     slot: 42,
                     normal: Vec3::Y,
+                },
+            },
+            add(UVec3::new(3, 0, 0), 1),
+        ]));
+        assert_eq!(d.len(), 2);
+        assert_eq!(d.edits[0].coord, UVec3::new(1, 0, 0));
+        assert_eq!(d.edits[1].coord, UVec3::new(3, 0, 0));
+    }
+
+    #[test]
+    fn append_delta_filters_set_dist() {
+        // SetDist (SDF-offset Inflate/Deflate in-place re-distancing) carries a
+        // per-octree slot id that can't be replayed onto a freshly-baked octree
+        // — a stale slot would index the wrong leaf or panic out of range, and
+        // the persist writer rejects it outright. It must be dropped on capture,
+        // exactly like SetNormal.
+        let mut d = SculptDiff::new();
+        d.append_delta(&delta_with(vec![
+            add(UVec3::new(1, 0, 0), 1),
+            LeafEdit {
+                coord: UVec3::new(2, 0, 0),
+                op: LeafEditOp::SetDist {
+                    slot: 42,
+                    normal: Vec3::Y,
+                    dist: -0.5,
                 },
             },
             add(UVec3::new(3, 0, 0), 1),

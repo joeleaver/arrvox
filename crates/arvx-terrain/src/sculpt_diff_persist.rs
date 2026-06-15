@@ -243,14 +243,15 @@ fn write_edit<W: Write>(w: &mut W, edit: &LeafEdit) -> std::io::Result<()> {
         }
         LeafEditOp::Empty => w.write_all(&[2u8])?,
         LeafEditOp::SetInterior => w.write_all(&[3u8])?,
-        LeafEditOp::SetNormal { .. } => {
-            // The SculptDiff::append_delta filter drops SetNormal
-            // before it ever reaches the diff; reaching here means
-            // a caller bypassed the filter, which would produce a
-            // non-replayable diff. Surface it loudly.
+        LeafEditOp::SetNormal { .. } | LeafEditOp::SetDist { .. } => {
+            // The SculptDiff::append_delta filter (AggOp::from_leaf_op → None)
+            // drops SetNormal / SetDist before they ever reach the diff;
+            // reaching here means a caller bypassed the filter, which would
+            // produce a non-replayable diff (both carry a per-octree slot id).
+            // Surface it loudly.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "SetNormal op cannot be persisted — its slot id is per-octree",
+                "SetNormal / SetDist ops cannot be persisted — their slot id is per-octree",
             ));
         }
     }

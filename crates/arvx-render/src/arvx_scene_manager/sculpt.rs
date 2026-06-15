@@ -378,10 +378,19 @@ impl ArvxSceneManager {
         let touched = &self.sculpt_stroke_touched;
         let delta = {
             let entry = self.asset_cache.get(handle)?;
+            // SDF-offset Inflate/Deflate read the per-leaf signed distances to
+            // reconstruct the local field; pass them when the asset carries
+            // them (else the kernel falls back to cell-center planes).
+            let dists = if entry.model.has_distances {
+                self.leaf_attr_pool.dists_as_slice()
+            } else {
+                &[]
+            };
             compute_brush_edits_in_stroke(
                 &entry.model.cpu_octree,
                 &self.brick_pool,
                 self.leaf_attr_pool.as_slice(),
+                dists,
                 op,
                 |c| touched.contains(&c),
             )
@@ -451,19 +460,30 @@ impl ArvxSceneManager {
                     // real-geometry mutation path (R2c → apply_delta)
                     // will handle them properly.
                 }
-                LeafEditOp::SetNormal { .. } => {
-                    // Smooth — no occupancy change, no slot to remove.
-                    // The real-geometry path consumes these via
-                    // `applied.renormalized_slots` further down.
+                LeafEditOp::SetNormal { .. } | LeafEditOp::SetDist { .. } => {
+                    // Smooth (SetNormal) / SDF-offset Inflate-Deflate (SetDist)
+                    // — no occupancy change, no slot to remove. The
+                    // real-geometry path consumes these via
+                    // `applied.renormalized_slots` / `applied.redist_slots`
+                    // further down.
                 }
             }
         }
 
         let leaves_removed = removed.len();
+        // "Nothing to apply" guard. Must enumerate EVERY mutating op-type the
+        // kernel can emit — `removed` only holds resolved Remove leaf-ids, so
+        // a delta of purely SetDist (gentle SDF-offset Inflate/Deflate that
+        // only re-distances existing surface leaves) or purely Empty
+        // (interior-erosion Deflate) would otherwise slip through and bail
+        // before apply_delta / the redist drain / the re-extract — the brush
+        // would silently do nothing. `count_removed` covers Remove|Empty.
         if removed.is_empty()
             && delta.count_added() == 0
             && delta.count_interior() == 0
             && delta.count_set_normal() == 0
+            && delta.count_set_dist() == 0
+            && delta.count_removed() == 0
         {
             return None;
         }
@@ -610,6 +630,18 @@ impl ArvxSceneManager {
             let attr = self.leaf_attr_pool.get_mut(*slot);
             attr.normal_oct = arvx_core::pack_oct(*normal);
         }
+        // SDF-offset Inflate/Deflate: pre-existing surface leaves the offset
+        // moved (toward, or sub-surface of, the new surface) get their stored
+        // signed distance + normal rewritten in place. Without this, an old
+        // surface cell the offset pushed under keeps its stale near-zero
+        // distance and Manifold-DC emits a spurious surface there — the
+        // shatter the retired brushfire kernel produced. Occupancy / material
+        // / slot are unchanged. Written before the geometry-epoch bump so the
+        // re-extract below sees the updated field.
+        for (slot, normal, dist) in &applied.redist_slots {
+            self.leaf_attr_pool.get_mut(*slot).normal_oct = arvx_core::pack_oct(*normal);
+            self.leaf_attr_pool.set_dist(*slot, *dist);
+        }
         // Release slots vacated by Remove / displaced-by-Add edits.
         // Done one-at-a-time since the slots aren't contiguous; the
         // pool's free-list absorbs them. Also drop any matching
@@ -715,14 +747,18 @@ impl ArvxSceneManager {
         let allocated_leaf_attr_ids: Vec<u32> =
             applied.allocated_slots.iter().map(|(s, _)| *s).collect();
         // Capture the kernel's edits for `SculptDiff` persistence.
-        // SetNormal is dropped because its slot id is per-octree (the
-        // terrain bake-replay path needs replay-stable ops only). The
-        // `SculptDiff::append_delta` consumer applies the same filter,
-        // but dropping at the source keeps the contract local.
+        // SetNormal AND SetDist are dropped: both carry a per-octree slot id
+        // that does not survive replay onto a freshly-baked octree (a stale
+        // slot would index a different leaf → corruption, or out of range →
+        // panic). They're also rejected by the persist writer as a backstop.
+        // The live in-session edit already applied them via `redist_slots`;
+        // the bake-replay diff only needs the replay-stable occupancy ops
+        // (Add / Remove / Empty / SetInterior). `SculptDiff::append_delta`
+        // applies the same filter, but dropping at the source keeps it local.
         let captured_edits: Vec<LeafEdit> = delta
             .edits
             .iter()
-            .filter(|e| !matches!(e.op, LeafEditOp::SetNormal { .. }))
+            .filter(|e| !matches!(e.op, LeafEditOp::SetNormal { .. } | LeafEditOp::SetDist { .. }))
             .copied()
             .collect();
         // Record this stamp's WORLD-space center so the NEXT stamp
@@ -870,6 +906,14 @@ impl ArvxSceneManager {
         for (slot, normal) in &applied.renormalized_slots {
             let attr = self.leaf_attr_pool.get_mut(*slot);
             attr.normal_oct = arvx_core::pack_oct(*normal);
+        }
+        // SDF-offset in-place distance rewrites (see apply_sculpt_brush). On
+        // the diff-replay path these are normally absent (the bake-replay diff
+        // drops SetDist as non-replay-stable), but drain them for parity in
+        // case a caller hands raw kernel edits through.
+        for (slot, normal, dist) in &applied.redist_slots {
+            self.leaf_attr_pool.get_mut(*slot).normal_oct = arvx_core::pack_oct(*normal);
+            self.leaf_attr_pool.set_dist(*slot, *dist);
         }
         for slot in &applied.freed_slots {
             self.leaf_attr_pool.deallocate_range(*slot, 1);
@@ -1031,13 +1075,17 @@ impl super::mesher::Mesher {
         // surface, so dropping cells that aren't actually emptied is
         // safe.
         //
-        // Raise / Inflate only ADD cells, so the original ground
-        // geometry under the brush stays a valid post-stamp surface —
-        // `KeepAll` skips the filter entirely (no per-cluster work, no
-        // IBO writes). An unconditional filter here would delete the
-        // ground tris under a Raise dome, leaving a hole the SN
-        // re-extract can't refill (SOLID↔INTERIOR cubes have no EMPTY
-        // corner and emit no surface).
+        // Raise / Inflate are purely ADDITIVE (Add / SetInterior, plus —
+        // for the SDF-offset Inflate — SetDist that pushes a buried original
+        // leaf sub-surface; never Remove/Empty). Any original surface they
+        // bury ends up INSIDE the new solid dome, hidden behind the
+        // re-extracted dome surface, so `KeepAll` is correct: keep the old
+        // tris (occluded, harmless) and append the dome patch. An
+        // unconditional filter here would instead delete the ground tris
+        // under the dome, leaving a hole the SN re-extract can't refill
+        // (SOLID↔INTERIOR cubes have no EMPTY corner and emit no surface).
+        // Deflate / Carve are subtractive — they expose what was hidden, so
+        // the stale tris MUST be dropped (SphereTouch).
         //
         // The shared `remesh_filter_dirty_clusters` owns the dirty
         // query, the rayon per-triangle filter (incl. the closest-point
@@ -1128,11 +1176,17 @@ impl super::mesher::Mesher {
         // is a pure local function of occupancy, so adjacent
         // patches/tiles agree on the boundary by construction.
         //
-        // Carry the extract's ∇D normal into the pool so the deferred
-        // resolve shades the smoothed surface (see
-        // `splat_relaxed_normals`). Must run before the geometry-epoch
-        // bump re-uploads the leaf_attr pool.
-        splat_relaxed_normals(&brush_verts, leaf_attr_pool);
+        // Carry the extract's normal into the pool so the deferred resolve
+        // shades the smoothed surface. In analytic-normal DC mode the pool
+        // ALREADY holds the exact `brush_add_normal` (and the re-extract
+        // shaded from it via `normal_sum`), so splatting the mesh normal
+        // back would only re-quantize/average and reintroduce facet noise —
+        // skip it. The blur path (no distances) and the `-∇D` rollback still
+        // need the splat (no analytic per-leaf normal exists there). Must
+        // run before the geometry-epoch bump re-uploads the leaf_attr pool.
+        if !(model.has_distances && arvx_core::mesh_extract::sculpt_analytic_normal_on()) {
+            splat_relaxed_normals(&brush_verts, leaf_attr_pool);
+        }
 
         _p_extract_ms = _ph_t3.elapsed().as_secs_f64() * 1000.0;
         let _ph_t4 = std::time::Instant::now();
@@ -1548,10 +1602,13 @@ impl super::mesher::Mesher {
         // geometry agree on shared boundary cells by construction
         // (watertight, no welding).
         //
-        // Carry the extract's ∇D normal into the pool (see
-        // `splat_relaxed_normals`); deferred resolve shades from the
-        // per-leaf normal, not the mesh vertex normal.
-        splat_relaxed_normals(&stroke_verts, leaf_attr_pool);
+        // Carry the extract's normal into the pool; deferred resolve shades
+        // from the per-leaf normal. Skip in analytic-normal DC mode — the
+        // pool already holds the exact analytic brush normal (see the
+        // rebuild_dirty_clusters note); splatting would reintroduce facets.
+        if !(model.has_distances && arvx_core::mesh_extract::sculpt_analytic_normal_on()) {
+            splat_relaxed_normals(&stroke_verts, leaf_attr_pool);
+        }
 
         // ── Step 6: apply the combined cluster delta ──
         // One `apply_cluster_delta`: drop the filtered bake-time tris then
