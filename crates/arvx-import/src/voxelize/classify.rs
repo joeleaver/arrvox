@@ -93,6 +93,16 @@ pub struct BrickResult {
     /// (the shell candidates); stored as `0` for inside voxels where
     /// it's never read.
     pub face_normals: [u32; 512],
+    /// Per-voxel signed distance to the mesh surface, quantized to i16
+    /// in voxel units (see [`arvx_core::LeafAttrPool::quantize_dist`]).
+    /// Shell candidates are outside voxels, so this is POSITIVE — the
+    /// Manifold-DC mesher places each vertex at `center − d·n` inward
+    /// toward the surface, matching arvx-core's neg-inside / pos-outside
+    /// convention with the outward `face_normals`. Drives the v7
+    /// distance section so a loaded import re-extracts / sculpts with
+    /// Manifold-DC instead of the blur fallback. Only meaningful where
+    /// `is_inside[flat] == false`; `0` (blur default) otherwise.
+    pub face_dists: [i16; 512],
     /// Per-voxel 4-bone skinning weight (top 4 bones by barycentric-
     /// interpolated weight, u8-quantized summing to 255). Zero-filled
     /// when no skeleton was supplied to [`process_brick`] — the
@@ -134,6 +144,7 @@ pub fn process_brick(
     let mut material_ids = [0u16; 512];
     let mut is_inside_buf = [false; 512];
     let mut face_normals = [0u32; 512];
+    let mut face_dists = [0i16; 512];
     let mut bone_voxels = [BoneVoxel::default(); 512];
     let mut has_bones = false;
     let mut all_inside = true;
@@ -230,6 +241,19 @@ pub fn process_brick(
                     };
                     face_normals[flat] = arvx_core::leaf_attr::pack_oct(normal);
 
+                    // Per-leaf signed distance for the v7 distance section
+                    // (Manifold-DC re-extract / sculpt). `nearest.distance`
+                    // is the true Euclidean object-space distance to the
+                    // surface (unit-gradient, so no grad-normalization is
+                    // needed — unlike the primitive-SDF voxelizer), and the
+                    // shell leaf is outside, so the signed distance is
+                    // +distance. Convert to voxel units and quantize the
+                    // same way the SDF voxelizer + terrain bake do, so the
+                    // re-extract reads identical units.
+                    face_dists[flat] = arvx_core::LeafAttrPool::quantize_dist(
+                        nearest.distance / voxel_size,
+                    );
+
                     // Bone weights — same nearest-triangle barycentric
                     // as material / color / normal. Only computed for
                     // shell candidates (inside voxels never emit leaf
@@ -259,6 +283,7 @@ pub fn process_brick(
 
     BrickResult {
         color_brick,
+        face_dists,
         material_ids,
         is_inside: is_inside_buf,
         face_normals,
@@ -356,6 +381,56 @@ mod tests {
             let sum: u16 = (0..4).map(|s| bv.bone_weight(s) as u16).sum();
             assert_eq!(sum, 0, "unskinned voxel {flat} should have zero weights");
         }
+    }
+
+    /// Shell (outside) voxels must carry a POSITIVE per-leaf signed
+    /// distance in VOXEL units, equal to the BVH Euclidean distance to
+    /// the surface / voxel_size (quantized). This is the field forwarded
+    /// to the v7 distance section so imported assets re-extract / sculpt
+    /// with Manifold-DC — matching arvx-core's pos-outside / outward-
+    /// normal convention (vertex placed at `center − d·n`, inward).
+    #[test]
+    fn process_brick_emits_positive_voxel_unit_distances_for_shell_voxels() {
+        use arvx_core::LeafAttrPool;
+        let mesh = triangle_mesh();
+        let bvh = crate::bvh::TriangleBvh::build(&mesh);
+        let config = crate::config::ImportConfig::default();
+        let voxel_size = 0.125_f32;
+        let brick_min = Vec3::new(-0.1, -0.1, -0.5);
+        let result = process_brick(&mesh, &bvh, brick_min, voxel_size, &config, None);
+
+        let mut checked = 0;
+        for flat in 0..512usize {
+            if result.is_inside[flat] {
+                // Inside voxels never become shell leaves → distance left
+                // at the zero (blur) default.
+                assert_eq!(result.face_dists[flat], 0, "inside voxel {flat} must keep dist 0");
+                continue;
+            }
+            let q = result.face_dists[flat];
+            if q == 0 {
+                continue; // voxel exactly on the surface — fine to skip
+            }
+            // Outside voxel → POSITIVE signed distance.
+            assert!(q > 0, "shell (outside) voxel {flat} must have positive dist, got {q}");
+            let d_vox = LeafAttrPool::dequantize_dist(q);
+            // Must equal the true Euclidean distance / voxel_size within
+            // quantization — pins the units + sign + roundtrip.
+            let vx = (flat % 8) as f32;
+            let vy = ((flat / 8) % 8) as f32;
+            let vz = (flat / 64) as f32;
+            let center = brick_min + Vec3::new(vx + 0.5, vy + 0.5, vz + 0.5) * voxel_size;
+            let expected = bvh.nearest(center).distance / voxel_size;
+            if expected < 3.9 {
+                // (skip clamp region near ±3.99)
+                assert!(
+                    (d_vox - expected).abs() <= 1.0 / 8192.0 + 1e-4,
+                    "voxel {flat}: stored {d_vox} vs expected {expected}",
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "at least one near-surface shell voxel must carry a real distance");
     }
 }
 

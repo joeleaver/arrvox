@@ -42,6 +42,11 @@ pub struct ShellOutput {
     pub color_voxels: Vec<ColorVoxel>,
     /// Per-leaf octahedrally-packed normals (same order).
     pub normals_packed: Vec<u32>,
+    /// Per-leaf quantized signed distances (i16, voxel units; same
+    /// order as `voxel_data`). Forwarded to the v7 distance section so a
+    /// loaded import re-extracts / sculpts with Manifold-DC instead of
+    /// the blur fallback. 1:1 with `voxel_data` (== header voxel_count).
+    pub dists: Vec<i16>,
     /// Per-leaf skinning weights (same order). Zero-filled for
     /// unskinned imports; only emitted to `.arvx` when
     /// [`Self::has_bones`] is set.
@@ -160,6 +165,7 @@ pub fn emit_shell_leaves(
     let mut voxel_data: Vec<VoxelSample> = Vec::new();
     let mut color_voxels: Vec<ColorVoxel> = Vec::new();
     let mut normals_packed: Vec<u32> = Vec::new();
+    let mut dists: Vec<i16> = Vec::new();
     let mut bone_voxels: Vec<BoneVoxel> = Vec::new();
     let mut brick_origins: Vec<[u32; 3]> = Vec::new();
     // Per-bone rest AABB accumulator — grown on demand as bone indices
@@ -194,6 +200,7 @@ pub fn emit_shell_leaves(
                         &mut voxel_data,
                         &mut color_voxels,
                         &mut normals_packed,
+                        &mut dists,
                         &mut bone_voxels,
                         &mut brick_origins,
                         &mut rest_bone_aabbs,
@@ -217,6 +224,7 @@ pub fn emit_shell_leaves(
         voxel_data,
         color_voxels,
         normals_packed,
+        dists,
         bone_voxels,
         brick_origins,
         rest_bone_aabbs,
@@ -245,6 +253,7 @@ fn emit_subbrick(
     voxel_data: &mut Vec<VoxelSample>,
     color_voxels: &mut Vec<ColorVoxel>,
     normals_packed: &mut Vec<u32>,
+    dists: &mut Vec<i16>,
     bone_voxels: &mut Vec<BoneVoxel>,
     brick_origins: &mut Vec<[u32; 3]>,
     rest_bone_aabbs: &mut Vec<[f32; 6]>,
@@ -397,6 +406,9 @@ fn emit_subbrick(
         let slot = *voxel_count;
         voxel_data.push(VoxelSample::new(0.0, mat_id, 0));
         normals_packed.push(normal_oct);
+        // Shell entries are outside voxels (selected by `!is_inside`), so
+        // `face_dists` carries a real positive signed distance here.
+        dists.push(result.face_dists[e.flat8]);
         color_voxels.push(cv);
         bone_voxels.push(bv);
         *voxel_count += 1;

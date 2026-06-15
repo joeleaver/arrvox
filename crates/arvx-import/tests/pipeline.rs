@@ -6,7 +6,10 @@
 use std::io::Write as _;
 
 use arvx_core::asset_file::{
-    ARVX_MAGIC, ARVX_VERSION, read_rkp_header,
+    ARVX_MAGIC, ARVX_VERSION, FLAG_HAS_DISTANCE, read_rkp_bricks, read_rkp_color,
+    read_rkp_dag_consumed, read_rkp_dag_groups, read_rkp_dag_produced, read_rkp_distance,
+    read_rkp_header, read_rkp_mesh_indices, read_rkp_mesh_vertices, read_rkp_meshlet_clusters,
+    read_rkp_normals, read_rkp_octree, read_rkp_skin_meta, read_rkp_voxels,
 };
 use arvx_import::{ImportConfig, NullReporter, import_mesh_to_opacity_rkp_with};
 
@@ -81,6 +84,66 @@ fn obj_cube_full_roundtrip() {
     assert_eq!(header.base_voxel_size, 0.1);
     // Cube is 1m across, expanded by 1 voxel on each side.
     assert!(header.aabb_min[0] < 0.0 && header.aabb_max[0] > 0.0);
+}
+
+/// The full import pipeline must persist the v7 per-leaf distance
+/// section so a loaded import re-extracts / sculpts with Manifold-DC
+/// instead of the blur fallback. Distances are 1:1 with the leaves
+/// (== header voxel_count) and POSITIVE (shell leaves are outside
+/// voxels). Before the wiring, the import passed None and the section
+/// never existed.
+#[test]
+fn obj_cube_persists_distance_section() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = write_tmp_obj(tmp.path(), "cube.obj");
+    let output = tmp.path().join("cube.arvx");
+
+    let config = ImportConfig {
+        voxel_size: Some(0.1),
+        ..ImportConfig::default()
+    };
+    let result = import_mesh_to_opacity_rkp_with(&source, &output, &config, &NullReporter)
+        .expect("import should succeed");
+
+    let file = std::fs::File::open(&output).unwrap();
+    let mut reader = std::io::BufReader::new(file);
+    let header = read_rkp_header(&mut reader).expect("header");
+    assert_eq!(header.version, ARVX_VERSION);
+    assert!(
+        header.flags & FLAG_HAS_DISTANCE != 0,
+        "import must set FLAG_HAS_DISTANCE",
+    );
+    assert!(header.distance_compressed_size > 0, "distance section must be non-empty");
+
+    // Distance is written LAST — drain every prior section in order.
+    let _ = read_rkp_octree(&mut reader, &header).expect("octree");
+    let _ = read_rkp_voxels(&mut reader, &header).expect("voxels");
+    let _ = read_rkp_normals(&mut reader, &header).expect("normals");
+    let _ = read_rkp_bricks(&mut reader, &header).expect("bricks");
+    let _ = read_rkp_color(&mut reader, &header).expect("color");
+    let _ = read_rkp_skin_meta(&mut reader, &header).expect("skin");
+    let _ = read_rkp_mesh_vertices(&mut reader, &header).expect("mesh verts");
+    let _ = read_rkp_mesh_indices(&mut reader, &header).expect("mesh indices");
+    let _ = read_rkp_meshlet_clusters(&mut reader, &header).expect("clusters");
+    let _ = read_rkp_dag_groups(&mut reader, &header).expect("dag groups");
+    let _ = read_rkp_dag_consumed(&mut reader, &header).expect("dag consumed");
+    let _ = read_rkp_dag_produced(&mut reader, &header).expect("dag produced");
+    let dist_bytes = read_rkp_distance(&mut reader, &header).expect("distance");
+    let dists: &[i16] = bytemuck::cast_slice(&dist_bytes);
+
+    assert_eq!(
+        dists.len(),
+        result.shell_voxels as usize,
+        "distances must be 1:1 with shell leaves (== voxel_count)",
+    );
+    assert!(
+        dists.iter().all(|&q| q >= 0),
+        "every shell leaf is an outside voxel → non-negative signed distance",
+    );
+    assert!(
+        dists.iter().any(|&q| q > 0),
+        "a real bake must carry nonzero distances",
+    );
 }
 
 #[test]

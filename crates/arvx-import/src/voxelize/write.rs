@@ -167,6 +167,18 @@ pub fn write_rkp(
         None
     };
 
+    // v7 per-leaf distance section. The voxelizer captured the true
+    // (Euclidean, unit-gradient) signed distance to the mesh surface per
+    // shell leaf; persist it so a loaded import re-extracts / sculpts
+    // with Manifold-DC instead of the blur fallback (the read side,
+    // asset_load::build_loaded_asset, sets has_distances from it). 1:1
+    // with the leaves (== voxel_count); empty only for a degenerate bake.
+    let distance_bytes: &[u8] = if shell.dists.is_empty() {
+        &[]
+    } else {
+        bytemuck::cast_slice(&shell.dists)
+    };
+
     write_rkp_atomic(output_path, |writer| {
         arvx_core::asset_file::write_rkp_with_progress(
             writer,
@@ -183,7 +195,7 @@ pub fn write_rkp(
             color_bytes,
             skin_meta,
             mesh_sections,
-            None, // distance_data (wired at bake time in a later stage)
+            if distance_bytes.is_empty() { None } else { Some(distance_bytes) },
             Some(&progress_cb),
         )
         .map_err(|e| format!("write .arvx: {e}"))
