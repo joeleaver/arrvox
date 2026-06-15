@@ -563,6 +563,26 @@ pub(crate) fn qef_hermite_force_off() -> bool {
     })
 }
 
+/// Bumped whenever the mesher's GEOMETRY OUTPUT changes for the same voxel
+/// input, so on-disk caches keyed by a bake signature (terrain `.arvxtile`,
+/// etc.) auto-invalidate instead of serving stale geometry. History:
+/// `1` = cell-center-plane QEF-Hermite; `2` = Manifold-DC interpolation.
+pub const MESHER_OUTPUT_VERSION: u32 = 2;
+
+/// Manifold-DC interpolation placement ([`manifold_dc_placement`]) — the
+/// PRODUCTION DEFAULT for the QEF/terrain path. It reconstructs each vertex by
+/// INTERPOLATING the stored per-cell signed distances at the cube's edge
+/// crossings (missing interior/empty neighbours extrapolated from the surface
+/// cell's Hermite plane), QEF over those crossings biased to the centroid,
+/// clamped to an expanded bound. This de-staircases gentle slopes that the old
+/// cell-center-plane + 1-voxel-cube-clamp QEF terraced, while staying watertight,
+/// deterministic, and crisp on sharp features. Rollback to the legacy placement
+/// with `ARVX_MESH_DC=0`. Read once.
+pub(crate) fn manifold_dc_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ARVX_MESH_DC").map(|v| v != "0").unwrap_or(true))
+}
+
 thread_local! {
     /// Per-thread force-OFF for the QEF-Hermite mesher (default `false` =
     /// allow QEF when a distance pool is present). The terrain seam tests
@@ -2288,6 +2308,133 @@ where
     Some(solve_qef(&planes, bias).clamp(lo, lo + Vec3::ONE))
 }
 
+/// **Manifold Dual Contouring placement** — reconstruct the vertex by
+/// INTERPOLATING the stored per-cell signed-distance field, not by fitting
+/// cell-center planes. For each of the cube's 12 edges that crosses the surface
+/// (sign change between its two corner cells' stored distances), linearly
+/// interpolate the crossing point from the two distances and take the surface
+/// cell's normal there; place the vertex by QEF over those Hermite crossings,
+/// Tikhonov-biased toward the crossing CENTROID. A rank-deficient gentle-slope
+/// cube collapses to the smooth centroid (instead of stepping), and the result
+/// is clamped to an EXPANDED bound so the vertex may follow a gentle slope
+/// across the cell boundary — the per-cube AABB clamp in `qef_hermite_placement`
+/// is what staircased gentle slopes.
+///
+/// Interior/empty corner cells carry only a sign (no stored magnitude); they
+/// contribute a ±band-half-width sentinel so a surface↔solid or surface↔empty
+/// crossing still interpolates to a sub-cell position. Sign convention matches
+/// [`qef_cell_inside`] so the topology and placement agree. Returns `None` when
+/// no edge crosses (caller falls back to the edge-crossing centroid).
+fn manifold_dc_placement<F>(
+    cube: IVec3,
+    cell_lookup: &F,
+    leaf_attr_pool: &[LeafAttr],
+    dists: &[i16],
+) -> Option<Vec3>
+where
+    F: Fn(IVec3) -> Option<u32>,
+{
+    // Sentinel half-width for the rare both-sides-have-no-distance edge.
+    const SENT: f32 = 0.866_025_4; // sqrt(3)/2
+    // Per corner cell: (inside?, stored signed distance, stored normal). Sign
+    // matches `qef_cell_inside`; surface cells carry a real (d, n), interior/
+    // empty carry only the sign.
+    let sample = |c: IVec3| -> (bool, Option<f32>, Option<Vec3>) {
+        match cell_lookup(c) {
+            None => (false, None, None),                          // empty → outside
+            Some(s) if s == CELL_INTERIOR => (true, None, None),  // deep solid → inside
+            Some(s) => {
+                let d = dists
+                    .get(s as usize)
+                    .copied()
+                    .map(LeafAttrPool::dequantize_dist)
+                    .unwrap_or(0.0);
+                let n = leaf_attr_pool
+                    .get(s as usize)
+                    .map(|a| unpack_oct(a.normal_oct))
+                    .filter(|n| n.length_squared() > 1e-12)
+                    .map(|n| n.normalize());
+                (d <= 0.0, Some(d), n)
+            }
+        }
+    };
+    // 12 cube edges as corner-index pairs in `corner_offset` (bit) order.
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1), (2, 3), (4, 5), (6, 7), // x
+        (0, 2), (1, 3), (4, 6), (5, 7), // y
+        (0, 4), (1, 5), (2, 6), (3, 7), // z
+    ];
+    let corners: [(bool, Option<f32>, Option<Vec3>); 8] =
+        std::array::from_fn(|i| sample(cube + corner_offset(i as u32)));
+    let center = |i: usize| -> Vec3 {
+        let c = cube + corner_offset(i as u32);
+        Vec3::new(c.x as f32 + 0.5, c.y as f32 + 0.5, c.z as f32 + 0.5)
+    };
+    let mut planes: Vec<(Vec3, Vec3)> = Vec::with_capacity(12);
+    let mut csum = Vec3::ZERO;
+    let mut nc = 0.0f32;
+    for (a, b) in EDGES {
+        let (ina, da_opt, na) = corners[a];
+        let (inb, db_opt, nb) = corners[b];
+        if ina == inb {
+            continue; // no sign change → no crossing on this edge
+        }
+        let ca = center(a);
+        let cb = center(b);
+        // Resolve both endpoint distances. A side with no stored magnitude
+        // (interior/empty) is EXTRAPOLATED from the surface side's Hermite
+        // plane (`d_b = d_a + (c_b − c_a)·n_a`, |∇d| = 1): on a clean slope this
+        // reproduces the exact plane (residual → 0) and on a curved field it is
+        // first-order — far better than a flat sentinel. Only when neither side
+        // is a surface cell (both sign-only) does the ±sentinel apply.
+        let (da, db) = match (da_opt, db_opt) {
+            (Some(da), Some(db)) => (da, db),
+            (Some(da), None) => {
+                let db = na
+                    .map(|n| da + (cb - ca).dot(n))
+                    .unwrap_or(if inb { -SENT } else { SENT });
+                (da, db)
+            }
+            (None, Some(db)) => {
+                let da = nb
+                    .map(|n| db + (ca - cb).dot(n))
+                    .unwrap_or(if ina { -SENT } else { SENT });
+                (da, db)
+            }
+            (None, None) => (
+                if ina { -SENT } else { SENT },
+                if inb { -SENT } else { SENT },
+            ),
+        };
+        let denom = da - db;
+        if denom.abs() < 1e-9 {
+            continue;
+        }
+        let t = (da / denom).clamp(0.0, 1.0);
+        let p = ca + (cb - ca) * t;
+        csum += p;
+        nc += 1.0;
+        // Normal from the surface endpoint (prefer the nearer of the two).
+        let n = if t < 0.5 { na.or(nb) } else { nb.or(na) };
+        if let Some(n) = n {
+            planes.push((n, p));
+        }
+    }
+    if nc == 0.0 {
+        return None;
+    }
+    let centroid = csum / nc;
+    let pos = if planes.is_empty() {
+        centroid
+    } else {
+        solve_qef(&planes, centroid)
+    };
+    // Corner-cell centers span [cube+0.5, cube+1.5]; allow ±0.5 cell beyond so a
+    // gentle slope is followed across the boundary instead of stepping at it.
+    let lo = Vec3::new(cube.x as f32 + 0.5, cube.y as f32 + 0.5, cube.z as f32 + 0.5);
+    Some(pos.clamp(lo - Vec3::splat(0.5), lo + Vec3::splat(1.5)))
+}
+
 /// Sign-based solidity for the QEF-Hermite topology. A cell is "inside"
 /// iff its stored per-leaf signed distance is `≤ 0` (center on/below the
 /// surface); deep INTERIOR-region cells (`CELL_INTERIOR`, no stored
@@ -2538,7 +2685,11 @@ where
     // isosurface. Falls back to the edge-crossing centroid only for a
     // degenerate cube that supplied no surface-leaf plane (defensive).
     let local_centroid = if qef_hermite {
-        qef_hermite_placement(cube, &cell_lookup, leaf_attr_pool, dists).unwrap_or(centroid0)
+        if manifold_dc_on() {
+            manifold_dc_placement(cube, &cell_lookup, leaf_attr_pool, dists).unwrap_or(centroid0)
+        } else {
+            qef_hermite_placement(cube, &cell_lookup, leaf_attr_pool, dists).unwrap_or(centroid0)
+        }
     } else {
         match (density_grid_fn, gradient_grid_fn) {
             (Some(dfn), Some(gfn)) if crossing_count > 0 => {
