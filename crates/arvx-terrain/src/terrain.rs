@@ -235,6 +235,11 @@ impl Terrain {
         }
         // Coarse region guard (see scope note above).
         mix(&(self.regions.len() as u64).to_le_bytes());
+        // Mesher output version — a mesher change (e.g. cell-center QEF →
+        // Manifold-DC) that alters baked geometry for the SAME spec must
+        // invalidate the on-disk `.arvxtile` cache, or a delete+regenerate
+        // silently reloads stale (old-mesher) tiles.
+        mix(&arvx_core::mesh_extract::MESHER_OUTPUT_VERSION.to_le_bytes());
         h
     }
 }
