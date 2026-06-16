@@ -1153,7 +1153,27 @@ fn compute_offset_edits(
                                 let slot = slot_grid[i];
                                 let prev = prev_dist(slot);
                                 let nd = dist_vox.min(prev);
-                                if nd < prev - 1e-4 {
+                                if nd < -band {
+                                    // Pushed deep under the new dome. Convert to
+                                    // interior bulk rather than keeping a leaf
+                                    // with a SetDist distance: a buried leaf's
+                                    // stored normal (the offset-field gradient at
+                                    // its sub-surface position) is not the dome's
+                                    // surface normal, yet DC still folds it into
+                                    // the `normal_sum` average of nearby flank
+                                    // cubes — that contaminated the shading and
+                                    // left a mottled dark band on the dome rim.
+                                    // Interior carries no normal, so it can't.
+                                    // (SetInterior is also replay-stable, unlike
+                                    // SetDist.) Only emit when it actually flips
+                                    // (prev was still a band leaf).
+                                    if prev >= -band {
+                                        edits.push(LeafEdit {
+                                            coord: c,
+                                            op: LeafEditOp::SetInterior,
+                                        });
+                                    }
+                                } else if nd < prev - 1e-4 {
                                     edits.push(LeafEdit {
                                         coord: c,
                                         op: LeafEditOp::SetDist { slot, normal: surf_n, dist: nd },
@@ -1218,6 +1238,89 @@ fn compute_offset_edits(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // ── Normal-smoothing post-pass. The per-cell analytic `surf_n` is the
+    // exact offset-field gradient, but at the thin dome rim — and where a stamp
+    // meets an already-sculpted area — the discrete band leaves a small step in
+    // the stored normals between the steep dome flank and its flatter
+    // surround. The editor shades PER-LEAF, so that step reads as a hard crease
+    // / mottle on the rim. A couple of Laplacian iterations over the emitted
+    // surface normals, with the un-edited surrounding surface pinned as fixed
+    // boundary data, blend the rim toward the surround and even out overlap
+    // seams. Normals only — geometry (the stored distances) is untouched.
+    {
+        let mut nrm: Vec<Vec3> = vec![Vec3::ZERO; total];
+        let mut has: Vec<bool> = vec![false; total];
+        for e in &edits {
+            let n = match e.op {
+                LeafEditOp::Add { normal, .. } | LeafEditOp::SetDist { normal, .. } => normal,
+                _ => continue,
+            };
+            let i = idx(e.coord);
+            nrm[i] = n;
+            has[i] = true;
+        }
+        // Pin the surrounding un-edited surface leaves: they seed the smoothing
+        // (so the rim blends toward them) but are never themselves moved.
+        let mut pinned: Vec<bool> = vec![false; total];
+        for z in lo.z..hi.z {
+            for y in lo.y..hi.y {
+                for x in lo.x..hi.x {
+                    let i = idx(UVec3::new(x, y, z));
+                    if !has[i] && state_kind[i] == 2 && normal_grid[i] != Vec3::ZERO {
+                        nrm[i] = normal_grid[i];
+                        has[i] = true;
+                        pinned[i] = true;
+                    }
+                }
+            }
+        }
+        for _ in 0..2 {
+            let src = nrm.clone();
+            for z in lo.z..hi.z {
+                for y in lo.y..hi.y {
+                    for x in lo.x..hi.x {
+                        let i = idx(UVec3::new(x, y, z));
+                        if !has[i] || pinned[i] {
+                            continue;
+                        }
+                        let mut sum = src[i];
+                        let mut cnt = 1.0f32;
+                        let nb = [
+                            (x > lo.x).then(|| idx(UVec3::new(x - 1, y, z))),
+                            (x + 1 < hi.x).then(|| idx(UVec3::new(x + 1, y, z))),
+                            (y > lo.y).then(|| idx(UVec3::new(x, y - 1, z))),
+                            (y + 1 < hi.y).then(|| idx(UVec3::new(x, y + 1, z))),
+                            (z > lo.z).then(|| idx(UVec3::new(x, y, z - 1))),
+                            (z + 1 < hi.z).then(|| idx(UVec3::new(x, y, z + 1))),
+                        ];
+                        for j in nb.iter().flatten() {
+                            if has[*j] {
+                                sum += src[*j];
+                                cnt += 1.0;
+                            }
+                        }
+                        let avg = sum / cnt;
+                        if avg.length_squared() > 1e-10 {
+                            nrm[i] = avg.normalize();
+                        }
+                    }
+                }
+            }
+        }
+        for e in &mut edits {
+            let i = idx(e.coord);
+            if !has[i] {
+                continue;
+            }
+            match &mut e.op {
+                LeafEditOp::Add { normal, .. } | LeafEditOp::SetDist { normal, .. } => {
+                    *normal = nrm[i];
+                }
+                _ => {}
             }
         }
     }

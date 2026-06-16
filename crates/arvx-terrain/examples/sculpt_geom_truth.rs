@@ -64,6 +64,19 @@ fn pack_oct(n: Vec3) -> u32 {
     xi | (yi << 16)
 }
 
+/// Replace each vertex normal with its leaf's STORED normal — matches the
+/// editor's deferred resolve, which shades per-pixel from `LeafAttr.normal_oct`
+/// (octree descent to the leaf), NOT the averaged mesh-vertex normal.
+fn with_leaf_normals(verts: &[MeshVertex], leaf: &LeafAttrPool) -> Vec<MeshVertex> {
+    let mut v = verts.to_vec();
+    for mv in &mut v {
+        if mv.leaf_attr_id != 0 {
+            mv.normal_oct = leaf.get(mv.leaf_attr_id).normal_oct;
+        }
+    }
+    v
+}
+
 /// Replace each vertex normal with its triangle's geometric FACE normal.
 fn with_face_normals(verts: &[MeshVertex], idx: &[u32]) -> Vec<MeshVertex> {
     let mut v = verts.to_vec();
@@ -301,9 +314,18 @@ fn main() {
                     continue;
                 }
                 let c = glam::UVec3::new(xx as u32, yy as u32, cz);
+                let dump_normals = std::env::var("ARVX_SCULPT_TRUTH_DUMPN").as_deref() == Ok("1");
                 let ch = match octree.cell_state(c, &bricks) {
                     CellState::Empty | CellState::OutOfBounds => '.',
                     CellState::Interior => '#',
+                    CellState::Solid(slot) if dump_normals => {
+                        // Horizontal-x tilt of the stored normal: spots
+                        // cell-to-cell normal noise on the flank.
+                        let n = arvx_core::unpack_oct(leaf.get(slot).normal_oct);
+                        let nx = n.x;
+                        if nx < -0.6 { '<' } else if nx < -0.25 { ',' }
+                        else if nx <= 0.25 { '|' } else if nx <= 0.6 { '`' } else { '>' }
+                    }
                     CellState::Solid(slot) => {
                         let d = leaf.dist(slot);
                         if d <= 0.0 {
@@ -386,8 +408,8 @@ fn main() {
     eprintln!("[sculpt-truth] region mesh: {} verts, {} tris", rverts.len(), ridx.len() / 3);
 
     // ── 5. Render both extracts (face + vertex + side) and report metrics.
-    render_set(&out, &format!("{tag}_full"), &verts, &idx, ground, surf_center, radius * VS);
-    render_set(&out, &format!("{tag}_region"), &rverts, &ridx, ground, surf_center, radius * VS);
+    render_set(&out, &format!("{tag}_full"), &verts, &idx, ground, surf_center, radius * VS, Some(&leaf));
+    render_set(&out, &format!("{tag}_region"), &rverts, &ridx, ground, surf_center, radius * VS, Some(&leaf));
     eprintln!("[sculpt-truth] PNGs in {}", out.canonicalize().unwrap_or(out).display());
 }
 
@@ -400,6 +422,7 @@ fn render_set(
     ground: f32,
     bc: Vec3,
     br: f32,
+    leaf: Option<&LeafAttrPool>,
 ) {
     if verts.is_empty() {
         eprintln!("[sculpt-truth/{tag}] EMPTY MESH");
@@ -430,6 +453,16 @@ fn render_set(
             RenderOpts { shaded: true, wireframe: false, voxels: false, dim_shading: false }, SIZE),
         &out.join(format!("{tag}_vertex.png")),
     );
+    // Editor-faithful: shade from the per-leaf STORED normal (what the
+    // deferred resolve reads per pixel), not the averaged mesh-vertex normal.
+    if let Some(leaf) = leaf {
+        let vl = with_leaf_normals(verts, leaf);
+        save(
+            &render(&cam_g, &dummy, &vl, idx,
+                RenderOpts { shaded: true, wireframe: false, voxels: false, dim_shading: false }, SIZE),
+            &out.join(format!("{tag}_leafnorm.png")),
+        );
+    }
     save(
         &render(&cam_s, &dummy, verts, idx,
             RenderOpts { shaded: true, wireframe: true, voxels: false, dim_shading: true }, SIZE),
