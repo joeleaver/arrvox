@@ -1075,17 +1075,20 @@ impl super::mesher::Mesher {
         // surface, so dropping cells that aren't actually emptied is
         // safe.
         //
-        // Raise / Inflate are purely ADDITIVE (Add / SetInterior, plus —
-        // for the SDF-offset Inflate — SetDist that pushes a buried original
-        // leaf sub-surface; never Remove/Empty). Any original surface they
-        // bury ends up INSIDE the new solid dome, hidden behind the
-        // re-extracted dome surface, so `KeepAll` is correct: keep the old
-        // tris (occluded, harmless) and append the dome patch. An
-        // unconditional filter here would instead delete the ground tris
-        // under the dome, leaving a hole the SN re-extract can't refill
-        // (SOLID↔INTERIOR cubes have no EMPTY corner and emit no surface).
-        // Deflate / Carve are subtractive — they expose what was hidden, so
-        // the stale tris MUST be dropped (SphereTouch).
+        // The SDF-offset Inflate RE-DEFINES the whole brush region's surface:
+        // it buries the original surface (→ interior / sub-surface SetDist) and
+        // emits a new dome. The old ground tris are therefore stale and MUST be
+        // dropped (SphereTouch) — keeping them (the old KeepAll path) left the
+        // original ground tris and the new SHALLOW dome rim at nearly-equal
+        // depth, which z-fought/flickered as the camera moved. Dropping them and
+        // re-extracting the dome leaves a single surface; at the sphere boundary
+        // the dome rim (offset→0) meets the kept terrain continuously, and the
+        // AABB-outside-sphere overlap is bit-identical (octree unchanged there)
+        // so it doesn't flicker. Deflate / Carve / Smooth / ClayStrip are
+        // likewise drop-and-re-extract. Only RAISE stays KeepAll: it unions new
+        // mass on top WITHOUT re-defining the existing surface band, so its old
+        // tris remain valid and a filter would punch a hole the SN re-extract
+        // can't refill (SOLID↔INTERIOR cubes have no EMPTY corner → no surface).
         //
         // The shared `remesh_filter_dirty_clusters` owns the dirty
         // query, the rayon per-triangle filter (incl. the closest-point
@@ -1095,13 +1098,18 @@ impl super::mesher::Mesher {
         // `arvx_scene_manager::remesh_region`.
         let filter = if matches!(
             op.mode,
-            BrushMode::Carve | BrushMode::Deflate | BrushMode::Smooth | BrushMode::ClayStrip
+            BrushMode::Carve
+                | BrushMode::Deflate
+                | BrushMode::Smooth
+                | BrushMode::ClayStrip
+                | BrushMode::Inflate
         ) {
             RemeshFilter::SphereTouch {
                 center: brush_center_local,
                 radius_sq: brush_radius_sq,
             }
         } else {
+            // Raise only.
             RemeshFilter::KeepAll
         };
         let region = RemeshRegion::brush(brush_lo, brush_hi, filter);
