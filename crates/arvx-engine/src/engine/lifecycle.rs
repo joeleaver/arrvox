@@ -171,7 +171,18 @@ impl EngineState {
             self.update_scene_gpu_transform_only();
             self.gpu_objects_dirty.clear();
         } else if self.gpu_objects_dirty.is_dirty() {
-            let profile = self.paint_profile_active();
+            // `ARVX_GPU_OBJECTS_PROFILE=1` logs every GPU-objects rebuild
+            // independently of paint profiling, attributing the cause —
+            // `all` (a `mark_all()`, e.g. terrain tile integrate/evict
+            // forcing a full rebuild; see terrain_ops L1 perf debt),
+            // `narrow-bail` (a structural-narrow attempt that hit a
+            // not-yet-mapped entity), or `narrow` (the fast path). Pair
+            // with `ARVX_TERRAIN_PROFILE=1` to correlate full rebuilds
+            // with the per-tick integrate/evict counts that triggered
+            // them. Baseline for the terrain-tick L1 fix.
+            let profile = self.paint_profile_active()
+                || std::env::var("ARVX_GPU_OBJECTS_PROFILE").is_ok();
+            let was_all = self.gpu_objects_dirty.is_all();
             let t0 = std::time::Instant::now();
             // PERF_DEBT.md C2-extension: structural-narrow fast path.
             // When the dirty set is non-empty and `is_all()` is false,
@@ -197,11 +208,22 @@ impl EngineState {
                     .unwrap_or(0);
                 let prev = LAST_NS.swap(now_ns, Ordering::Relaxed);
                 let gap_ms = if prev == 0 { 0.0 } else { (now_ns.saturating_sub(prev)) as f64 / 1.0e6 };
+                let cause = if used_narrow {
+                    "narrow"
+                } else if was_all {
+                    "all" // mark_all() — full rebuild forced (terrain tick, scene load, ...)
+                } else {
+                    "narrow-bail" // narrow tried but an entity had no gpu mapping
+                };
                 eprintln!(
-                    "[paint] update_scene_gpu dt={:?} path={} instances={} overlays={} gap_since_last={:.1}ms",
+                    "[gpu-objects] update_scene_gpu dt={:?} path={} cause={} instances={} assets={} mesh_draws={} proxy_draws={} overlays={} gap_since_last={:.1}ms",
                     t0.elapsed(),
                     if used_narrow { "narrow" } else { "full" },
+                    cause,
                     self.gpu_instances.len(),
+                    self.gpu_assets.len(),
+                    self.mesh_draws.len(),
+                    self.proxy_draws.len(),
                     self.gpu_instance_overlays.len(),
                     gap_ms,
                 );
