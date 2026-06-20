@@ -80,13 +80,37 @@ impl super::state::EngineState {
         // `[terrain-tick]` line with `[render-frame] STALL` / `[geo-epoch]`.
         let prof = std::env::var("ARVX_TERRAIN_PROFILE").is_ok();
         let t_tick = std::time::Instant::now();
-        let completed = runtime.streamer.drain_completed();
-        let n_completed = completed.len();
-        let integrated_any = !completed.is_empty();
+        // Drain freshly-completed bakes into the backlog queue, but do NOT
+        // integrate the whole batch this tick. On a warm `.arvxtile` cache a
+        // tile bakes in ~0 ms, so an entire footprint can land in one drain;
+        // integrating all of them in a single sim tick (each under the
+        // scene_mgr lock + a full GPU upload) stalls the sim for seconds
+        // before it publishes a new snapshot — the load freeze. The sibling
+        // asset-load path is already budgeted (`drain_pending_asset_loads`);
+        // this gives terrain the same treatment so a burst materialises
+        // progressively instead of freezing. (P3-A.)
+        for kb in runtime.streamer.drain_completed() {
+            runtime.pending_integrations.push_back(kb);
+        }
+        // Per-tick integrate budget (tiles). Override via
+        // `ARVX_TERRAIN_INTEGRATE_BUDGET`; 0/invalid → default. Every queued
+        // tile is still integrated (just spread across ticks), so the
+        // streamer's `record_integrated` / hot-swap eviction bookkeeping sees
+        // each one exactly as before.
+        let integrate_budget: usize = std::env::var("ARVX_TERRAIN_INTEGRATE_BUDGET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&b| b > 0)
+            .unwrap_or(2);
+        let n_this_tick = runtime.pending_integrations.len().min(integrate_budget);
+        let integrated_any = n_this_tick > 0;
         let debug_hotswap = std::env::var("ARVX_TERRAIN_DEBUG").is_ok();
         let mut integ_sum = std::time::Duration::ZERO;
         let mut integ_max = std::time::Duration::ZERO;
-        for (key, baked) in completed {
+        for _ in 0..n_this_tick {
+            let Some((key, baked)) = runtime.pending_integrations.pop_front() else {
+                break;
+            };
             let t_i = std::time::Instant::now();
             let token = self.integrate_terrain_tile(&mut runtime, key, baked);
             let dt_i = t_i.elapsed();
@@ -152,9 +176,11 @@ impl super::state::EngineState {
             self.gpu_objects_dirty.mark_all();
         }
 
-        if prof && (integrated_any || evicted_any) {
+        let backlog = runtime.pending_integrations.len();
+        if prof && (integrated_any || evicted_any || backlog > 0) {
             eprintln!(
-                "[terrain-tick] integrated={n_completed} (integrate {:.1}ms, max_tile {:.1}ms) \
+                "[terrain-tick] integrated={n_this_tick} backlog={backlog} \
+                 (integrate {:.1}ms, max_tile {:.1}ms) \
                  evicted={} residency+evict={:.1}ms submit={:.1}ms tick_total={:.1}ms",
                 integ_sum.as_secs_f64() * 1000.0,
                 integ_max.as_secs_f64() * 1000.0,

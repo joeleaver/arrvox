@@ -7,10 +7,10 @@
 //! gets a u64 token back. [`TerrainRuntime`] maps tokens to live
 //! `(Entity, AssetHandle)` pairs so eviction can release both.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use arvx_render::AssetHandle;
-use arvx_terrain::{SculptDiff, TileKey, TileStreamer};
+use arvx_terrain::{BakedTile, SculptDiff, TileKey, TileStreamer};
 
 /// Engine-side runtime state for the active Terrain.
 ///
@@ -75,6 +75,13 @@ pub struct TerrainRuntime {
     /// Monotonic token counter — the streamer doesn't generate these
     /// itself.
     pub next_token: u64,
+    /// P3-A integrate backlog. Freshly-drained bakes land here and are
+    /// integrated at most `ARVX_TERRAIN_INTEGRATE_BUDGET` per sim tick, so a
+    /// warm-cache burst (a whole footprint ready at once, bake_time≈0) spreads
+    /// across ticks instead of stalling the sim — and therefore presentation —
+    /// for seconds in a single tick. Every queued tile is still integrated and
+    /// still flows through `record_integrated` / hot-swap eviction in order.
+    pub pending_integrations: VecDeque<(TileKey, BakedTile)>,
 }
 
 impl TerrainRuntime {
@@ -111,6 +118,7 @@ impl TerrainRuntime {
             divergent_tiles: HashSet::new(),
             diffs: HashMap::new(),
             next_token: 1,
+            pending_integrations: VecDeque::new(),
         }
     }
 
