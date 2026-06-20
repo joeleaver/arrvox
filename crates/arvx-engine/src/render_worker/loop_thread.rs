@@ -186,26 +186,28 @@ pub(super) fn run_render_thread(
                     );
                 }
             }
-            // Block until the GPU signals the in-flight readbacks complete,
-            // delivering their `map_async` callbacks. A non-blocking
-            // `PollType::Poll` does NOT advance those callbacks once we
-            // stop submitting frames — with no new submission to drive the
-            // device timeline forward, the three pending readbacks never
-            // complete, `has_idle_slot()` stays false, and this gate wedges
-            // FOREVER (observed: a terrain-gen bake burst pushed the render
-            // thread into the gate; it then spun for 4.5 s+ at pending=3/3,
-            // never shipping a frame → rinch's window surface went Outdated
-            // → #42's missing reconfigure made the dead viewport permanent).
-            // `wait_indefinitely` is the same blocking idiom the proc
-            // readbacks use; the next iteration's poll+drain frees the slot.
+            // BOUNDED WAIT (P3-B). The render thread must NEVER hard-block on
+            // readback-slot availability — presentation liveness cannot be held
+            // hostage to GPU-queue drain. A non-blocking `PollType::Poll` does
+            // not advance the pending `map_async` callbacks once we stop
+            // submitting frames, so the old code blocked on
+            // `wait_indefinitely()` to force the device timeline forward — but
+            // that hard-froze the render thread for the entire (load-inflated)
+            // queue drain (observed 4.5 s+ at pending=3/3), turning a stale
+            // surface into a frozen one. Instead we wait at most a small budget
+            // and then RETURN to the loop regardless: picks/snapshots keep
+            // flowing, the next iteration re-polls + drains to free a slot, and
+            // a genuine GPU wedge degrades to a loud, repeating budget-exceeded
+            // canary instead of a silent indefinite park (the signature that
+            // localized the Xid-109 TLAS hang).
             //
-            // PROBE: log on entry to the blocking wait (once per stall
-            // episode) and again if a single wait runs long. If the last
-            // render-thread line in the log is "→ wait_indefinitely" with
-            // no following "wait returned" / "[render-stall] recovered",
-            // the GPU work behind the readbacks never completed and the
-            // device itself is wedged (that signature localized the
-            // Xid-109 TLAS hang).
+            // This bounds the worst case; it does NOT remove the underlying
+            // readback↔present coupling — that is P2 (a dedicated readback poll
+            // thread + newest-wins present, deleting this gate entirely).
+            let gate_wait_ms: u64 = std::env::var("ARVX_RENDER_GATE_WAIT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8);
             let fresh_stall = bp_spins == 1;
             if fresh_stall {
                 let pending = state
@@ -214,14 +216,25 @@ pub(super) fn run_render_thread(
                     .map(|vr| vr.readback.pending_count())
                     .unwrap_or(0);
                 eprintln!(
-                    "[render-gate] stall begin → wait_indefinitely (pending={pending}/3)"
+                    "[render-gate] stall begin → bounded wait {gate_wait_ms}ms (pending={pending}/3)"
                 );
             }
             let wait_t0 = std::time::Instant::now();
-            let _ = state.device.poll(wgpu::PollType::wait_indefinitely());
+            let poll_result = state.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(gate_wait_ms)),
+            });
             let wait_ms = wait_t0.elapsed().as_secs_f32() * 1000.0;
-            if wait_ms > 100.0 {
-                eprintln!("[render-gate] wait_indefinitely returned after {wait_ms:.0}ms");
+            // A timeout here is EXPECTED under load and is NOT fatal — we simply
+            // return to the loop. Only log it as a canary so a persistent wedge
+            // (every wait timing out, never recovering) is visible in the log.
+            if matches!(poll_result, Err(wgpu::PollError::Timeout))
+                && (fresh_stall || wait_ms > 100.0)
+            {
+                eprintln!(
+                    "[render-gate] wait budget exceeded ({wait_ms:.0}ms, budget={gate_wait_ms}ms) \
+                     pending=3/3 — continuing (not blocking)"
+                );
             }
             continue;
         }
