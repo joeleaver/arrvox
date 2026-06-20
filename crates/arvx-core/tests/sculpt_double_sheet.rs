@@ -199,101 +199,99 @@ fn terrain_inflate_does_not_double_sheet() {
         leaf.dists_as_slice(),
     );
 
-    // ── 5. SphereTouch-filter the old tris (mirror RemeshFilter::SphereTouch):
-    // keep a triangle iff ALL three verts are strictly outside the brush sphere.
+    // ── 5. Two drop filters on the old tris:
+    //   (a) SphereTouch(op.radius)  — what the editor does TODAY (the bug):
+    //       keep a tri iff all 3 verts are outside the brush sphere.
+    //   (b) BoxTouch(patch emit box) — the candidate fix: drop everything the
+    //       patch re-extract re-emits (incl. the +1 extract pad), so no
+    //       kept-old can overlap the patch. (Mirrors RemeshFilter::BoxTouch.)
     let center_world = grid_origin + cg * VS;
-    let radius_world = radius * VS;
-    let r2 = radius_world * radius_world;
-    let kept_old: Vec<(Vec3, Vec3)> = old_idx
-        .chunks_exact(3)
-        .filter(|t| {
-            t.iter().all(|&i| (Vec3::from(old_verts[i as usize].local_pos) - center_world).length_squared() > r2)
-        })
-        .filter_map(|t| {
-            let p0 = Vec3::from(old_verts[t[0] as usize].local_pos);
-            let p1 = Vec3::from(old_verts[t[1] as usize].local_pos);
-            let p2 = Vec3::from(old_verts[t[2] as usize].local_pos);
-            let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
-            (n != Vec3::ZERO).then_some(((p0 + p1 + p2) / 3.0, n))
-        })
-        .collect();
+    let r2 = (radius * VS) * (radius * VS);
+    let box_min = grid_origin + (rmin.as_vec3() - Vec3::ONE) * VS;
+    let box_max = grid_origin + (rmax.as_vec3() + Vec3::ONE) * VS;
+    let in_box = |p: Vec3| p.cmpge(box_min).all() && p.cmple(box_max).all();
+    let collect_kept = |keep: &dyn Fn(Vec3, Vec3, Vec3) -> bool| -> Vec<(Vec3, Vec3)> {
+        old_idx
+            .chunks_exact(3)
+            .filter_map(|t| {
+                let p0 = Vec3::from(old_verts[t[0] as usize].local_pos);
+                let p1 = Vec3::from(old_verts[t[1] as usize].local_pos);
+                let p2 = Vec3::from(old_verts[t[2] as usize].local_pos);
+                if !keep(p0, p1, p2) {
+                    return None;
+                }
+                let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+                (n != Vec3::ZERO).then_some(((p0 + p1 + p2) / 3.0, n))
+            })
+            .collect()
+    };
+    let kept_sphere = collect_kept(&|p0, p1, p2| {
+        (p0 - center_world).length_squared() > r2
+            && (p1 - center_world).length_squared() > r2
+            && (p2 - center_world).length_squared() > r2
+    });
+    let kept_box = collect_kept(&|p0, p1, p2| !in_box(p0) && !in_box(p1) && !in_box(p2));
     let patch_tris = tris(&patch_verts, &patch_idx);
 
-    // ── 6. Detect cross-source coincident sheets AND measure their vertical
-    // offset. Two up-facing surfaces stacked in the same xz column with a
-    // SUB-VOXEL, NON-ZERO gap z-fight; a bit-identical overlap (gap≈0) is a
-    // harmless duplicate. We classify so the test fails only on a REAL z-fight,
-    // not on the (safe) bit-identical outside-sphere overlap the editor relies on.
+    // ── 6. Cross-source coincident-sheet detector. Two up-facing surfaces in
+    // the same xz column with a SUB-VOXEL NON-ZERO gap z-fight; a bit-identical
+    // overlap (gap≈0) is harmless. Returns (bit_identical, z_fight, max_gap_vox).
     let up = |n: Vec3| n.y > 0.5;
     let cell = |p: Vec3| (((p.x - grid_origin.x) / VS).floor() as i32, ((p.z - grid_origin.z) / VS).floor() as i32);
-    // kept-old up-tris binned by xz cell, storing (centroid, normal) so we can
-    // evaluate the old surface height at any xz from the tri's plane.
-    let mut old_bins: HashMap<(i32, i32), Vec<(Vec3, Vec3)>> = HashMap::new();
-    for (c, n) in &kept_old {
-        if up(*n) {
-            old_bins.entry(cell(*c)).or_default().push((*c, *n));
+    let detect = |kept: &[(Vec3, Vec3)]| -> (usize, usize, f32) {
+        let mut old_bins: HashMap<(i32, i32), Vec<(Vec3, Vec3)>> = HashMap::new();
+        for (c, n) in kept {
+            if up(*n) {
+                old_bins.entry(cell(*c)).or_default().push((*c, *n));
+            }
         }
-    }
-    let xz_tol = 0.5 * VS;
-    let mut exact_cols = 0usize; // |gap| < 0.02 vox → bit-identical (harmless)
-    let mut zfight_cols = 0usize; // 0.02 ≤ |gap| < 1.5 vox → distinct coincident sheets
-    let mut max_gap_vox = 0.0f32;
-    let mut sample = Vec::new();
-    for (pc, pn) in &patch_tris {
-        if !up(*pn) {
-            continue;
-        }
-        let (cx, cz) = cell(*pc);
-        // nearest kept-old up-tri in same/neighbour cells, by xz distance
-        let mut best: Option<(f32, Vec3, Vec3)> = None;
-        for dx in -1..=1 {
-            for dz in -1..=1 {
-                if let Some(olds) = old_bins.get(&(cx + dx, cz + dz)) {
-                    for (oc, on) in olds {
-                        let dxz = ((oc.x - pc.x).powi(2) + (oc.z - pc.z).powi(2)).sqrt();
-                        if dxz < xz_tol && best.map(|(b, _, _)| dxz < b).unwrap_or(true) {
-                            best = Some((dxz, *oc, *on));
+        let xz_tol = 0.5 * VS;
+        let (mut exact, mut zfight, mut maxgap) = (0usize, 0usize, 0.0f32);
+        for (pc, pn) in &patch_tris {
+            if !up(*pn) {
+                continue;
+            }
+            let (cx, cz) = cell(*pc);
+            let mut best: Option<(f32, Vec3, Vec3)> = None;
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(olds) = old_bins.get(&(cx + dx, cz + dz)) {
+                        for (oc, on) in olds {
+                            let dxz = ((oc.x - pc.x).powi(2) + (oc.z - pc.z).powi(2)).sqrt();
+                            if dxz < xz_tol && best.map(|(b, _, _)| dxz < b).unwrap_or(true) {
+                                best = Some((dxz, *oc, *on));
+                            }
                         }
                     }
                 }
             }
-        }
-        if let Some((_, oc, on)) = best {
-            // old surface height at the patch centroid's xz, from the old tri plane
-            let oh = if on.y.abs() > 1e-4 {
-                oc.y - (on.x * (pc.x - oc.x) + on.z * (pc.z - oc.z)) / on.y
-            } else {
-                oc.y
-            };
-            let gap = (pc.y - oh).abs() / VS; // voxels
-            if gap < 0.02 {
-                exact_cols += 1;
-            } else if gap < 1.5 {
-                zfight_cols += 1;
-                max_gap_vox = max_gap_vox.max(gap);
-                if sample.len() < 6 {
-                    sample.push((*pc, oc, gap));
+            if let Some((_, oc, on)) = best {
+                let oh = if on.y.abs() > 1e-4 {
+                    oc.y - (on.x * (pc.x - oc.x) + on.z * (pc.z - oc.z)) / on.y
+                } else {
+                    oc.y
+                };
+                let gap = (pc.y - oh).abs() / VS;
+                if gap < 0.02 {
+                    exact += 1;
+                } else if gap < 1.5 {
+                    zfight += 1;
+                    maxgap = maxgap.max(gap);
                 }
             }
         }
-    }
+        (exact, zfight, maxgap)
+    };
 
-    eprintln!(
-        "[double-sheet] patch_up={} overlapping kept-old → bit-identical(harmless)={} z-FIGHT(distinct)={} (max gap {:.3} vox)",
-        patch_tris.iter().filter(|(_, n)| up(*n)).count(),
-        exact_cols,
-        zfight_cols,
-        max_gap_vox,
-    );
-    for (p, o, g) in &sample {
-        eprintln!("  z-fight patch@({:.4},{:.4},{:.4}) vs old@({:.4},{:.4},{:.4}) gap={:.3} vox", p.x, p.y, p.z, o.x, o.y, o.z, g);
-    }
+    let (es, zs, gs) = detect(&kept_sphere);
+    let (eb, zb, gb) = detect(&kept_box);
+    eprintln!("[double-sheet] SphereTouch(op.radius, EDITOR TODAY):   bit-identical={es:>3}  z-FIGHT={zs:>3}  (max gap {gs:.3} vox)");
+    eprintln!("[double-sheet] BoxTouch(patch emit box, FIX CANDIDATE): bit-identical={eb:>3}  z-FIGHT={zb:>3}  (max gap {gb:.3} vox)");
 
     assert_eq!(
-        zfight_cols, 0,
-        "DOUBLE SHEET (z-fight): {zfight_cols} patch ground tris sit a sub-voxel NON-zero distance \
-         (max {max_gap_vox:.3} vox) from a kept-old ground tri in the same xz column — distinct \
-         coincident surfaces that flicker as the camera moves. (Bit-identical overlaps: {exact_cols}, harmless.) \
-         Fix: unify the SphereTouch drop reach ({radius} vox) with the patch re-extract reach."
+        zs, 0,
+        "DOUBLE SHEET (z-fight): editor's SphereTouch leaves {zs} sub-voxel-offset coincident patch/old \
+         ground tris (max {gs:.3} vox). BoxTouch(patch region) candidate leaves {zb} (max {gb:.3} vox). \
+         Unify the drop reach with the patch re-extract reach in rebuild_dirty_clusters."
     );
 }
