@@ -533,6 +533,8 @@ fn terrain_inflate_does_not_double_sheet() {
     let fv: Vec<Vec3> = old_verts.iter().map(|v| Vec3::from(v.local_pos)).collect();
     let mut seam_max = 0.0f32;
     let mut seam_far = 0usize;
+    let pos_dbg = std::env::var("ARVX_SEAM_POS").is_ok();
+    let (mut n_pad, mut n_ring, mut n_interior) = (0usize, 0usize, 0usize);
     for rv in region_pre_v.iter().map(|v| Vec3::from(v.local_pos)) {
         let mut best = f32::MAX;
         for &f in &fv {
@@ -542,7 +544,31 @@ fn terrain_inflate_does_not_double_sheet() {
         seam_max = seam_max.max(d);
         if d > 0.01 * VS {
             seam_far += 1;
+            if pos_dbg {
+                // grid coords + signed cells-from-nearest-box-face (>0 = outside box = pad)
+                let g = (rv - grid_origin) / VS;
+                let gi = [g.x, g.y, g.z];
+                let mn = [rmin.x as f32, rmin.y as f32, rmin.z as f32];
+                let mx = [rmax.x as f32, rmax.y as f32, rmax.z as f32];
+                // max over axes of how far OUTSIDE the box (negative = inside)
+                let mut outside = f32::MIN;
+                let mut inside_margin = f32::MAX;
+                for a in 0..3 {
+                    outside = outside.max((mn[a] - gi[a]).max(gi[a] - mx[a]));
+                    inside_margin = inside_margin.min((gi[a] - mn[a]).min(mx[a] - gi[a]));
+                }
+                if outside > 0.01 {
+                    n_pad += 1;
+                } else if inside_margin < 2.0 {
+                    n_ring += 1;
+                } else {
+                    n_interior += 1;
+                }
+            }
         }
+    }
+    if pos_dbg {
+        eprintln!("[SEAM-POS] of {seam_far} divergent verts: pad(outside box)={n_pad}  boundary-ring(<2 cells in)={n_ring}  interior={n_interior}");
     }
     eprintln!(
         "[VERTEX-SET] region-pre vs full-pre: {} verts, max nearest-full {:.4} vox, {} verts >0.01 vox apart  <- REAL region!=full boundary divergence",
@@ -552,18 +578,21 @@ fn terrain_inflate_does_not_double_sheet() {
     );
 
     // Everything above is documented via prints; these are the measured landscape.
-    let _ = (es, eb, gb, zb, ei, zi, gi, ex_e, ex_z, ex_g, ex_holes, box_holes, rz_box, rg_box, rz_ex, rg_ex, rz_iso, rg_iso);
+    let _ = (es, eb, gb, zb, ei, zi, gi, ex_e, ex_z, ex_g, ex_holes, box_holes, rz_box, rg_box, rz_ex, rg_ex, rg_sphere);
 
-    // CAPTURED OPEN BUG (stable gate). Task #1's double-sheet is reproduced as
-    // BOTH: a true rendered double-sheet on the editor's SphereTouch path (ray
-    // validator) AND a region!=full boundary vertex divergence. Fixing task #1 =
-    // drive the editor path to 0 via (a) brush-region drop + (b) region/full
-    // boundary mesher consistency. Flip to `assert_eq!(rz_sphere, 0)` + un-ignore
-    // when fixed.
+    // PART B FIXED + GATED (region-grid widened to the collect halo): the region
+    // extract is now BIT-IDENTICAL to the full extract — no boundary divergence,
+    // no pure-mesher double sheet. These two assertions guard against a
+    // regression of that fix.
+    assert_eq!(seam_far, 0, "part B regressed: region != full at boundary — {seam_far} verts up to {seam_max:.4}/VS apart");
+    assert_eq!(rz_iso, 0, "part B regressed: pure-mesher (no-brush) double-sheet columns = {rz_iso}");
+
+    // PART A REMAINING (separate fix): the editor's SphereTouch path still has
+    // brush-near-op.radius double sheets (kept-old = pre-brush, patch =
+    // post-brush). Drop the brush's changed region to eliminate. Flip this to
+    // `assert_eq!(rz_sphere, 0)` + un-ignore once part A lands.
     assert!(
-        rz_sphere > 0 && seam_far > 0,
-        "expected to REPRODUCE both effects but got editor-path ray double-sheet cols={rz_sphere} \
-         (max {rg_sphere:.3} vox) and region/full divergent verts={seam_far} (max {seam_max:.4} vox / VS). \
-         If either is 0 the repro setup drifted."
+        rz_sphere > 0,
+        "expected the brush near-radius double-sheet to still reproduce on the SphereTouch path, got {rz_sphere}"
     );
 }

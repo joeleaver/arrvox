@@ -1715,12 +1715,20 @@ where
     //     offsets are in `{-1, 0}`), and `build_cube_vertex` corner
     //     lookups extend up to `[pad_min - 1, pad_max + 1)`.
     //
-    // `cells.iter()` may include entries past the grid bounds — the
-    // collect step pads by +3 to give `build_cube_vertex` boundary
-    // data, but our grid only needs ±1. `CellGrid::set` silently
-    // drops out-of-bounds writes so the populate step is bounds-safe.
-    let grid_min = pad_min - IVec3::ONE;
-    let grid_size = pad_max - pad_min + IVec3::splat(2);
+    // The grid MUST cover everything the collect step provides (`±3` around the
+    // region), not just `±1`: the `+1` emit-pad cubes (whose dual vertices land
+    // up to a voxel past `region_max`) read corner cells out to ~`region_max+2`
+    // for their Manifold-DC placement. Sizing the grid to `±1` dropped those
+    // corners, so `cell_lookup` fell back to `is_solid_lookup → CELL_INTERIOR`
+    // (losing the real stored distance) and the pad placement EXTRAPOLATED
+    // instead of reading the real value — diverging from the full extract by up
+    // to ~0.5 vox (the sculpt-patch-vs-kept-old z-fight; `tests/sculpt_double_
+    // sheet.rs`). Sizing the grid to the collect halo makes the region extract
+    // bit-identical to the full extract at the boundary (and improves
+    // region↔region seam watertightness for terrain). `CellGrid::set` still
+    // drops anything past these (wider) bounds.
+    let grid_min = pad_min - IVec3::splat(2);
+    let grid_size = pad_max - pad_min + IVec3::splat(5);
     scratch.cells_grid.reuse(grid_min, grid_size);
     scratch.cube_vertex_grid.reuse(grid_min, grid_size);
     scratch.solid_cells.clear();
