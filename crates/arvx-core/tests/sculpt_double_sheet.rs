@@ -518,6 +518,20 @@ fn terrain_inflate_does_not_double_sheet() {
     let box_keep = |p0: Vec3, p1: Vec3, p2: Vec3| !in_box(p0) && !in_box(p1) && !in_box(p2);
     let ex_keep = |p0: Vec3, p1: Vec3, p2: Vec3| !in_ex_box(p0) && !in_ex_box(p1) && !in_ex_box(p2);
     let (rz_sphere, rg_sphere) = zfight_columns(&union_of(kept_up_verts(&old_verts, &old_idx, &sphere_keep), &patch_up), grid_origin, VS);
+    // PART A candidate: expand the drop radius by 1 cell so edited cells whose
+    // dual vertex lands just outside the op.radius sphere (the kernel gates edits
+    // by cell-CENTER axis_d, SphereTouch drops by VERTEX distance) are dropped too.
+    let ra2 = ((radius + 1.0) * VS) * ((radius + 1.0) * VS);
+    let sphere_keep_a = |p0: Vec3, p1: Vec3, p2: Vec3| {
+        (p0 - center_world).length_squared() > ra2 && (p1 - center_world).length_squared() > ra2 && (p2 - center_world).length_squared() > ra2
+    };
+    let (rz_a, rg_a) = zfight_columns(&union_of(kept_up_verts(&old_verts, &old_idx, &sphere_keep_a), &patch_up), grid_origin, VS);
+    eprintln!("[PART-A] SphereTouch(radius+1) drop: double-sheet cols={rz_a} (g{rg_a:.3})");
+    // Is the residual a WITHIN-PATCH double sheet (dome + un-buried original
+    // ground)? Run the validator on the patch ALONE (no kept-old).
+    let (rz_patch_alone, rg_pa) = zfight_columns(&patch_up.clone(), grid_origin, VS);
+    let (rz_patch_ex_alone, rg_pea) = zfight_columns(&patch_ex_up.clone(), grid_origin, VS);
+    eprintln!("[PART-A] PATCH ALONE (no kept-old): tight={rz_patch_alone} (g{rg_pa:.3})  expanded={rz_patch_ex_alone} (g{rg_pea:.3})  <- nonzero ⇒ kernel doesn't bury original surface under the dome");
     let (rz_box, rg_box) = zfight_columns(&union_of(kept_up_verts(&old_verts, &old_idx, &box_keep), &patch_up), grid_origin, VS);
     let (rz_ex, rg_ex) = zfight_columns(&union_of(kept_up_verts(&old_verts, &old_idx, &ex_keep), &patch_ex_up), grid_origin, VS);
     let (rz_iso, rg_iso) = zfight_columns(&union_of(up_verts(&old_verts, &old_idx), &up_verts(&region_pre_v, &region_pre_i)), grid_origin, VS);
