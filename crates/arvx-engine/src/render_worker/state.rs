@@ -37,7 +37,8 @@ use crate::viewport::ViewportId;
 
 use super::loop_thread::run_render_thread;
 use super::readback_poll::{
-    run_readback_poll_thread, ReadbackJob, RenderReadbackHandles, SlotFree,
+    new_present_handle, run_present_thread, run_readback_poll_thread, ReadbackJob,
+    RenderReadbackHandles, SlotFree,
 };
 
 /// Handle returned by [`RenderWorker::spawn`]. The sim side keeps this;
@@ -56,6 +57,9 @@ pub struct RenderWorker {
     /// its `job_tx` (owned by `RenderState`) is dropped first, disconnecting
     /// the poll thread's `job_rx` and letting it return.
     poll_handle: Option<JoinHandle<()>>,
+    /// Dedicated present thread (P2) — owns the surface blit. Joined LAST: the
+    /// poll thread sets the present shutdown flag + notifies on its way out.
+    present_handle: Option<JoinHandle<()>>,
 }
 
 impl Drop for RenderWorker {
@@ -69,8 +73,13 @@ impl Drop for RenderWorker {
             let _ = h.join();
         }
         // Render thread is gone → its `RenderState` (and the `job_tx` inside)
-        // is dropped → the poll thread's `job_rx` disconnects → it returns.
+        // is dropped → the poll thread's `job_rx` disconnects → it returns,
+        // signalling the present thread to shut down on its way out.
         if let Some(h) = self.poll_handle.take() {
+            let _ = h.join();
+        }
+        // Poll thread set the present shutdown flag + notified → present exits.
+        if let Some(h) = self.present_handle.take() {
             let _ = h.join();
         }
     }
@@ -227,10 +236,10 @@ impl RenderWorker {
     ///
     /// The render thread takes ownership of `init.device`, `init.queue`,
     /// builds the [`ArvxRenderer`] + per-viewport renderers there, then
-    /// enters its render loop. `frame_callback` is invoked once per visible
-    /// viewport per shipped frame — on the **readback-poll thread** (P2), not
-    /// the render thread; the editor surface writers don't care which thread
-    /// runs it (the callback is `Send`).
+    /// enters its render loop. `frame_callback` (the surface blit) is invoked
+    /// once per visible viewport per shipped frame — on the dedicated
+    /// **present thread** (P2), kept OFF both the render thread and the
+    /// `device.poll` thread so a slow blit can never stall either.
     pub fn spawn(init: RenderInit, frame_callback: FrameCallback) -> Self {
         let inbox = Arc::new(RenderInbox::new());
         let (cmd_tx, cmd_rx) = crossbeam::channel::unbounded::<RenderCommand>();
@@ -245,11 +254,28 @@ impl RenderWorker {
         let inflight_submits = Arc::new(AtomicU32::new(0));
         let delivered_dt_bits = Arc::new(AtomicU32::new(f32::NAN.to_bits()));
 
-        // The poll thread is the SOLE `device.poll` caller; clone the device
-        // handle (cheap, Arc-backed) before `init` is moved into the render
-        // thread.
+        // Newest-wins handoff between the poll thread (publishes) and the
+        // present thread (blits). Keeping the blit on its OWN thread is the
+        // whole point: a slow `frame_callback` only drops frames, it never
+        // stalls the poll thread (and therefore never wedges the render
+        // thread's `on_submitted_work_done` pacing).
+        let present = new_present_handle();
+
+        // Present thread — owns the surface blit. It does NOT touch wgpu.
+        let present_for_thread = present.clone();
+        let dt_for_present = delivered_dt_bits.clone();
+        let present_handle = std::thread::Builder::new()
+            .name("arvx-present".to_string())
+            .spawn(move || {
+                run_present_thread(present_for_thread, frame_callback, dt_for_present);
+            })
+            .expect("spawn arvx-present thread");
+
+        // Poll thread — the SOLE `device.poll` caller. Never blits. Clone the
+        // device handle (cheap, Arc-backed) before `init` is moved into the
+        // render thread.
         let device_for_poll = init.device.clone();
-        let dt_for_poll = delivered_dt_bits.clone();
+        let present_for_poll = present.clone();
         let poll_handle = std::thread::Builder::new()
             .name("arvx-readback-poll".to_string())
             .spawn(move || {
@@ -257,8 +283,7 @@ impl RenderWorker {
                     device_for_poll,
                     job_rx,
                     slot_free_tx,
-                    frame_callback,
-                    dt_for_poll,
+                    present_for_poll,
                 );
             })
             .expect("spawn arvx-readback-poll thread");
@@ -285,6 +310,7 @@ impl RenderWorker {
             commands: cmd_tx,
             handle: Some(handle),
             poll_handle: Some(poll_handle),
+            present_handle: Some(present_handle),
         }
     }
 }

@@ -82,6 +82,16 @@ pub(super) fn run_render_thread(
     // carries no dt (sim falls back to its prior EMA value for that frame).
     let mut prev_render_start: Option<std::time::Instant> = None;
 
+    // Queue-depth-pacing wedge probe. The render thread refuses to submit a new
+    // frame while `inflight_submits >= cap`; that count is drained only by the
+    // poll thread's `device.poll` firing `on_submitted_work_done`. A BRIEF stay
+    // at the cap is healthy pacing under load; a LONG one means submissions
+    // aren't completing (or the poll thread isn't draining) — a wedge. We log a
+    // canary so that failure mode is visible in the log instead of a silent
+    // freeze. `pace_blocked_since` is `Some` while we're parked at the cap.
+    let mut pace_blocked_since: Option<std::time::Instant> = None;
+    let mut pace_last_log: Option<std::time::Instant> = None;
+
     // Per-scope rolling sample buffer for the [render.gpu.percentiles]
     // diagnostic dump. Bounded to PERCENTILE_WINDOW; oldest sample
     // drops when full. Costs ~PERCENTILE_WINDOW × 4 B × scope_count
@@ -135,9 +145,39 @@ pub(super) fn run_render_thread(
         //     `on_submitted_work_done`, fired by the poll thread's
         //     `device.poll`). At the cap, skip this iteration with a short
         //     bounded sleep — never an indefinite block, never readback-coupled.
-        if state.inflight_submits.load(Ordering::Relaxed) >= max_inflight {
+        let inflight_now = state.inflight_submits.load(Ordering::Relaxed);
+        if inflight_now >= max_inflight {
+            let now = std::time::Instant::now();
+            let since = *pace_blocked_since.get_or_insert(now);
+            let blocked_ms = now.duration_since(since).as_secs_f32() * 1000.0;
+            // Healthy pacing clears in a few ms. A sustained park means
+            // submissions aren't completing / the poll thread isn't draining
+            // `inflight_submits` — that's the freeze signature, made loud.
+            if blocked_ms > 250.0 {
+                let due = pace_last_log
+                    .map(|t| now.duration_since(t).as_millis() >= 500)
+                    .unwrap_or(true);
+                if due {
+                    pace_last_log = Some(now);
+                    eprintln!(
+                        "[render-pace] WEDGED inflight={inflight_now}/{max_inflight} for {blocked_ms:.0}ms \
+                         — submissions not draining (poll thread stalled?)"
+                    );
+                }
+            }
             std::thread::sleep(std::time::Duration::from_micros(500));
             continue;
+        }
+        // Cleared the cap — pair the wedge canary if we'd been parked long.
+        if let Some(since) = pace_blocked_since.take() {
+            let blocked_ms = std::time::Instant::now()
+                .duration_since(since)
+                .as_secs_f32()
+                * 1000.0;
+            if blocked_ms > 250.0 {
+                eprintln!("[render-pace] recovered after {blocked_ms:.0}ms");
+            }
+            pace_last_log = None;
         }
 
         // We are about to render a real frame. Compute the dt back
