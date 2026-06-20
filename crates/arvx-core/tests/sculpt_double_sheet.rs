@@ -1,0 +1,299 @@
+//! Geometry-truth repro of the in-editor terrain-sculpt "double-sheet" z-fight.
+//!
+//! Reproduces, on a flat voxelized slab and at EDITOR-DEFAULT brush params, the
+//! exact editor sculpt sequence that produces two coincident surface sheets:
+//!
+//!   1. voxelize a flat ground slab (with per-leaf distances → DC/QEF)
+//!   2. extract the FULL pre-edit mesh = the "old tris"
+//!   3. apply an Inflate stamp through the REAL brush kernel
+//!   4. SphereTouch-filter the old tris by `op.radius` (mirrors the editor —
+//!      remesh_region.rs RemeshFilter::SphereTouch)
+//!   5. re-extract the PATCH over the brush cell range (mirrors the editor)
+//!   6. detect cross-source coincident sheets: an up-facing kept-old ground
+//!      triangle and an up-facing patch triangle stacked in the SAME xz column
+//!
+//! The bug: the patch re-extract emits tris up to ~1 voxel PAST region_max
+//! (mesh_extract.rs:1548-1553), so the dome-rim/ground annulus lands in the
+//! kept-old ground ring that SphereTouch (keyed on `op.radius`) did not drop →
+//! two ground sheets at ~the same place → z-fight in the editor.
+//!
+//! IMPORTANT: uses editor-default brush params (radius≈2 vox / strength≈8), NOT
+//! the inverted radius=8/strength=6 of the `sculpt_geom_truth` example — the bug
+//! is regime-specific and the example's params mask it.
+//!
+//! This is the editor-path repro the z-fight saga lacked: it exercises the real
+//! filter+patch geometry headlessly. The fix is to make the SphereTouch drop and
+//! the patch re-extract cover the SAME reach so the annulus can't double up.
+
+use arvx_core::mesh_extract::{
+    collect_cell_map_in_region, extract_mesh_region_from_cells_pooled_haloed,
+    extract_surface_mesh_density_haloed, MeshVertex, SculptExtractScratch,
+};
+use arvx_core::sculpt::{
+    apply_delta, brush_cell_range, compute_brush_edits_in_stroke, BrushMode, BrushOp, FalloffCurve,
+};
+use arvx_core::voxelize_octree::voxelize_octree;
+use arvx_core::{Aabb, BrickPool, LeafAttrPool};
+use glam::{IVec3, Vec3};
+use std::collections::HashMap;
+
+const VS: f32 = 0.25;
+const N: u32 = 64; // 64³ grid (2^6), 16 m tile
+
+/// Octahedral normal pack (local copy — matches `arvx_core::leaf_attr::pack_oct`,
+/// which may be private; mirrors the `sculpt_geom_truth` example).
+fn pack_oct(n: Vec3) -> u32 {
+    let n = n / (n.x.abs() + n.y.abs() + n.z.abs()).max(1e-6);
+    let (mut x, mut y) = (n.x, n.y);
+    if n.z < 0.0 {
+        let ox = (1.0 - y.abs()) * if x >= 0.0 { 1.0 } else { -1.0 };
+        let oy = (1.0 - x.abs()) * if y >= 0.0 { 1.0 } else { -1.0 };
+        x = ox;
+        y = oy;
+    }
+    let xi = (x.clamp(-1.0, 1.0) * 32767.0).round() as i32 as i16 as u16 as u32;
+    let yi = (y.clamp(-1.0, 1.0) * 32767.0).round() as i32 as i16 as u16 as u32;
+    xi | (yi << 16)
+}
+
+/// Per-triangle (centroid, face-normal) for the given mesh.
+fn tris(verts: &[MeshVertex], idx: &[u32]) -> Vec<(Vec3, Vec3)> {
+    idx.chunks_exact(3)
+        .filter_map(|t| {
+            let p0 = Vec3::from(verts[t[0] as usize].local_pos);
+            let p1 = Vec3::from(verts[t[1] as usize].local_pos);
+            let p2 = Vec3::from(verts[t[2] as usize].local_pos);
+            let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+            if n == Vec3::ZERO {
+                None
+            } else {
+                Some(((p0 + p1 + p2) / 3.0, n))
+            }
+        })
+        .collect()
+}
+
+// CAPTURED OPEN BUG. RED today: the editor's SphereTouch(op.radius) drop leaves a
+// sub-voxel-offset patch/kept-old overlap on sloped surfaces (z-fight). Un-ignore
+// once the drop reach is unified with the patch re-extract reach in the editor
+// (arvx_scene_manager/sculpt.rs::rebuild_dirty_clusters) + the test mirror updated.
+#[ignore = "reproduces open bug: sculpt double-sheet z-fight on slopes (48 distinct coincident sheets); un-ignore when the SphereTouch drop reach is unified with the patch re-extract reach"]
+#[test]
+fn terrain_inflate_does_not_double_sheet() {
+    // ── 1. Flat ground slab with per-leaf distances. sdf = y - ground.
+    let extent = N as f32 * VS;
+    let ground = extent * 0.5;
+    let aabb = Aabb::new(Vec3::ZERO, Vec3::splat(extent));
+    // Sloped surface. A FLAT slab gives bit-identical region/full DC placement
+    // (coincident but harmless — no z-fight); a slope is where region-vs-full
+    // sub-voxel placement can diverge (the real editor regime). Brush centre x =
+    // tile centre, so the surface height there is exactly `ground`.
+    let slope = 0.35_f32;
+    let cx = extent * 0.5;
+    let mut sdf = |ps: &[Vec3]| -> Vec<(f32, u16, u16, u8, u32, Option<Vec3>)> {
+        ps.iter().map(|p| (p.y - (ground + slope * (p.x - cx)), 0u16, 0u16, 0u8, 0u32, None)).collect()
+    };
+    let mut leaf = LeafAttrPool::new(1 << 16);
+    let mut bricks = BrickPool::new(1 << 12);
+    let res = voxelize_octree(&mut sdf, &aabb, VS, &mut leaf, &mut bricks, 0).expect("voxelize");
+    let mut octree = res.octree;
+    let grid_origin = res.grid_origin;
+    let depth = octree.depth();
+
+    // ── 2. Full pre-edit extract = the "old tris".
+    let (old_verts, old_idx) = extract_surface_mesh_density_haloed(
+        octree.as_slice(),
+        depth,
+        VS,
+        grid_origin,
+        bricks.as_slice(),
+        leaf.as_slice(),
+        leaf.bones_as_slice(),
+        &[],
+        0,
+        None,
+        leaf.dists_as_slice(),
+        None,
+    );
+
+    // ── 3. Inflate stamp at the surface centre, EDITOR DEFAULTS.
+    let radius = 2.0_f32; // voxels — editor default (NOT the example's 8)
+    let strength = 8.0_f32; // finest-voxel amplitude — editor default
+    let cg = Vec3::splat(N as f32 * 0.5); // (32,32,32): on the ground at the centre
+    let op = BrushOp {
+        center: cg,
+        segment_start: cg,
+        radius,
+        falloff_curve: FalloffCurve::Smooth,
+        strength,
+        mode: BrushMode::Inflate,
+        material: 0,
+    };
+    // Editor-faithful patch region = the brush cell range (sculpt.rs:1045),
+    // NOT a hand-rolled radius+2 box. The +1 extract pad is internal to
+    // extract_mesh_region; the SphereTouch drop below uses op.radius. The
+    // mismatch between this region's reach and the drop radius is the bug.
+    let bextent = 1u32 << depth;
+    let (blo, bhi) = brush_cell_range(&op, bextent);
+    let rmin = IVec3::new(blo.x as i32, blo.y as i32, blo.z as i32).max(IVec3::ZERO);
+    let rmax = IVec3::new(bhi.x as i32, bhi.y as i32, bhi.z as i32).min(IVec3::splat(bextent as i32));
+    let delta = compute_brush_edits_in_stroke(
+        &octree,
+        &bricks,
+        leaf.as_slice(),
+        leaf.dists_as_slice(),
+        op,
+        |_| false,
+    );
+    assert!(!delta.is_empty(), "Inflate produced no edits — brush placement is off the surface");
+
+    let n_added = delta.count_added() as u32;
+    let base = if n_added > 0 {
+        leaf.allocate_contiguous_bump(n_added).expect("alloc slots")
+    } else {
+        0
+    };
+    let mut next = base;
+    let applied = apply_delta(&mut octree, &mut bricks, &delta, || {
+        let s = next;
+        next += 1;
+        s
+    });
+    for (slot, attrs) in &applied.allocated_slots {
+        *leaf.get_mut(*slot) = attrs.to_leaf_attr();
+        leaf.set_dist(*slot, attrs.dist);
+    }
+    for (slot, normal) in &applied.renormalized_slots {
+        leaf.get_mut(*slot).normal_oct = pack_oct(*normal);
+    }
+    for (slot, normal, dist) in &applied.redist_slots {
+        leaf.get_mut(*slot).normal_oct = pack_oct(*normal);
+        leaf.set_dist(*slot, *dist);
+    }
+
+    // ── 4. Re-extract the PATCH over the brush cell range (mirrors the editor:
+    // cell map padded +3, extract over (rmin, rmax) computed above).
+    let cells = collect_cell_map_in_region(
+        octree.as_slice(),
+        depth,
+        bricks.as_slice(),
+        rmin - IVec3::splat(3),
+        rmax + IVec3::splat(3),
+    );
+    let mut scratch = SculptExtractScratch::new();
+    let (patch_verts, patch_idx) = extract_mesh_region_from_cells_pooled_haloed(
+        &mut scratch,
+        &cells,
+        rmin,
+        rmax,
+        octree.as_slice(),
+        depth,
+        VS,
+        grid_origin,
+        bricks.as_slice(),
+        leaf.as_slice(),
+        leaf.bones_as_slice(),
+        &[],
+        None,
+        None::<&fn(Vec3) -> f32>,
+        leaf.dists_as_slice(),
+    );
+
+    // ── 5. SphereTouch-filter the old tris (mirror RemeshFilter::SphereTouch):
+    // keep a triangle iff ALL three verts are strictly outside the brush sphere.
+    let center_world = grid_origin + cg * VS;
+    let radius_world = radius * VS;
+    let r2 = radius_world * radius_world;
+    let kept_old: Vec<(Vec3, Vec3)> = old_idx
+        .chunks_exact(3)
+        .filter(|t| {
+            t.iter().all(|&i| (Vec3::from(old_verts[i as usize].local_pos) - center_world).length_squared() > r2)
+        })
+        .filter_map(|t| {
+            let p0 = Vec3::from(old_verts[t[0] as usize].local_pos);
+            let p1 = Vec3::from(old_verts[t[1] as usize].local_pos);
+            let p2 = Vec3::from(old_verts[t[2] as usize].local_pos);
+            let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+            (n != Vec3::ZERO).then_some(((p0 + p1 + p2) / 3.0, n))
+        })
+        .collect();
+    let patch_tris = tris(&patch_verts, &patch_idx);
+
+    // ── 6. Detect cross-source coincident sheets AND measure their vertical
+    // offset. Two up-facing surfaces stacked in the same xz column with a
+    // SUB-VOXEL, NON-ZERO gap z-fight; a bit-identical overlap (gap≈0) is a
+    // harmless duplicate. We classify so the test fails only on a REAL z-fight,
+    // not on the (safe) bit-identical outside-sphere overlap the editor relies on.
+    let up = |n: Vec3| n.y > 0.5;
+    let cell = |p: Vec3| (((p.x - grid_origin.x) / VS).floor() as i32, ((p.z - grid_origin.z) / VS).floor() as i32);
+    // kept-old up-tris binned by xz cell, storing (centroid, normal) so we can
+    // evaluate the old surface height at any xz from the tri's plane.
+    let mut old_bins: HashMap<(i32, i32), Vec<(Vec3, Vec3)>> = HashMap::new();
+    for (c, n) in &kept_old {
+        if up(*n) {
+            old_bins.entry(cell(*c)).or_default().push((*c, *n));
+        }
+    }
+    let xz_tol = 0.5 * VS;
+    let mut exact_cols = 0usize; // |gap| < 0.02 vox → bit-identical (harmless)
+    let mut zfight_cols = 0usize; // 0.02 ≤ |gap| < 1.5 vox → distinct coincident sheets
+    let mut max_gap_vox = 0.0f32;
+    let mut sample = Vec::new();
+    for (pc, pn) in &patch_tris {
+        if !up(*pn) {
+            continue;
+        }
+        let (cx, cz) = cell(*pc);
+        // nearest kept-old up-tri in same/neighbour cells, by xz distance
+        let mut best: Option<(f32, Vec3, Vec3)> = None;
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if let Some(olds) = old_bins.get(&(cx + dx, cz + dz)) {
+                    for (oc, on) in olds {
+                        let dxz = ((oc.x - pc.x).powi(2) + (oc.z - pc.z).powi(2)).sqrt();
+                        if dxz < xz_tol && best.map(|(b, _, _)| dxz < b).unwrap_or(true) {
+                            best = Some((dxz, *oc, *on));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((_, oc, on)) = best {
+            // old surface height at the patch centroid's xz, from the old tri plane
+            let oh = if on.y.abs() > 1e-4 {
+                oc.y - (on.x * (pc.x - oc.x) + on.z * (pc.z - oc.z)) / on.y
+            } else {
+                oc.y
+            };
+            let gap = (pc.y - oh).abs() / VS; // voxels
+            if gap < 0.02 {
+                exact_cols += 1;
+            } else if gap < 1.5 {
+                zfight_cols += 1;
+                max_gap_vox = max_gap_vox.max(gap);
+                if sample.len() < 6 {
+                    sample.push((*pc, oc, gap));
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "[double-sheet] patch_up={} overlapping kept-old → bit-identical(harmless)={} z-FIGHT(distinct)={} (max gap {:.3} vox)",
+        patch_tris.iter().filter(|(_, n)| up(*n)).count(),
+        exact_cols,
+        zfight_cols,
+        max_gap_vox,
+    );
+    for (p, o, g) in &sample {
+        eprintln!("  z-fight patch@({:.4},{:.4},{:.4}) vs old@({:.4},{:.4},{:.4}) gap={:.3} vox", p.x, p.y, p.z, o.x, o.y, o.z, g);
+    }
+
+    assert_eq!(
+        zfight_cols, 0,
+        "DOUBLE SHEET (z-fight): {zfight_cols} patch ground tris sit a sub-voxel NON-zero distance \
+         (max {max_gap_vox:.3} vox) from a kept-old ground tri in the same xz column — distinct \
+         coincident surfaces that flicker as the camera moves. (Bit-identical overlaps: {exact_cols}, harmless.) \
+         Fix: unify the SphereTouch drop reach ({radius} vox) with the patch re-extract reach."
+    );
+}
