@@ -74,6 +74,7 @@
 mod frame;
 mod frame_helpers;
 mod loop_thread;
+mod readback_poll;
 mod state;
 mod user_shader_mesh_tick;
 

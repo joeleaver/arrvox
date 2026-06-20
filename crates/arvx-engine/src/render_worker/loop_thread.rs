@@ -16,6 +16,7 @@
 //! - [`lerp_world_matrix`] does the per-object TRS decompose / lerp / slerp /
 //!   recompose.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crossbeam::channel::{Receiver, Sender};
@@ -23,7 +24,8 @@ use crossbeam::channel::{Receiver, Sender};
 use crate::render_frame::{RenderCommand, RenderFrame, RenderInit, RenderResult};
 
 use super::frame::render_one_frame;
-use super::state::{FrameCallback, RenderInbox, RenderState};
+use super::readback_poll::RenderReadbackHandles;
+use super::state::{RenderInbox, RenderState};
 
 /// Top-level render-thread entry point.
 ///
@@ -49,10 +51,19 @@ pub(super) fn run_render_thread(
     inbox: Arc<RenderInbox>,
     cmd_rx: Receiver<RenderCommand>,
     out_tx: Sender<RenderResult>,
-    frame_callback: FrameCallback,
+    handles: RenderReadbackHandles,
 ) {
     let render_pacing = init.render_pacing;
-    let mut state = RenderState::new(init);
+    let mut state = RenderState::new(init, handles);
+
+    // P2 queue-depth pacing cap: max submissions allowed in flight on the GPU
+    // before the render thread skips an iteration. Bounds queue depth (the old
+    // gate's job) without coupling to readback. Default 4 ≈ a few frames; raise
+    // for more GPU overlap, lower for lower latency.
+    let max_inflight: u32 = std::env::var("ARVX_MAX_INFLIGHT_SUBMITS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
 
     // Bootstrap: wait for the first snapshot. `None` = shutdown
     // signal arrived before any snapshot ever did.
@@ -63,27 +74,13 @@ pub(super) fn run_render_thread(
     state.curr_snap_time = std::time::Instant::now();
     state.curr_snap = Some(Arc::new(first));
 
-    // Wall-clock instant of the last *actual* render iteration. We
-    // skip backoff iterations (see `2a. GPU backpressure gate`) when
-    // computing this — counting them would inflate the panel's
-    // "Render FPS" to reflect the 500 µs sleep loop instead of the
-    // true GPU-bound production rate. Reset to `None` here so the
-    // first real iteration carries no dt (sim falls back to its prior
-    // EMA value for that one frame).
+    // Wall-clock instant of the last *actual* render iteration. We skip
+    // queue-depth-paced iterations (see `2a. Queue-depth pacing`) when
+    // computing this — counting them would inflate the panel's "Render FPS"
+    // to reflect the 500 µs pacing sleep instead of the true GPU-bound
+    // production rate. Reset to `None` here so the first real iteration
+    // carries no dt (sim falls back to its prior EMA value for that frame).
     let mut prev_render_start: Option<std::time::Instant> = None;
-
-    // ── Backpressure-gate stall probe ──
-    // The render thread can only go *permanently silent* (no `[render]`
-    // lines, no frames shipped → rinch surface goes Outdated) by
-    // spinning in the GPU-backpressure gate below: every MAIN readback
-    // slot stays pending and the `continue` never logs. These track how
-    // long we've been stalled; an abnormal (>50 ms) stall logs a
-    // `[render-stall]` canary so a GPU-side wedge is attributable from
-    // the log alone (this is how the Xid-109 TLAS hang was localized).
-    // Pure observation — no behavior change.
-    let mut bp_stall_start: Option<std::time::Instant> = None;
-    let mut bp_spins: u64 = 0;
-    let mut bp_last_log: Option<std::time::Instant> = None;
 
     // Per-scope rolling sample buffer for the [render.gpu.percentiles]
     // diagnostic dump. Bounded to PERCENTILE_WINDOW; oldest sample
@@ -110,157 +107,44 @@ pub(super) fn run_render_thread(
             return;
         }
 
-        // 2a. GPU backpressure gate.
-        //
-        // The composite readback ring is only 3 buffers deep per
-        // viewport. When every slot is still waiting for its
-        // previously-issued `map_async` callback to fire, encoding
-        // another frame would:
-        //
-        //   1. Drop the readback copy (acquire_write_idx → None)
-        //      so this iteration's pixels never reach the editor.
-        //   2. Submit a full pass chain anyway, deepening the wgpu
-        //      queue behind every still-pending readback.
-        //
-        // (2) is the real killer — a 450 Hz CPU encode loop can
-        // easily pile 70+ frames of GPU work into the queue, which
-        // pushes each in-flight readback's `map_async` completion
-        // seconds into the future. The visible symptom is what
-        // prompted this fix: the engine reported ~170 fps "shipping"
-        // but the editor closure saw 80% of callbacks carrying
-        // byte-identical pixel content — because `cached_pixels`
-        // kept returning the same drained buffer while new readbacks
-        // were stuck behind the backlog.
-        //
-        // The fix is to self-pace CPU encoding to the rate readbacks
-        // actually complete at — which is our proxy for true GPU
-        // throughput. If MAIN has no idle slot, poll the device,
-        // drain any newly-complete maps, back off briefly, and retry.
-        // When GPU keeps up (idle slot available) we run full tilt.
-        //
-        // This preserves the "uncapped render" intent: there's no
-        // fixed Hz cap, render runs as fast as the GPU sustains. It
-        // just stops submitting work the GPU can't actually execute.
-        let _ = state.device.poll(wgpu::PollType::Poll);
-        for vp_id in state
-            .viewport_renderers
-            .keys()
-            .copied()
-            .collect::<Vec<_>>()
-        {
-            if let Some(vr) = state.viewport_renderers.get_mut(&vp_id) {
-                let w = vr.width;
-                let h = vr.height;
-                let padded_row = vr.readback_padded_row();
-                vr.readback.drain_completed(w, h, padded_row);
+        // 2. Recycle composite ring slots the readback-poll thread has
+        //    finished reading + unmapping, so the next encode can claim a
+        //    writable slot. Non-blocking; the generation tag makes a stale free
+        //    (e.g. arriving after a viewport resize recreated the buffers) a
+        //    harmless no-op (see `ReadbackRing::free_slot`).
+        while let Ok(free) = state.slot_free_rx.try_recv() {
+            if let Some(vr) = state.viewport_renderers.get_mut(&free.vp_id) {
+                vr.readback.free_slot(free.slot, free.generation);
             }
         }
-        let main_has_slot = state
-            .viewport_renderers
-            .get(&crate::viewport::ViewportId::MAIN)
-            .map(|vr| vr.readback.has_idle_slot())
-            .unwrap_or(true);
-        if !main_has_slot {
-            bp_spins += 1;
-            let now = std::time::Instant::now();
-            let started = *bp_stall_start.get_or_insert(now);
-            // Surface-lost canary: only ABNORMAL stalls (>50 ms). Healthy
-            // GPU backpressure clears in a few ms; the wedge this fixes
-            // climbed for seconds. Rate-limited to every ~250 ms.
-            let stalled_ms = now.duration_since(started).as_secs_f32() * 1000.0;
-            if stalled_ms > 50.0 {
-                let due = bp_last_log
-                    .map(|t| now.duration_since(t).as_millis() >= 250)
-                    .unwrap_or(true);
-                if due {
-                    bp_last_log = Some(now);
-                    let pending = state
-                        .viewport_renderers
-                        .get(&crate::viewport::ViewportId::MAIN)
-                        .map(|vr| vr.readback.pending_count())
-                        .unwrap_or(0);
-                    eprintln!(
-                        "[render-stall] backpressure: no idle MAIN slot for {:.0}ms \
-                         ({} spins) pending={}/3 — render thread cannot ship",
-                        stalled_ms, bp_spins, pending,
-                    );
-                }
-            }
-            // BOUNDED WAIT (P3-B). The render thread must NEVER hard-block on
-            // readback-slot availability — presentation liveness cannot be held
-            // hostage to GPU-queue drain. A non-blocking `PollType::Poll` does
-            // not advance the pending `map_async` callbacks once we stop
-            // submitting frames, so the old code blocked on
-            // `wait_indefinitely()` to force the device timeline forward — but
-            // that hard-froze the render thread for the entire (load-inflated)
-            // queue drain (observed 4.5 s+ at pending=3/3), turning a stale
-            // surface into a frozen one. Instead we wait at most a small budget
-            // and then RETURN to the loop regardless: picks/snapshots keep
-            // flowing, the next iteration re-polls + drains to free a slot, and
-            // a genuine GPU wedge degrades to a loud, repeating budget-exceeded
-            // canary instead of a silent indefinite park (the signature that
-            // localized the Xid-109 TLAS hang).
-            //
-            // This bounds the worst case; it does NOT remove the underlying
-            // readback↔present coupling — that is P2 (a dedicated readback poll
-            // thread + newest-wins present, deleting this gate entirely).
-            let gate_wait_ms: u64 = std::env::var("ARVX_RENDER_GATE_WAIT_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8);
-            let fresh_stall = bp_spins == 1;
-            if fresh_stall {
-                let pending = state
-                    .viewport_renderers
-                    .get(&crate::viewport::ViewportId::MAIN)
-                    .map(|vr| vr.readback.pending_count())
-                    .unwrap_or(0);
-                eprintln!(
-                    "[render-gate] stall begin → bounded wait {gate_wait_ms}ms (pending={pending}/3)"
-                );
-            }
-            let wait_t0 = std::time::Instant::now();
-            let poll_result = state.device.poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(std::time::Duration::from_millis(gate_wait_ms)),
-            });
-            let wait_ms = wait_t0.elapsed().as_secs_f32() * 1000.0;
-            // A timeout here is EXPECTED under load and is NOT fatal — we simply
-            // return to the loop. Only log it as a canary so a persistent wedge
-            // (every wait timing out, never recovering) is visible in the log.
-            if matches!(poll_result, Err(wgpu::PollError::Timeout))
-                && (fresh_stall || wait_ms > 100.0)
-            {
-                eprintln!(
-                    "[render-gate] wait budget exceeded ({wait_ms:.0}ms, budget={gate_wait_ms}ms) \
-                     pending=3/3 — continuing (not blocking)"
-                );
-            }
+
+        // 2a. Queue-depth pacing — the replacement for the DELETED readback
+        //     backpressure gate.
+        //
+        //     The old gate coupled frame submission to readback-slot
+        //     availability, which is coupled to GPU-queue depth: a load burst
+        //     filled the ring and the render thread either spun (stale surface)
+        //     or hard-blocked on `wait_indefinitely` (frozen renderer). P2
+        //     deletes that coupling entirely — the dedicated poll thread owns
+        //     readback + present and keeps shipping the newest frame regardless.
+        //
+        //     The one thing the gate got RIGHT was bounding queue depth so a
+        //     fast CPU loop can't pile 70+ frames of GPU work behind everything.
+        //     We keep THAT, decoupled from readback: cap the number of
+        //     submissions still executing on the GPU (tracked via
+        //     `on_submitted_work_done`, fired by the poll thread's
+        //     `device.poll`). At the cap, skip this iteration with a short
+        //     bounded sleep — never an indefinite block, never readback-coupled.
+        if state.inflight_submits.load(Ordering::Relaxed) >= max_inflight {
+            std::thread::sleep(std::time::Duration::from_micros(500));
             continue;
-        }
-        // Recovered from an abnormal (>50 ms) stall — pair the canary so a
-        // wedge that the fix did NOT cover stands out as a backpressure
-        // line with no matching recovery.
-        if let Some(started) = bp_stall_start.take() {
-            let stalled_ms = std::time::Instant::now()
-                .duration_since(started)
-                .as_secs_f32()
-                * 1000.0;
-            if stalled_ms > 50.0 {
-                eprintln!(
-                    "[render-stall] recovered after {:.0}ms ({} spins)",
-                    stalled_ms, bp_spins,
-                );
-            }
-            bp_spins = 0;
-            bp_last_log = None;
         }
 
         // We are about to render a real frame. Compute the dt back
         // to the last real render — this is what becomes the panel's
-        // "Render FPS". Excluding backoff iterations from the dt
-        // means the rate reflects honest GPU-bound throughput, not
-        // the 2 kHz spin of the backoff sleep.
+        // "Render FPS". Excluding queue-depth-paced iterations from the
+        // dt means the rate reflects honest GPU-bound throughput, not
+        // the 500 µs pacing sleep.
         let render_dt_ms = prev_render_start
             .map(|p| iter_start.duration_since(p).as_secs_f32() * 1000.0);
         prev_render_start = Some(iter_start);
@@ -301,20 +185,19 @@ pub(super) fn run_render_thread(
 
         // 2b. Drain a completed pick, if any. Non-blocking.
         //
-        // Must run AFTER the backoff gate above. `drain_pick` calls
-        // `pick_in_flight.take()` so the pick is consumed; if we
-        // drained pre-backoff and then hit the `continue`, the
-        // PickResult would be silently dropped (no `out_tx.send` runs
-        // on backoff iterations) and the click would never reach
-        // sim. Picks tolerate a few ms of extra latency; outright
-        // losing them does not.
+        // Must run AFTER the queue-depth pacing skip above. `drain_pick` calls
+        // `pick_in_flight.take()` so the pick is consumed; if we drained before
+        // the pacing skip and then hit the `continue`, the PickResult would be
+        // silently dropped (no `out_tx.send` runs on a skipped iteration) and
+        // the click would never reach sim. Picks tolerate a few ms of extra
+        // latency; outright losing them does not. (The pick's map_async
+        // completion is driven by the poll thread's `device.poll`.)
         let pick_result = state.drain_pick();
         let r_t_pick = render_phase_start.elapsed();
 
         // 3. Check for a fresh snapshot — non-blocking. If present,
         //    update the two-snapshot window and refresh the sim_dt
         //    EMA from the observed interval.
-        let mut new_snapshot_consumed = false;
         if let Some(new) = inbox.try_take() {
             let observed = iter_start.duration_since(state.curr_snap_time);
             // EMA the sim_dt estimate toward the observed interval.
@@ -330,7 +213,6 @@ pub(super) fn run_render_thread(
             state.prev_snap = state.curr_snap.take();
             state.curr_snap = Some(Arc::new(new));
             state.curr_snap_time = iter_start;
-            new_snapshot_consumed = true;
         }
 
         // Arc-clone so we hold a borrow-checker-friendly ref to the
@@ -382,22 +264,12 @@ pub(super) fn run_render_thread(
 
         let r_t_interp = render_phase_start.elapsed();
 
-        // 6. Render — same pipeline as before; `render_one_frame`
-        //    now takes the interpolated objects as an explicit
-        //    parameter separate from the snapshot (the snapshot's
-        //    own `gpu_objects` field is the canonical curr data).
-        //    Pass `new_snapshot_consumed` so the readback path can
-        //    skip the editor pixel callback on iterations that just
-        //    re-render the same snapshot data — those frames have
-        //    no new content to display and just thrash rinch's
-        //    surface buffer Mutex.
-        let outcome = render_one_frame(
-            &mut state,
-            &curr,
-            &interp_instances,
-            new_snapshot_consumed,
-            &frame_callback,
-        );
+        // 6. Render — `render_one_frame` takes the interpolated objects as an
+        //    explicit parameter separate from the snapshot (the snapshot's own
+        //    `gpu_objects` field is the canonical curr data). It encodes,
+        //    submits, and hands the composite slot to the readback-poll thread;
+        //    it does NOT ship pixels itself (P2).
+        let outcome = render_one_frame(&mut state, &curr, interp_instances);
         let r_t_render = render_phase_start.elapsed();
 
         // 7. GPU profiler — drain resolved timings for sim's history.

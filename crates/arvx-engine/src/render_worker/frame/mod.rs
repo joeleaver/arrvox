@@ -15,7 +15,7 @@
 
 use crate::render_frame::{PendingPick, RenderFrame};
 
-use super::state::{FrameCallback, RenderState};
+use super::state::RenderState;
 
 mod encode;
 mod post;
@@ -64,18 +64,15 @@ pub(super) struct EncodeOutput {
 /// otherwise it's the TRS-blended version from
 /// `interpolate_gpu_objects`.
 ///
-/// `new_snapshot_consumed` is true on the iteration that just took a
-/// fresh snapshot from the inbox — gates the editor pixel callback.
-/// When false (we're re-rendering the same snapshot for interpolation),
-/// GPU work still runs but pixels are not shipped to the editor surface
-/// (the content didn't change, so shipping would just thrash rinch's
-/// `Mutex<RenderSurfaceBuffer>` with no visible benefit).
+/// P2: pixel shipping is no longer the render thread's job — the readback-poll
+/// thread ships the newest composite per viewport — so this no longer takes a
+/// frame callback or a `new_snapshot_consumed` gate. GPU work still runs every
+/// iteration; the poll thread rate-limits and dedupes what actually reaches the
+/// editor surface.
 pub(super) fn render_one_frame(
     state: &mut RenderState,
     frame: &RenderFrame,
     gpu_instances: &[arvx_render::arvx_gpu_object::ArvxGpuInstance],
-    new_snapshot_consumed: bool,
-    frame_callback: &FrameCallback,
 ) -> RenderOutcome {
     // Sub-phase timing inside the render thread, gated on
     // `ARVX_RENDER_PROFILE=1`. Splits the `render` bucket of
@@ -87,9 +84,7 @@ pub(super) fn render_one_frame(
     let t_pre = phase_start.elapsed();
     let encode = encode::encode_viewports(state, frame, &pre);
     let t_encode = phase_start.elapsed();
-    let outcome = post::finalize_frame(
-        state, frame, new_snapshot_consumed, frame_callback, encode,
-    );
+    let outcome = post::finalize_frame(state, encode);
     let t_post = phase_start.elapsed();
     if render_profile {
         let to_ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;

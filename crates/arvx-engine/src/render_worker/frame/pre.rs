@@ -26,10 +26,11 @@ pub(super) fn run_pre_frame(
     let pre_profile = std::env::var("ARVX_RENDER_PROFILE").is_ok();
     let pre_start = std::time::Instant::now();
 
-    // 0. Drive the wgpu async runtime so any in-flight async maps can
-    //    complete (volumetric sun-atten readbacks, frame readbacks,
-    //    pick readbacks).
-    let _ = state.device.poll(wgpu::PollType::Poll);
+    // 0. (P2) No `device.poll` here. The dedicated readback-poll thread is the
+    //    SOLE device poller; it drives every in-flight async map (volumetric
+    //    sun-atten, composite readbacks, pick readbacks) and every
+    //    `on_submitted_work_done` callback. A second poller on the render
+    //    thread would defeat the decoupling and re-introduce render-side polls.
 
     // 0a. Material palette upload — every frame (cheap; ~1 KB).
     state
