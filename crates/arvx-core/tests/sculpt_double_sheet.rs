@@ -499,7 +499,7 @@ fn terrain_inflate_does_not_double_sheet() {
 
     eprintln!("[double-sheet] SphereTouch(op.radius, EDITOR TODAY):   bit-identical={es:>3}  z-FIGHT={zs:>3}  (max gap {gs:.3} vox)");
     eprintln!("[double-sheet] BoxTouch(tight patch region):           bit-identical={eb:>3}  z-FIGHT={zb:>3}  (max gap {gb:.3} vox)  holes={box_holes}");
-    eprintln!("[double-sheet] ISOLATION full-vs-region (pre-brush):   bit-identical={ei:>3}  z-FIGHT={zi:>3}  (max gap {gi:.3} vox)  <- mesher is consistent");
+    eprintln!("[double-sheet] ISOLATION full-vs-region (pre-brush):   bit-identical={ei:>3}  z-FIGHT={zi:>3}  (max gap {gi:.3} vox)  <- centroid detector UNRELIABLE (see VERTEX-SET)");
     eprintln!("[double-sheet] FIX expanded(+{EX}) region + Box drop:    bit-identical={ex_e:>3}  z-FIGHT={ex_z:>3}  (max gap {ex_g:.3} vox)  holes={ex_holes}");
 
     // ── TRUSTWORTHY VALIDATOR: cast a vertical ray per column over each
@@ -524,21 +524,46 @@ fn terrain_inflate_does_not_double_sheet() {
     eprintln!("[RAY-VALIDATOR] true rendered double-sheet columns (gap in vox):");
     eprintln!("    SphereTouch(today)={rz_sphere} (g{rg_sphere:.3})   BoxTouch(tight)={rz_box} (g{rg_box:.3})   expanded+Box={rz_ex} (g{rg_ex:.3})   isolation={rz_iso} (g{rg_iso:.3})");
 
-    // SOLID, stable assertion: the MESHER is consistent — the region extract is
-    // bit-identical to the full extract on IDENTICAL data. This rules out
-    // "mesher inconsistency" as the root cause and pins the double-sheet on the
-    // BRUSH changing near-op.radius placement (kept-old = pre-brush, patch =
-    // post-brush) plus a smaller region-boundary-vs-full-boundary seam offset.
-    // (The fix-recipe numbers above are documented but NOT asserted: the
-    // column-coincidence detector cannot cleanly distinguish a welded seam from
-    // a true double-sheet, so it reliably REPRODUCES the bug but is not a
-    // trustworthy gate for a FIX — that needs in-editor / render confirmation.)
-    let _ = (es, eb, gb, ex_e, ex_g, ex_holes, box_holes, zb); // documented via prints
-    assert_eq!(
-        zi, 0,
-        "mesher inconsistency: region extract diverged from full extract on IDENTICAL pre-brush data \
-         (z-fight={zi}, max gap {gi:.3} vox). If this fires, the seam divergence is a real mesher bug. \
-         Today it is 0 — the double-sheet (SphereTouch z-fight={zs}, max {gs:.3} vox) is the BRUSH \
-         modifying near-radius placement, not the mesher."
+    // ── DECISIVE mesher check: are the region-pre and full-pre VERTEX SETS
+    // identical? For each region-pre vertex, 3D distance to the nearest full-pre
+    // vertex. seam_far > 0 ⇒ the region extract genuinely produces DIFFERENT
+    // boundary vertices than the full extract (a REAL mesher seam, NOT a
+    // triangulation/interpolation artifact) — exactly what the column-coincidence
+    // detector hid by matching centroids loosely.
+    let fv: Vec<Vec3> = old_verts.iter().map(|v| Vec3::from(v.local_pos)).collect();
+    let mut seam_max = 0.0f32;
+    let mut seam_far = 0usize;
+    for rv in region_pre_v.iter().map(|v| Vec3::from(v.local_pos)) {
+        let mut best = f32::MAX;
+        for &f in &fv {
+            best = best.min((f - rv).length_squared());
+        }
+        let d = best.sqrt();
+        seam_max = seam_max.max(d);
+        if d > 0.01 * VS {
+            seam_far += 1;
+        }
+    }
+    eprintln!(
+        "[VERTEX-SET] region-pre vs full-pre: {} verts, max nearest-full {:.4} vox, {} verts >0.01 vox apart  <- REAL region!=full boundary divergence",
+        region_pre_v.len(),
+        seam_max / VS,
+        seam_far,
+    );
+
+    // Everything above is documented via prints; these are the measured landscape.
+    let _ = (es, eb, gb, zb, ei, zi, gi, ex_e, ex_z, ex_g, ex_holes, box_holes, rz_box, rg_box, rz_ex, rg_ex, rz_iso, rg_iso);
+
+    // CAPTURED OPEN BUG (stable gate). Task #1's double-sheet is reproduced as
+    // BOTH: a true rendered double-sheet on the editor's SphereTouch path (ray
+    // validator) AND a region!=full boundary vertex divergence. Fixing task #1 =
+    // drive the editor path to 0 via (a) brush-region drop + (b) region/full
+    // boundary mesher consistency. Flip to `assert_eq!(rz_sphere, 0)` + un-ignore
+    // when fixed.
+    assert!(
+        rz_sphere > 0 && seam_far > 0,
+        "expected to REPRODUCE both effects but got editor-path ray double-sheet cols={rz_sphere} \
+         (max {rg_sphere:.3} vox) and region/full divergent verts={seam_far} (max {seam_max:.4} vox / VS). \
+         If either is 0 the repro setup drifted."
     );
 }
