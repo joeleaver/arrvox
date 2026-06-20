@@ -35,7 +35,7 @@ use arvx_core::sculpt::{
 use arvx_core::voxelize_octree::voxelize_octree;
 use arvx_core::{Aabb, BrickPool, LeafAttrPool};
 use glam::{IVec3, Vec3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const VS: f32 = 0.25;
 const N: u32 = 64; // 64³ grid (2^6), 16 m tile
@@ -287,6 +287,19 @@ fn terrain_inflate_does_not_double_sheet() {
     let (eb, zb, gb) = detect(&kept_box);
     eprintln!("[double-sheet] SphereTouch(op.radius, EDITOR TODAY):   bit-identical={es:>3}  z-FIGHT={zs:>3}  (max gap {gs:.3} vox)");
     eprintln!("[double-sheet] BoxTouch(patch emit box, FIX CANDIDATE): bit-identical={eb:>3}  z-FIGHT={zb:>3}  (max gap {gb:.3} vox)");
+
+    // Hole check for the BoxTouch candidate: every xz column the FULL pre-edit
+    // surface covered must still be covered by (kept_box ∪ patch) — else
+    // dropping the whole box punched a hole the patch didn't refill.
+    let surf_cols = |tris_cn: &[(Vec3, Vec3)]| -> HashSet<(i32, i32)> {
+        tris_cn.iter().filter(|(_, n)| up(*n)).map(|(c, _)| cell(*c)).collect()
+    };
+    let full_old = tris(&old_verts, &old_idx);
+    let full_old_cols = surf_cols(&full_old);
+    let mut covered = surf_cols(&kept_box);
+    covered.extend(surf_cols(&patch_tris));
+    let box_holes = full_old_cols.iter().filter(|c| !covered.contains(c)).count();
+    eprintln!("[double-sheet] BoxTouch hole-check: {box_holes} surface columns lost (of {} pre-edit)", full_old_cols.len());
 
     assert_eq!(
         zs, 0,
