@@ -73,6 +73,119 @@ fn tris(verts: &[MeshVertex], idx: &[u32]) -> Vec<(Vec3, Vec3)> {
         .collect()
 }
 
+/// Up-facing triangles' full world-space vertices (ground tris face +Y).
+fn up_verts(verts: &[MeshVertex], idx: &[u32]) -> Vec<[Vec3; 3]> {
+    idx.chunks_exact(3)
+        .filter_map(|t| {
+            let p = [
+                Vec3::from(verts[t[0] as usize].local_pos),
+                Vec3::from(verts[t[1] as usize].local_pos),
+                Vec3::from(verts[t[2] as usize].local_pos),
+            ];
+            let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+            (n.y > 0.5).then_some(p)
+        })
+        .collect()
+}
+
+/// Up-facing triangles surviving `keep`, from the OLD mesh (mirrors a drop filter).
+fn kept_up_verts(verts: &[MeshVertex], idx: &[u32], keep: &dyn Fn(Vec3, Vec3, Vec3) -> bool) -> Vec<[Vec3; 3]> {
+    idx.chunks_exact(3)
+        .filter_map(|t| {
+            let p = [
+                Vec3::from(verts[t[0] as usize].local_pos),
+                Vec3::from(verts[t[1] as usize].local_pos),
+                Vec3::from(verts[t[2] as usize].local_pos),
+            ];
+            if !keep(p[0], p[1], p[2]) {
+                return None;
+            }
+            let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+            (n.y > 0.5).then_some(p)
+        })
+        .collect()
+}
+
+/// Surface height at `(x,z)` from a triangle via XZ barycentric interpolation,
+/// or None if `(x,z)` is outside the triangle's XZ projection.
+fn bary_height(tri: &[Vec3; 3], x: f32, z: f32) -> Option<f32> {
+    let (a, b, c) = (tri[0], tri[1], tri[2]);
+    let (v0x, v0z) = (b.x - a.x, b.z - a.z);
+    let (v1x, v1z) = (c.x - a.x, c.z - a.z);
+    let (v2x, v2z) = (x - a.x, z - a.z);
+    let d00 = v0x * v0x + v0z * v0z;
+    let d01 = v0x * v1x + v0z * v1z;
+    let d11 = v1x * v1x + v1z * v1z;
+    let d20 = v2x * v0x + v2z * v0z;
+    let d21 = v2x * v1x + v2z * v1z;
+    let denom = d00 * d11 - d01 * d01;
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    let u = 1.0 - v - w;
+    let e = -1e-4;
+    (u >= e && v >= e && w >= e).then_some(u * a.y + v * b.y + w * c.y)
+}
+
+/// THE TRUSTWORTHY VALIDATOR. Cast a vertical ray through every grid-cell-center
+/// column over the union mesh's xz bbox and count the up-facing surfaces it hits.
+/// Heights within 0.02 vox merge into one layer (a welded seam, or two
+/// bit-identical coincident surfaces, reads as ONE surface). A column with ≥2
+/// layers separated by a z-fighting gap (0.02..1.5 vox) is a TRUE double sheet.
+/// Returns (double_sheet_columns, max_gap_vox). Unlike column-coincidence, this
+/// cannot be fooled by a welded region/full seam.
+fn zfight_columns(union_up: &[[Vec3; 3]], grid_origin: Vec3, vs: f32) -> (usize, f32) {
+    if union_up.is_empty() {
+        return (0, 0.0);
+    }
+    let (mut lo_x, mut lo_z, mut hi_x, mut hi_z) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for t in union_up {
+        for p in t {
+            lo_x = lo_x.min(p.x);
+            lo_z = lo_z.min(p.z);
+            hi_x = hi_x.max(p.x);
+            hi_z = hi_z.max(p.z);
+        }
+    }
+    let cxa = ((lo_x - grid_origin.x) / vs).floor() as i32;
+    let cxb = ((hi_x - grid_origin.x) / vs).ceil() as i32;
+    let cza = ((lo_z - grid_origin.z) / vs).floor() as i32;
+    let czb = ((hi_z - grid_origin.z) / vs).ceil() as i32;
+    let (mut count, mut maxgap) = (0usize, 0.0f32);
+    let merge = 0.02 * vs;
+    for cz in cza..=czb {
+        for cx in cxa..=cxb {
+            let px = grid_origin.x + (cx as f32 + 0.5) * vs;
+            let pz = grid_origin.z + (cz as f32 + 0.5) * vs;
+            let mut hs: Vec<f32> = union_up.iter().filter_map(|t| bary_height(t, px, pz)).collect();
+            if hs.len() < 2 {
+                continue;
+            }
+            hs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut layers = vec![hs[0]];
+            for &h in &hs[1..] {
+                if (h - layers.last().unwrap()).abs() > merge {
+                    layers.push(h);
+                }
+            }
+            let mut zf = false;
+            for w in layers.windows(2) {
+                let g = (w[1] - w[0]).abs();
+                if g > merge && g < 1.5 * vs {
+                    zf = true;
+                    maxgap = maxgap.max(g / vs);
+                }
+            }
+            if zf {
+                count += 1;
+            }
+        }
+    }
+    (count, maxgap)
+}
+
 // CAPTURED OPEN BUG. RED today: the editor's SphereTouch(op.radius) drop leaves a
 // sub-voxel-offset patch/kept-old overlap on sloped surfaces (z-fight). Un-ignore
 // once the drop reach is unified with the patch re-extract reach in the editor
@@ -388,6 +501,28 @@ fn terrain_inflate_does_not_double_sheet() {
     eprintln!("[double-sheet] BoxTouch(tight patch region):           bit-identical={eb:>3}  z-FIGHT={zb:>3}  (max gap {gb:.3} vox)  holes={box_holes}");
     eprintln!("[double-sheet] ISOLATION full-vs-region (pre-brush):   bit-identical={ei:>3}  z-FIGHT={zi:>3}  (max gap {gi:.3} vox)  <- mesher is consistent");
     eprintln!("[double-sheet] FIX expanded(+{EX}) region + Box drop:    bit-identical={ex_e:>3}  z-FIGHT={ex_z:>3}  (max gap {ex_g:.3} vox)  holes={ex_holes}");
+
+    // ── TRUSTWORTHY VALIDATOR: cast a vertical ray per column over each
+    // RENDERED union mesh (kept-old ∪ patch) and count true double sheets.
+    // Immune to the welded-seam confound that fooled the column-coincidence
+    // detector above.
+    let patch_up = up_verts(&patch_verts, &patch_idx);
+    let patch_ex_up = up_verts(&patch_ex_v, &patch_ex_i);
+    let union_of = |kept: Vec<[Vec3; 3]>, patch: &[[Vec3; 3]]| {
+        let mut u = kept;
+        u.extend_from_slice(patch);
+        u
+    };
+    let sphere_keep =
+        |p0: Vec3, p1: Vec3, p2: Vec3| (p0 - center_world).length_squared() > r2 && (p1 - center_world).length_squared() > r2 && (p2 - center_world).length_squared() > r2;
+    let box_keep = |p0: Vec3, p1: Vec3, p2: Vec3| !in_box(p0) && !in_box(p1) && !in_box(p2);
+    let ex_keep = |p0: Vec3, p1: Vec3, p2: Vec3| !in_ex_box(p0) && !in_ex_box(p1) && !in_ex_box(p2);
+    let (rz_sphere, rg_sphere) = zfight_columns(&union_of(kept_up_verts(&old_verts, &old_idx, &sphere_keep), &patch_up), grid_origin, VS);
+    let (rz_box, rg_box) = zfight_columns(&union_of(kept_up_verts(&old_verts, &old_idx, &box_keep), &patch_up), grid_origin, VS);
+    let (rz_ex, rg_ex) = zfight_columns(&union_of(kept_up_verts(&old_verts, &old_idx, &ex_keep), &patch_ex_up), grid_origin, VS);
+    let (rz_iso, rg_iso) = zfight_columns(&union_of(up_verts(&old_verts, &old_idx), &up_verts(&region_pre_v, &region_pre_i)), grid_origin, VS);
+    eprintln!("[RAY-VALIDATOR] true rendered double-sheet columns (gap in vox):");
+    eprintln!("    SphereTouch(today)={rz_sphere} (g{rg_sphere:.3})   BoxTouch(tight)={rz_box} (g{rg_box:.3})   expanded+Box={rz_ex} (g{rg_ex:.3})   isolation={rz_iso} (g{rg_iso:.3})");
 
     // SOLID, stable assertion: the MESHER is consistent — the region extract is
     // bit-identical to the full extract on IDENTICAL data. This rules out
