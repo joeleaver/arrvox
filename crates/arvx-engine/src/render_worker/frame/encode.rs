@@ -8,8 +8,11 @@
 //! from [`super::PreFrameOutput`] and emits [`super::EncodeOutput`]
 //! carrying pick wiring data into [`super::post::finalize_frame`].
 
+use std::sync::atomic::Ordering;
+
 use crate::render_frame::RenderFrame;
 
+use super::super::readback_poll::ReadbackJob;
 use super::super::state::RenderState;
 
 use super::{EncodeOutput, PreFrameOutput};
@@ -314,13 +317,42 @@ pub(super) fn encode_viewports(
             );
         }
 
-        // 3k. Composite readback (frame pixels back to the editor).
+        // 3k. Composite readback (frame pixels back to the editor). Claims a
+        //     free ring slot + encodes the texture→buffer copy; `None` when
+        //     all slots are still in flight on the poll thread (we then render
+        //     + submit normally but ship no pixels this frame — newest-wins
+        //     tolerates the drop, and we NEVER stall waiting for a slot).
         let readback_idx = vr.encode_composite_readback(&mut encoder);
         state.renderer.resolve_profiler_queries(&mut encoder);
-        state.queue.submit(std::iter::once(encoder.finish()));
 
+        // P2 pacing: bound GPU-queue depth by in-flight submissions, NOT by
+        // readback slots. Increment before submit; decrement when the GPU
+        // signals the work is done (fired by the poll thread's `device.poll`).
+        state.inflight_submits.fetch_add(1, Ordering::Relaxed);
+        state.queue.submit(std::iter::once(encoder.finish()));
+        let inflight_done = state.inflight_submits.clone();
+        state
+            .queue
+            .on_submitted_work_done(move || {
+                inflight_done.fetch_sub(1, Ordering::Relaxed);
+            });
+
+        // Hand the just-written composite slot to the dedicated readback-poll
+        // thread (it owns map_async → read → ship → unmap → recycle). The
+        // generation tags both newest-wins ship ordering and the slot-free
+        // match (so a resize race can't free the wrong slot).
         if let Some(idx) = readback_idx {
-            vr.readback.issue_map_async(idx);
+            let generation = state.readback_generation.fetch_add(1, Ordering::Relaxed) + 1;
+            let buffer = vr.readback.build_in_flight(idx, generation);
+            let _ = state.readback_job_tx.send(ReadbackJob {
+                vp_id: vp.id,
+                slot: idx,
+                buffer,
+                generation,
+                width: vr.width,
+                height: vr.height,
+                padded_row: vr.readback_padded_row(),
+            });
         }
         // Pair the LOD-stats map_async with the matching submit
         // (validation requires map_async after submit, not before).

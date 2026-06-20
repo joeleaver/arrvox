@@ -137,3 +137,65 @@ fn terrain_gen_keeps_rendering() {
         obs.gpu_objects()
     );
 }
+
+/// P2 regression — the decoupled-readback present must stay live at the
+/// TIGHTEST queue-depth pacing cap (`ARVX_MAX_INFLIGHT_SUBMITS=1`).
+///
+/// This is the test that pins the mechanism which REPLACED the deleted
+/// backpressure gate. The render thread now refuses to render a new frame while
+/// the in-flight-submit count is at the cap, and the ONLY thing that decrements
+/// that count is the dedicated readback-poll thread's `device.poll` firing the
+/// `on_submitted_work_done` callbacks. If that wiring were broken, a cap of 1
+/// would wedge the renderer permanently — the frame counter would go flat and
+/// this test would time out. It also proves the gate is truly gone: there is no
+/// readback-slot coupling left that a burst could deadlock on.
+///
+/// (Pixel shipping happens on the poll thread now, so the `FrameCallback`
+/// counter rising also proves the off-thread ship + newest-wins path is live.)
+///
+/// Run single-threaded (`--test-threads=1`): this test sets a process-global
+/// env var, matching the harness convention.
+#[test]
+fn p2_render_survives_tightest_inflight_cap() {
+    unsafe {
+        std::env::set_var("ARVX_TERRAIN_PROFILE", "1");
+        std::env::set_var("ARVX_MAX_INFLIGHT_SUBMITS", "1");
+    }
+
+    let (engine, obs) = Observed::spawn_engine(640, 360);
+
+    assert!(
+        wait_until(Duration::from_secs(60), || obs.frames() > 0),
+        "engine never produced a first frame at inflight cap=1 — queue-depth \
+         pacing deadlock (on_submitted_work_done not draining)?"
+    );
+
+    engine
+        .cmd_tx
+        .send(EngineCommand::SpawnTerrain)
+        .expect("send SpawnTerrain");
+
+    assert!(
+        wait_until(Duration::from_secs(60), || obs.gpu_objects() >= 1),
+        "terrain never integrated at inflight cap=1 — gpu_objects={}",
+        obs.gpu_objects()
+    );
+
+    // At cap=1 only one submission may be outstanding at a time, so frames are
+    // fully serialized against GPU completion. They must STILL keep flowing —
+    // a flat counter here means the pacing wedged (the failure mode the old
+    // gate had, now structurally impossible).
+    let base = obs.frames();
+    let advanced = wait_until(Duration::from_secs(20), || obs.frames() >= base + 30);
+
+    // Leave the env as we found it for any subsequent test in the binary.
+    unsafe { std::env::remove_var("ARVX_MAX_INFLIGHT_SUBMITS") };
+
+    assert!(
+        advanced,
+        "render FROZE at inflight cap=1: only {} new frames in 20s (gpu_objects={}) \
+         — queue-depth pacing is not being drained by the poll thread",
+        obs.frames() - base,
+        obs.gpu_objects()
+    );
+}

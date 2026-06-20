@@ -1966,21 +1966,34 @@ impl ViewportRenderer {
     }
 }
 
-/// Triple-buffered async readback. The engine writes the composite into
-/// one buffer per frame, immediately issues `map_async` on it, and reads
-/// pixels back the frame (or two) later via [`drain_completed`]. There is
-/// no `device.poll(Wait)` anywhere on the hot path — completion is checked
-/// with `try_recv` after a non-blocking `poll(Poll)`.
+/// Triple-buffered composite readback (P2 — decoupled present).
 ///
-/// Three buffers gives one slot for the in-flight write, one for the
-/// in-flight map, and one always-idle slot, so [`acquire_write_idx`]
-/// effectively never returns `None` when the GPU is keeping up.
+/// The render thread copies the composite into a free slot
+/// ([`acquire_write_idx`] → `copy_texture_to_buffer`), submits, then claims
+/// the slot via [`build_in_flight`] and hands a clone of the buffer to the
+/// dedicated readback-poll thread. That thread owns the `map_async` → read →
+/// unmap lifecycle and, when done, recycles the slot back here via
+/// [`free_slot`]. The render thread itself **never** polls the device, maps,
+/// or reads pixels — so presentation is no longer coupled to readback-slot
+/// availability (the old backpressure gate is gone).
+///
+/// Each slot is tagged with the monotonic `generation` of the job currently
+/// occupying it (`None` = idle). [`free_slot`] only releases a slot when the
+/// freed generation matches, so a stale free for a buffer that a viewport
+/// resize recreated underneath an in-flight job can't release the new job's
+/// slot. `wgpu::Buffer` is a cheap `Clone` (Arc-backed) so handing a clone to
+/// the poll thread shares the same GPU allocation.
+///
+/// Three buffers give one for the in-flight write, one for the in-flight map,
+/// and one idle slot, so [`acquire_write_idx`] effectively never returns
+/// `None` when the poll thread is recycling slots promptly; when it does, the
+/// render thread simply skips the readback copy for that frame (newest-wins
+/// tolerates a dropped frame) without stalling.
 pub struct ReadbackRing {
     pub buffers: [wgpu::Buffer; 3],
-    pending: [Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>; 3],
-    cached: Vec<u8>,
-    cached_w: u32,
-    cached_h: u32,
+    /// `Some(generation)` while a slot's buffer is handed to the poll thread;
+    /// `None` when the slot is writable.
+    pending: [Option<u64>; 3],
 }
 
 impl ReadbackRing {
@@ -1992,100 +2005,43 @@ impl ReadbackRing {
                 create_readback_buffer(device, width, height),
             ],
             pending: [None, None, None],
-            cached: Vec::new(),
-            cached_w: 0,
-            cached_h: 0,
         }
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        // Any in-flight maps reference the OLD buffers. Dropping the
-        // receiver is safe — the buffers themselves still exist until
-        // `Drop` runs in the next assignment, and wgpu cancels the maps
-        // when the buffer goes away.
+        // Recreate the buffers at the new size. Any in-flight jobs hold their
+        // OWN clones of the OLD buffers (the poll thread reads + unmaps those
+        // independently), so dropping our handles here is safe. We reset every
+        // slot to idle; a later `SlotFree` for an old-generation job won't
+        // match the (now-`None`-or-newly-issued) slot, so it's harmlessly
+        // ignored — see `free_slot`.
         self.pending = [None, None, None];
         self.buffers = [
             create_readback_buffer(device, width, height),
             create_readback_buffer(device, width, height),
             create_readback_buffer(device, width, height),
         ];
-        self.cached.clear();
-        self.cached_w = 0;
-        self.cached_h = 0;
     }
 
+    /// Index of a writable slot, or `None` if all three are in flight.
     pub fn acquire_write_idx(&self) -> Option<usize> {
         self.pending.iter().position(|p| p.is_none())
     }
 
-    /// `true` when at least one readback slot is idle — i.e.
-    /// [`acquire_write_idx`] would return `Some`. Callers use this as a
-    /// GPU-backpressure signal: if every slot is still waiting for a
-    /// previously-submitted `map_async` to complete, the CPU is
-    /// outpacing the GPU and should back off rather than submit more
-    /// work (which would just deepen the queue and delay every pending
-    /// readback even further).
-    pub fn has_idle_slot(&self) -> bool {
-        self.pending.iter().any(|p| p.is_none())
+    /// Claim `idx` for the job tagged `generation` and return a clone of its
+    /// buffer to hand to the poll thread. The slot stays in flight until a
+    /// matching [`free_slot`] arrives.
+    pub fn build_in_flight(&mut self, idx: usize, generation: u64) -> wgpu::Buffer {
+        self.pending[idx] = Some(generation);
+        self.buffers[idx].clone()
     }
 
-    /// Number of readback slots currently awaiting a `map_async`
-    /// completion (0..=3). Diagnostic only: the render-thread
-    /// backpressure-stall probe logs this to show whether `poll`/`drain`
-    /// is making progress when the gate wedges.
-    pub fn pending_count(&self) -> usize {
-        self.pending.iter().filter(|p| p.is_some()).count()
-    }
-
-    /// After submit, kick off `map_async` on the buffer that was just
-    /// written. Buffer state goes from idle → in-flight; later
-    /// `drain_completed` will read it back and return it to idle.
-    pub fn issue_map_async(&mut self, idx: usize) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.buffers[idx].slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.pending[idx] = Some(rx);
-    }
-
-    /// Non-blocking: copy any completed maps' pixels into the cached
-    /// frame. Caller must have already done `device.poll(Poll)` so
-    /// callbacks can fire. Returns `true` when `cached_pixels` was
-    /// updated this call.
-    pub fn drain_completed(&mut self, width: u32, height: u32, padded_row: u32) -> bool {
-        let mut updated = false;
-        for i in 0..self.pending.len() {
-            let done = self.pending[i].as_ref().map(|rx| rx.try_recv().is_ok()).unwrap_or(false);
-            if !done {
-                continue;
-            }
-            self.pending[i] = None;
-            let slice = self.buffers[i].slice(..);
-            let data = slice.get_mapped_range();
-            let mut out = vec![0u8; (width * height * 4) as usize];
-            for y in 0..height as usize {
-                let src = y * padded_row as usize;
-                let dst = y * width as usize * 4;
-                let row = width as usize * 4;
-                if src + row <= data.len() && dst + row <= out.len() {
-                    out[dst..dst + row].copy_from_slice(&data[src..src + row]);
-                }
-            }
-            drop(data);
-            self.buffers[i].unmap();
-            self.cached = out;
-            self.cached_w = width;
-            self.cached_h = height;
-            updated = true;
-        }
-        updated
-    }
-
-    pub fn cached_pixels(&self) -> Option<(&[u8], u32, u32)> {
-        if self.cached.is_empty() {
-            None
-        } else {
-            Some((&self.cached, self.cached_w, self.cached_h))
+    /// Recycle a slot the poll thread finished with. No-op unless the slot is
+    /// still occupied by exactly `generation` (guards the resize race where a
+    /// stale free arrives for a buffer that's since been recreated/re-issued).
+    pub fn free_slot(&mut self, slot: usize, generation: u64) {
+        if slot < self.pending.len() && self.pending[slot] == Some(generation) {
+            self.pending[slot] = None;
         }
     }
 }

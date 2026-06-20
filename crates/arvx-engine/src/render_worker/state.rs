@@ -17,7 +17,7 @@
 //! handle.
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::thread::JoinHandle;
@@ -36,6 +36,9 @@ use crate::render_frame::{
 use crate::viewport::ViewportId;
 
 use super::loop_thread::run_render_thread;
+use super::readback_poll::{
+    run_readback_poll_thread, ReadbackJob, RenderReadbackHandles, SlotFree,
+};
 
 /// Handle returned by [`RenderWorker::spawn`]. The sim side keeps this;
 /// dropping it triggers a graceful shutdown of the render thread.
@@ -49,6 +52,10 @@ pub struct RenderWorker {
     /// Send aperiodic commands (resize, shutdown, …).
     pub commands: Sender<RenderCommand>,
     handle: Option<JoinHandle<()>>,
+    /// Dedicated readback-poll thread (P2). Joined AFTER the render thread so
+    /// its `job_tx` (owned by `RenderState`) is dropped first, disconnecting
+    /// the poll thread's `job_rx` and letting it return.
+    poll_handle: Option<JoinHandle<()>>,
 }
 
 impl Drop for RenderWorker {
@@ -59,6 +66,11 @@ impl Drop for RenderWorker {
         let _ = self.commands.send(RenderCommand::Shutdown);
         self.inbox.shutdown();
         if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        // Render thread is gone → its `RenderState` (and the `job_tx` inside)
+        // is dropped → the poll thread's `job_rx` disconnects → it returns.
+        if let Some(h) = self.poll_handle.take() {
             let _ = h.join();
         }
     }
@@ -215,18 +227,55 @@ impl RenderWorker {
     ///
     /// The render thread takes ownership of `init.device`, `init.queue`,
     /// builds the [`ArvxRenderer`] + per-viewport renderers there, then
-    /// enters its render loop. `frame_callback` is invoked once per
-    /// visible viewport per produced frame, on the render thread.
+    /// enters its render loop. `frame_callback` is invoked once per visible
+    /// viewport per shipped frame — on the **readback-poll thread** (P2), not
+    /// the render thread; the editor surface writers don't care which thread
+    /// runs it (the callback is `Send`).
     pub fn spawn(init: RenderInit, frame_callback: FrameCallback) -> Self {
         let inbox = Arc::new(RenderInbox::new());
         let (cmd_tx, cmd_rx) = crossbeam::channel::unbounded::<RenderCommand>();
         let (out_tx, out_rx) = crossbeam::channel::unbounded::<RenderResult>();
 
+        // P2 readback plumbing: composite hand-off + slot recycle channels,
+        // shared generation counter, in-flight-submit pacing counter, and the
+        // delivered-dt panel value.
+        let (job_tx, job_rx) = crossbeam::channel::unbounded::<ReadbackJob>();
+        let (slot_free_tx, slot_free_rx) = crossbeam::channel::unbounded::<SlotFree>();
+        let generation = Arc::new(AtomicU64::new(0));
+        let inflight_submits = Arc::new(AtomicU32::new(0));
+        let delivered_dt_bits = Arc::new(AtomicU32::new(f32::NAN.to_bits()));
+
+        // The poll thread is the SOLE `device.poll` caller; clone the device
+        // handle (cheap, Arc-backed) before `init` is moved into the render
+        // thread.
+        let device_for_poll = init.device.clone();
+        let dt_for_poll = delivered_dt_bits.clone();
+        let poll_handle = std::thread::Builder::new()
+            .name("arvx-readback-poll".to_string())
+            .spawn(move || {
+                run_readback_poll_thread(
+                    device_for_poll,
+                    job_rx,
+                    slot_free_tx,
+                    frame_callback,
+                    dt_for_poll,
+                );
+            })
+            .expect("spawn arvx-readback-poll thread");
+
+        let handles = RenderReadbackHandles {
+            job_tx,
+            slot_free_rx,
+            generation,
+            inflight_submits,
+            delivered_dt_bits,
+        };
+
         let inbox_for_thread = inbox.clone();
         let handle = std::thread::Builder::new()
             .name("arvx-render".to_string())
             .spawn(move || {
-                run_render_thread(init, inbox_for_thread, cmd_rx, out_tx, frame_callback);
+                run_render_thread(init, inbox_for_thread, cmd_rx, out_tx, handles);
             })
             .expect("spawn arvx-render thread");
 
@@ -235,6 +284,7 @@ impl RenderWorker {
             outbox: out_rx,
             commands: cmd_tx,
             handle: Some(handle),
+            poll_handle: Some(poll_handle),
         }
     }
 }
@@ -347,21 +397,22 @@ pub(super) struct RenderState {
     /// of the next.
     pub(super) last_rendered_vp: std::collections::HashMap<ViewportId, [[f32; 4]; 4]>,
 
-    /// Wall-clock instant of the last `frame_callback` invocation.
-    /// We rate-limit pixel callbacks (see [`MIN_FRAME_CALLBACK_INTERVAL`])
-    /// because rinch's `surface_writer.submit_frame` holds an
-    /// `8 MB` Mutex<Buffer> lock for the duration of a memcpy. At
-    /// `Uncapped` render rates that lock is held >100% of wall time,
-    /// starving the editor's main thread (which holds the same lock
-    /// for an 8 MB clone during composite). The visible symptom is
-    /// "render reports 200 fps but the editor surface updates at
-    /// ~1 fps" because the main thread can't get the lock.
-    ///
-    /// Render still iterates uncapped — interpolation and physics
-    /// keep the GPU pipeline full, the readback rings keep filling.
-    /// We just don't ship every produced frame to the editor; the
-    /// editor only displays at vsync anyway.
-    pub(super) last_frame_callback: std::time::Instant,
+    // ── P2 decoupled-readback plumbing ──
+    /// Hand a copied+submitted composite to the poll thread.
+    pub(super) readback_job_tx: Sender<ReadbackJob>,
+    /// Drained at the top of each loop: ring slots the poll thread finished.
+    pub(super) slot_free_rx: Receiver<SlotFree>,
+    /// Monotonic readback generation, shared with the poll thread.
+    pub(super) readback_generation: Arc<AtomicU64>,
+    /// Submitted-but-not-GPU-complete command buffers. The render loop paces
+    /// new frames against this (`on_submitted_work_done` decrements it) instead
+    /// of readback-slot availability — bounding queue depth without coupling
+    /// presentation to readback.
+    pub(super) inflight_submits: Arc<AtomicU32>,
+    /// Poll-thread-written delivered-frame dt (f32 bits, NaN = none yet), read
+    /// when building `RenderResult` so the editor's delivered-FPS panel still
+    /// reflects real ship cadence now that shipping is off-thread.
+    pub(super) delivered_dt_bits: Arc<AtomicU32>,
 }
 
 /// Minimum wall-clock between two `frame_callback` invocations. ~120 Hz —
@@ -371,7 +422,7 @@ pub(super) const MIN_FRAME_CALLBACK_INTERVAL: std::time::Duration =
     std::time::Duration::from_micros(8_300);
 
 impl RenderState {
-    pub(super) fn new(init: RenderInit) -> Self {
+    pub(super) fn new(init: RenderInit, handles: RenderReadbackHandles) -> Self {
         let device = init.device;
         let queue = init.queue;
         let mut renderer = ArvxRenderer::new(&device, &queue, init.initial_width, init.initial_height);
@@ -430,9 +481,11 @@ impl RenderState {
             // override falls back to the snapshot's own view_proj
             // (i.e. prev_vp == view_proj, no motion).
             last_rendered_vp: std::collections::HashMap::new(),
-            // Sub-zero so the first frame's callback always fires.
-            last_frame_callback: std::time::Instant::now()
-                - std::time::Duration::from_secs(1),
+            readback_job_tx: handles.job_tx,
+            slot_free_rx: handles.slot_free_rx,
+            readback_generation: handles.generation,
+            inflight_submits: handles.inflight_submits,
+            delivered_dt_bits: handles.delivered_dt_bits,
         }
     }
 
