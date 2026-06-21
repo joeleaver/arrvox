@@ -1325,6 +1325,23 @@ impl ArvxSceneManager {
             }
         }
     }
+
+    /// Clear ONE asset's mesh/cluster dirty flags — called by the
+    /// byte-budgeted upload as soon as a single asset's mesh has fully
+    /// uploaded, rather than waiting for the whole geometry epoch.
+    /// Without this, a drawn asset whose `mesh_dirty` is still set (the
+    /// epoch hasn't completed) is re-yielded by
+    /// `iter_loaded_asset_meshes` after the next epoch bump and
+    /// re-uploaded in full — a multi-hundred-MiB atomic re-upload storm.
+    /// Per-asset clearing makes `mesh_dirty` itself the upload cursor.
+    pub fn mark_asset_upload_clean(&mut self, handle_raw: u32) {
+        if let Some(Some(entry)) = self.asset_cache.entries.get_mut(handle_raw as usize) {
+            entry.view.mesh_dirty = false;
+            entry.view.clusters_dirty = false;
+            entry.view.mesh_indices_dirty.clear();
+            entry.view.mesh_vertices_dirty.clear();
+        }
+    }
 }
 
 #[cfg(test)]

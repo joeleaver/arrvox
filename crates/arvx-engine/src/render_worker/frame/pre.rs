@@ -147,120 +147,171 @@ pub(super) fn run_pre_frame(
                 sim_to_render_ms, bump_to_submit_ms, submit_to_pickup_ms, frame.geometry_epoch,
             );
         }
+        // ── #3 byte-budgeted geometry upload ──────────────────────────
+        // Spread a big (coalesced multi-asset) upload across frames under
+        // a per-frame byte budget so it never freezes the present. Reset
+        // the cross-frame cursor when a new epoch arrives mid-drain: fresh
+        // appended geometry means the references must re-upload and a
+        // previously-"done" mesh may be dirty again. The per-pool GPU
+        // high-water marks (on ArvxScene) are NOT reset — their bytes stay
+        // valid; they just chase the now-larger pool length.
+        if state.geo_budget.in_progress_epoch != frame.geometry_epoch {
+            state.geo_budget.restart(frame.geometry_epoch);
+        }
+        let budget = state.geo_upload_budget_bytes;
+
         let t1 = std::time::Instant::now();
         let geo = sm.geometry_upload();
         let t_snapshot = t1.elapsed();
+
+        // Phase A (data pools, budget-split over frames) + Phase B
+        // (octree + brick_face_links, atomic, only once the data pools are
+        // fully resident). Until Phase B runs the appended geometry is
+        // invisible — no octree node references the new leaf/brick slots —
+        // so a half-filled pool tail never shows as garbage.
         let t2 = std::time::Instant::now();
-        state.renderer.upload_geometry(&state.queue, &geo);
+        let progress = state.renderer.upload_geometry_budgeted(
+            &state.queue,
+            &geo,
+            budget,
+            &mut state.geo_budget.refs_uploaded,
+        );
+        // Drop the append-dirty the cursor just consumed so a pool that
+        // drained early stops re-uploading its resident prefix every frame
+        // (which would starve the budget and stall the whole drain). The
+        // remaining dirty is the un-shipped tail + any genuine in-place
+        // edit, both still handled. (`geo` borrowed the dirty snapshot;
+        // its borrow has ended, so taking `sm` mutably here is fine.)
+        let (lv, cv, bv, brv) = state.renderer.pool_valid_marks();
+        sm.clear_geometry_dirty_below(lv, cv, bv, brv);
         let t_pool_upload = t2.elapsed();
-        let t3 = std::time::Instant::now();
-        // Delta-upload: the snapshot in `geo` cloned the per-pool dirty
-        // trackers; now that the writes have been queued, clear the
-        // manager-side trackers so the next epoch ships only fresh
-        // mutations rather than the same bytes again. Must run AFTER
-        // upload_geometry so a write_buffer failure (in tests, panics)
-        // leaves the trackers populated for retry.
-        sm.clear_geometry_dirty_ranges();
-        let t_clear = t3.elapsed();
-        // Mesh path — keep the per-asset (vbo, ibo) cache in step with the
-        // path's per-asset (vbo, ibo) cache. iter_loaded_asset_meshes
-        // skips empty mesh extractions (procedurals etc.) so this only
-        // touches assets that produced a non-empty surface mesh at
-        // load time. Phase 6.1: indices is the full DAG IBO (LOD-0
-        // first, then LOD-1, ...); dispatch draws only the LOD-0
-        // prefix until Phase 6.2 wires the indirect path.
+
+        // Phase C — per-asset mesh + cluster upload, budgeted. A fresh
+        // asset fills its VBO/IBO across frames (undrawn until complete —
+        // `mesh_buffer()` returns `None`, never garbage); a small asset
+        // finishes in one call. Each asset's own `mesh_dirty` flag is the
+        // cursor: cleared the moment its mesh is fully resident so it's
+        // not re-yielded (and never re-uploaded in full on the next epoch
+        // bump). Runs only after the references are up, so an asset's mesh
+        // is never drawable before its octree/leaf data is resident.
         let t_mesh_start = std::time::Instant::now();
         let mut mesh_bytes_total: u64 = 0;
         let mut mesh_asset_count: usize = 0;
-        for (handle, vertices, indices, vertices_dirty, indices_dirty, lod0_index_count)
-            in sm.iter_loaded_asset_meshes()
-        {
-            let bytes = state.renderer.upload_mesh_for_asset(
-                &state.queue,
-                handle.raw(),
-                vertices,
-                indices,
-                vertices_dirty,
-                indices_dirty,
-                lod0_index_count,
-            );
-            mesh_bytes_total += bytes;
-            mesh_asset_count += 1;
+        let mut any_cluster_buffer_replaced = false;
+        let mut mesh_drained = false;
+        if progress.refs_uploaded {
+            // Collect this frame's work under immutable borrows of `sm`, so
+            // the per-asset dirty-clear afterwards can take `sm` mutably
+            // without fighting the live mesh iterator.
+            let cluster_map: std::collections::HashMap<u32, _> = sm
+                .iter_loaded_asset_clusters()
+                .map(|(h, c)| (h.raw(), c))
+                .collect();
+            let pending: Vec<_> = sm
+                .iter_loaded_asset_meshes()
+                .map(|(h, v, i, vd, id, lod0)| (h.raw(), v, i, vd, id, lod0))
+                .collect();
+            let mut done_handles: Vec<u32> = Vec::new();
+            let mut stalled = false; // ran out of budget before draining all
+            let mut remaining = budget;
+            for (raw, vertices, indices, vertices_dirty, indices_dirty, lod0_index_count)
+                in pending
+            {
+                if remaining == 0 {
+                    stalled = true;
+                    break;
+                }
+                let (bytes, done) = state.renderer.upload_mesh_for_asset_budgeted(
+                    &state.queue,
+                    raw,
+                    vertices,
+                    indices,
+                    vertices_dirty,
+                    indices_dirty,
+                    lod0_index_count,
+                    remaining,
+                );
+                remaining = remaining.saturating_sub(bytes);
+                mesh_bytes_total += bytes;
+                if done {
+                    // Clusters upload only when the mesh is fully resident,
+                    // SAME frame, AFTER the mesh (the table indexes the IBO).
+                    if let Some(&clusters) = cluster_map.get(&raw) {
+                        let replaced = state.renderer.upload_mesh_clusters_for_asset(
+                            &state.queue, raw, clusters,
+                        );
+                        any_cluster_buffer_replaced |= replaced;
+                    }
+                    done_handles.push(raw);
+                    mesh_asset_count += 1;
+                } else {
+                    // Still mid-upload — it consumed this frame's budget.
+                    stalled = true;
+                    break;
+                }
+            }
+            // The iterator + cluster_map borrows have ended; now clear each
+            // completed asset's dirty flag (the mesh cursor).
+            for raw in &done_handles {
+                sm.mark_asset_upload_clean(*raw);
+            }
+            // Every pending (dirty) asset was processed unless we stalled on
+            // the budget, so `!stalled` ⇒ no dirty meshes remain.
+            mesh_drained = !stalled;
         }
         let t_mesh_upload = t_mesh_start.elapsed();
-        if mesh_asset_count > 0 {
-            let mib = mesh_bytes_total as f64 / (1024.0 * 1024.0);
-            eprintln!(
-                "[delta upload] mesh: {mesh_asset_count} asset(s) · {mib:.3} MiB total \
-                 (VBO+IBO tail writes) in {:.2} ms",
-                t_mesh_upload.as_secs_f64() * 1000.0,
-            );
+
+        // Completion — only when Phase A + B + C are ALL drained do we
+        // clear the dirty trackers, mark assets clean, and advance the
+        // epoch. A partial frame leaves them intact so the gate
+        // (frame.geometry_epoch > last_uploaded) re-enters next frame and
+        // the cursors continue. This clear-and-advance-on-complete rule is
+        // the load-bearing invariant: clearing early would drop the
+        // un-uploaded remainder permanently (the epoch already advanced).
+        let complete = progress.data_drained && progress.refs_uploaded && mesh_drained;
+        if complete {
+            sm.clear_geometry_dirty_ranges();
+            sm.mark_loaded_asset_uploads_clean();
+            // Read the epoch under the SAME lock so a mid-frame mutation
+            // (bake worker integrating an artifact) doesn't trick us into
+            // thinking we're caught up. Worst case: re-upload next frame.
+            state.last_uploaded_geometry_epoch = sm.geometry_epoch();
+            state.geo_budget.restart(0); // idle
         }
-        let t_cluster_start = std::time::Instant::now();
-        // Phase 5 — per-asset meshlet cluster table. Storage buffer
-        // for the Phase 6 LOD-selection compute pass; uploaded here
-        // but unused by current dispatch (validates the upload path
-        // without rewiring the hot draw call).
-        let mut cluster_asset_count = 0;
-        let mut any_cluster_buffer_replaced = false;
-        for (handle, clusters) in sm.iter_loaded_asset_clusters() {
-            let replaced = state.renderer.upload_mesh_clusters_for_asset(
-                &state.queue, handle.raw(), clusters,
-            );
-            any_cluster_buffer_replaced |= replaced;
-            cluster_asset_count += 1;
-        }
-        let t_cluster_upload = t_cluster_start.elapsed();
-        if cluster_asset_count > 0 {
-            eprintln!(
-                "[delta upload] cluster table: {cluster_asset_count} asset(s) in {:.2} ms",
-                t_cluster_upload.as_secs_f64() * 1000.0,
-            );
-        }
-        // Per-asset dirty-flag clean-up: every iter above only yielded
-        // assets whose `mesh_dirty / splats_dirty / clusters_dirty`
-        // flag was set; clear them now so the next epoch bump only
-        // re-uploads assets that mutated in the interim. Cut the
-        // sculpt-stamp upload cost from "every loaded asset × full
-        // realloc" to "just the one sculpted asset".
-        sm.mark_loaded_asset_uploads_clean();
-        // Read-back the epoch *under the same lock* so concurrent
-        // mutations (bake worker integrating an artifact mid-frame)
-        // don't trick us into thinking we're caught up when we're
-        // not. Worst case: we re-upload next frame, which is fine.
-        state.last_uploaded_geometry_epoch = sm.geometry_epoch();
         drop(sm);
+
         let t_total = geo_epoch_t0.elapsed();
         eprintln!(
-            "[geo-epoch] lock={:.2}ms snap={:.2}ms pool={:.2}ms clear={:.2}ms \
-             mesh={:.2}ms clusters={:.2}ms total={:.2}ms",
+            "[geo-epoch] lock={:.2}ms snap={:.2}ms pools+refs={:.2}ms mesh={:.2}ms total={:.2}ms \
+             | epoch={} dataDrained={} refs={} meshThisFrame={} meshDrained={} consumed={:.2}MiB complete={}",
             t_lock.as_secs_f64() * 1000.0,
             t_snapshot.as_secs_f64() * 1000.0,
             t_pool_upload.as_secs_f64() * 1000.0,
-            t_clear.as_secs_f64() * 1000.0,
             t_mesh_upload.as_secs_f64() * 1000.0,
-            t_cluster_upload.as_secs_f64() * 1000.0,
             t_total.as_secs_f64() * 1000.0,
+            frame.geometry_epoch,
+            progress.data_drained,
+            progress.refs_uploaded,
+            mesh_asset_count,
+            mesh_drained,
+            (progress.bytes_consumed + mesh_bytes_total) as f64 / (1024.0 * 1024.0),
+            complete,
         );
 
         // Invalidate cached `mesh_lod_select_g2_bgs` (and shadow
-        // counterparts) across every viewport, but only when at least
-        // one cluster buffer was actually replaced this epoch. The g2
-        // bind groups hold references to the per-asset cluster table
-        // buffer; if the cluster table was replaced (initial alloc,
-        // grow, or empty-clear), the cached BG still points at the
-        // dropped buffer and the compute pass reads stale cluster
-        // data — admit fails on every cluster and the asset's
-        // geometry vanishes from the frame. The freshness key in
+        // counterparts) across every viewport whenever a cluster buffer
+        // was actually replaced THIS frame. The g2 bind groups hold
+        // references to the per-asset cluster table buffer; if the cluster
+        // table was replaced (initial alloc, grow, or empty-clear), the
+        // cached BG still points at the dropped buffer and the compute
+        // pass reads stale cluster data — admit fails on every cluster and
+        // the asset's geometry vanishes. The freshness key in
         // viewport_renderer (asset_handle_raw, args_capacity) doesn't
-        // catch this case.
-        //
-        // When the cluster buffer is reused in place
-        // (`queue.write_buffer`, no allocation), the wgpu::Buffer
-        // object is unchanged and the cached BG still points at the
-        // correct buffer — skip the invalidation. This is the steady-
-        // state sculpt path; eliding the cascade avoids re-creating
-        // every BG per stamp.
+        // catch this, and under budgeting a cluster replace can land on a
+        // later frame than the pool-drain — so this MUST run on whatever
+        // frame the replace happens, not gated on the epoch "completing".
+        // In-place cluster reuse (no realloc) leaves the buffer object
+        // unchanged → skip the cascade (the steady-state sculpt path).
         if any_cluster_buffer_replaced {
             for vr in state.viewport_renderers.values_mut() {
                 for slot in vr.mesh_lod_select_g2_bgs.iter_mut() {

@@ -82,6 +82,41 @@ impl DirtyRanges {
         self.full = false;
     }
 
+    /// Drop the portion of every tracked range below `threshold` bytes,
+    /// keeping only `[threshold, ..)`. A range entirely below `threshold`
+    /// is removed; one straddling it is truncated to its upper part.
+    ///
+    /// Used by the byte-budgeted geometry upload: once the GPU high-water
+    /// cursor has uploaded a pool's appended tail up to `valid_bytes`, the
+    /// append-dirty for `[0, valid_bytes)` is satisfied and must be
+    /// dropped — otherwise a drained pool would re-upload its whole
+    /// resident prefix every frame (the append-dirty range spans the
+    /// entire appended region) and starve the tail budget so the pool
+    /// never finishes draining. Exits full-pool mode (the remainder is no
+    /// longer a clean `(0, total)` range).
+    pub fn retain_from(&mut self, threshold: u32) {
+        if threshold == 0 {
+            return;
+        }
+        let mut kept: Vec<(u32, u32)> = Vec::with_capacity(self.ranges.len());
+        let mut total = 0u64;
+        for &(off, len) in &self.ranges {
+            let end = off.saturating_add(len);
+            if end <= threshold {
+                continue; // fully below the cursor → consumed, drop
+            }
+            let new_off = off.max(threshold);
+            let new_len = end - new_off;
+            if new_len > 0 {
+                kept.push((new_off, new_len));
+                total += new_len as u64;
+            }
+        }
+        self.ranges = kept;
+        self.total_bytes = total;
+        self.full = false;
+    }
+
     /// True when no ranges are currently tracked.
     pub fn is_empty(&self) -> bool {
         self.ranges.is_empty()
@@ -410,6 +445,46 @@ mod tests {
         d.coalesce();
         assert_eq!(d.range_count(), 1);
         assert_eq!(d.total_dirty_bytes(), 256);
+    }
+
+    #[test]
+    fn retain_from_drops_below_keeps_above_and_truncates_straddler() {
+        let mut d = DirtyRanges::new();
+        d.mark(0, 100); // fully below threshold 200 → dropped
+        d.mark(150, 100); // straddles 200 → truncated to (200, 50)
+        d.mark(300, 50); // fully above → kept as-is
+        d.retain_from(200);
+        let ranges: Vec<_> = d.iter().collect();
+        assert_eq!(ranges, vec![(200, 50), (300, 50)]);
+        assert_eq!(d.total_dirty_bytes(), 100);
+    }
+
+    #[test]
+    fn retain_from_zero_is_noop() {
+        let mut d = DirtyRanges::new();
+        d.mark(0, 100);
+        d.retain_from(0);
+        assert_eq!(d.iter().collect::<Vec<_>>(), vec![(0, 100)]);
+    }
+
+    #[test]
+    fn retain_from_clears_a_fully_consumed_full_range() {
+        // The drained-pool case: append marked the whole pool, the cursor
+        // reached the end → retain_from(len) empties it and exits full mode.
+        let mut d = DirtyRanges::new();
+        d.mark_full(1000);
+        d.retain_from(1000);
+        assert!(d.is_empty());
+        assert!(!d.is_full_pool(1000));
+    }
+
+    #[test]
+    fn retain_from_truncates_full_range_to_tail() {
+        let mut d = DirtyRanges::new();
+        d.mark_full(1000);
+        d.retain_from(600);
+        assert_eq!(d.iter().collect::<Vec<_>>(), vec![(600, 400)]);
+        assert!(!d.is_full_pool(1000));
     }
 
     #[test]

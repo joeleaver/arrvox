@@ -88,6 +88,31 @@ pub struct GeometryUpload<'a> {
     pub brick_dirty: arvx_core::DirtyRanges,
 }
 
+/// Progress report from [`ArvxScene::upload_geometry_budgeted`] — how far
+/// the byte-budgeted, multi-frame geometry upload has advanced for the
+/// current epoch. The render worker uses it to decide whether to upload
+/// per-asset meshes (only after `refs_uploaded`) and whether to advance
+/// `last_uploaded_geometry_epoch` + clear the dirty trackers (only when
+/// everything, including meshes, has shipped).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GeoBudgetProgress {
+    /// Every data pool (leaf_attr / color / bone / brick) is fully
+    /// resident on the GPU for this epoch — Phase A complete.
+    pub data_drained: bool,
+    /// The "references" (octree nodes + brick_face_links) have been
+    /// uploaded — Phase B complete. Only ever true once `data_drained`.
+    /// Until this is true the appended geometry is invisible (no octree
+    /// node references the new leaf/brick slots), so a half-filled pool
+    /// tail never shows as garbage.
+    pub refs_uploaded: bool,
+    /// Bytes written to the GPU this call — for telemetry / pacing.
+    pub bytes_consumed: u64,
+    /// A pool buffer was reallocated (grew) this call. The first frame of
+    /// a burst grows every under-sized pool to its final size (one
+    /// `buffers_epoch` bump); subsequent frames write in place.
+    pub grew: bool,
+}
+
 /// Per-frame data. Camera uniforms are per-viewport and uploaded
 /// separately via `ViewportRenderer::upload_camera`.
 pub struct FrameUpload<'a> {
@@ -160,6 +185,18 @@ struct UploadStats {
 /// low for typical stamps; this cap covers pathological cases (very
 /// scattered per-slot mutations).
 const MAX_DELTA_RANGES: usize = 64;
+
+/// Per-frame byte slice of a pool's un-resident tail to upload, given
+/// `prev_valid` bytes already on the GPU, a CPU pool of `len` bytes, and a
+/// per-call `budget`. Returns `[lo, hi)`: `lo = min(prev_valid, len)`,
+/// `hi = min(prev_valid + budget, len)`. `lo == hi` means the tail is fully
+/// resident (nothing to write). Pure (no GPU) so the byte accounting that
+/// drives [`ArvxScene::upload_pool_budgeted`] is unit-testable.
+fn budgeted_tail(prev_valid: u64, len: u64, budget: u64) -> (u64, u64) {
+    let lo = prev_valid.min(len);
+    let hi = lo.saturating_add(budget).min(len);
+    (lo, hi)
+}
 
 /// Storage stride (u32 lanes) of one octree node on the GPU. Lanes:
 ///   .x = node value (EMPTY / INTERIOR / BRANCH offset / LEAF / BRICK id)
@@ -516,6 +553,122 @@ impl ArvxScene {
         }
     }
 
+    /// Byte-budgeted, multi-frame geometry upload (the render-thread
+    /// stall fix). Where [`Self::upload_geometry`] uploads the whole
+    /// epoch synchronously — up to ~500 ms for a coalesced multi-asset
+    /// load, which freezes the present — this spreads it across frames
+    /// under a per-call `budget` (bytes), in three phases:
+    ///
+    /// - **Phase A** (this call, possibly over many frames): the data
+    ///   pools `leaf_attr → color → bone → brick`, each tail-filled up to
+    ///   the shared budget. Returns `data_drained` once all four are fully
+    ///   resident.
+    /// - **Phase B** (single frame, only once `data_drained`): the
+    ///   *references* — octree nodes + `brick_face_links` — uploaded whole
+    ///   (atomic, never split). Gated by `refs_uploaded`, which the caller
+    ///   threads across frames and resets when the epoch changes. The
+    ///   octree is uploaded last and whole so an octree node can never
+    ///   reference a not-yet-resident leaf/brick slot.
+    /// - **Phase C** (per-asset meshes) lives in the render worker — it
+    ///   runs only after `refs_uploaded`.
+    ///
+    /// `*_valid` (the per-pool GPU high-water marks) are the cross-frame
+    /// cursors; the caller holds no per-pool budget state. A `budget` of
+    /// `u64::MAX` restores single-frame behavior (regression / A-B knob).
+    pub fn upload_geometry_budgeted(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &GeometryUpload,
+        budget: u64,
+        refs_uploaded: &mut bool,
+    ) -> GeoBudgetProgress {
+        let mut grew = false;
+        let mut consumed = 0u64;
+        let mut remaining = budget;
+
+        // ── Phase A: data pools, leaf_attr → color → bone → brick. ──
+        // Each pool grows to its final size on the first touched frame
+        // (so a later frame can fill the tail at a stable buffer object)
+        // and writes up to the SHARED remaining budget. We never `break`
+        // early on `remaining == 0`: a budget-0 call still grows an
+        // under-sized pool (cheap) and re-applies any in-prefix sculpt
+        // edits, it just writes no tail — so all pools reach final size
+        // promptly even while only the front pool's tail is draining.
+        let mut all_drained = true;
+        for (buffer, valid, label, bytes, dirty) in [
+            (
+                &mut self.leaf_attr_pool_buffer, &mut self.leaf_attr_pool_valid,
+                "arvx_leaf_attr_pool", data.leaf_attr_pool, &data.leaf_attr_dirty,
+            ),
+            (
+                &mut self.color_pool_buffer, &mut self.color_pool_valid,
+                "arvx_color_pool", data.color_pool, &data.color_dirty,
+            ),
+            (
+                &mut self.bone_weights_buffer, &mut self.bone_weights_valid,
+                "arvx_bone_weights", data.bone_weights, &data.bone_dirty,
+            ),
+            (
+                &mut self.brick_pool_buffer, &mut self.brick_pool_valid,
+                "arvx_brick_pool", data.brick_pool, &data.brick_dirty,
+            ),
+        ] {
+            let (stats, drained) = Self::upload_pool_budgeted(
+                device, queue, buffer, valid, label, bytes, dirty, remaining,
+            );
+            grew |= stats.grew;
+            consumed += stats.bytes_written;
+            remaining = remaining.saturating_sub(stats.bytes_written);
+            all_drained &= drained;
+        }
+
+        // ── Phase B: references (octree + face_links), atomic-last. ──
+        // Only once every data pool is resident, and only once per epoch
+        // (the caller resets `*refs_uploaded` on an epoch change). Uploaded
+        // whole — never budget-split — so a partially-written octree can
+        // never publish a node that points at a not-yet-resident slot.
+        if all_drained && !*refs_uploaded {
+            let octree_stats = Self::upload_octree_delta(
+                device, queue, &mut self.octree_nodes_buffer, "arvx_octree_nodes",
+                data.octree_nodes, data.octree_internal_attrs, &data.octree_dirty,
+            );
+            grew |= octree_stats.grew;
+            consumed += octree_stats.bytes_written;
+            // face_links has no delta tracker — full re-write, same
+            // "references" tier as the octree.
+            grew |= Self::ensure_and_write(
+                device, queue, &mut self.brick_face_links_buffer, "arvx_brick_face_links",
+                data.brick_face_links,
+            );
+            *refs_uploaded = true;
+        }
+
+        if grew {
+            self.buffers_epoch += 1;
+        }
+        GeoBudgetProgress {
+            data_drained: all_drained,
+            refs_uploaded: *refs_uploaded,
+            bytes_consumed: consumed,
+            grew,
+        }
+    }
+
+    /// The four data pools' GPU high-water marks `(leaf_attr, color, bone,
+    /// brick)` in bytes — how far the byte-budgeted upload has filled each.
+    /// The render worker hands these to
+    /// `ArvxSceneManager::clear_geometry_dirty_below` so consumed
+    /// append-dirty is dropped and a drained pool stops re-uploading.
+    pub fn pool_valid_marks(&self) -> (u64, u64, u64, u64) {
+        (
+            self.leaf_attr_pool_valid,
+            self.color_pool_valid,
+            self.bone_weights_valid,
+            self.brick_pool_valid,
+        )
+    }
+
     /// Delta-aware upload for a homogeneous byte pool (brick_pool,
     /// leaf_attr_pool, color_pool, bone_weights). Returns telemetry +
     /// whether the buffer was reallocated. `valid_bytes` tracks how many
@@ -645,6 +798,127 @@ impl ArvxScene {
             range_count += 1;
         }
         UploadStats { grew: false, bytes_written, range_count }
+    }
+
+    /// Byte-budgeted variant of [`Self::upload_pool_delta`] for a
+    /// homogeneous data pool (brick / leaf_attr / color / bone).
+    ///
+    /// The whole point of the budget is to keep a cold load's giant
+    /// `write_buffer` (e.g. a 125 MiB brick tail) from happening
+    /// synchronously in ONE render frame — which freezes the present
+    /// for hundreds of ms. Instead we grow the buffer to its **final**
+    /// size ONCE (carrying the resident prefix forward GPU→GPU, ~µs),
+    /// then write at most `budget` bytes of the un-resident tail per
+    /// call, advancing `*valid_bytes` (the GPU high-water cursor). A
+    /// later frame writes the next slice. `*valid_bytes == data.len()`
+    /// means the pool is fully resident → returns `drained = true`.
+    ///
+    /// Grow-to-final-ONCE is mandatory, not progressive sizing: a
+    /// buffer that grew each frame would realloc every frame (maximal
+    /// bind-group churn) AND could leave an octree node (uploaded in
+    /// the "references last" phase) pointing past the current buffer
+    /// size = OOB read. Sizing to final up front keeps the buffer
+    /// object stable while the tail fills.
+    ///
+    /// Any in-prefix `dirty` ranges (sculpt edits to the already-
+    /// resident `[0, valid)` region) are re-applied in full each call —
+    /// they are KB-scale by construction (a stamp never spans the
+    /// budget), so they never split. A pure append marks only the tail
+    /// `[valid, len)`, so the in-prefix loop writes nothing.
+    ///
+    /// SAFETY of progressive tail fill: the appended tail bytes are not
+    /// referenced by any uploaded octree node until the "references
+    /// last" phase runs (gated on every data pool being drained), so a
+    /// half-filled tail is invisible, never garbage — proven against the
+    /// shader descent in the design workflow.
+    fn upload_pool_budgeted(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &mut wgpu::Buffer,
+        valid_bytes: &mut u64,
+        label: &str,
+        data: &[u8],
+        dirty: &arvx_core::DirtyRanges,
+        budget: u64,
+    ) -> (UploadStats, bool) {
+        if data.is_empty() {
+            *valid_bytes = 0;
+            return (UploadStats::default(), true);
+        }
+        let needed = data.len() as u64;
+        let max_binding = device.limits().max_storage_buffer_binding_size as u64;
+        if needed > max_binding {
+            eprintln!(
+                "[POOL LIMIT] {label}: {needed} bytes EXCEEDS max_storage_buffer_binding_size \
+                 {max_binding} — this binding is now invalid (GPU may fault / surface may drop)",
+            );
+        }
+        let prev_valid = (*valid_bytes).min(needed);
+        let mut grew = false;
+        let mut bytes_written = 0u64;
+        let mut range_count = 0usize;
+
+        // 1. Grow to FINAL size once. Carry the resident prefix forward.
+        //    `tail_start` is where the un-resident tail begins; on a grow
+        //    the sub-4-byte remainder of `prev_valid` isn't GPU→GPU
+        //    copyable, so it folds back into the tail write.
+        let mut tail_start = prev_valid;
+        if needed > buffer.size() {
+            let old_buffer = std::mem::replace(
+                buffer,
+                Self::create_storage(
+                    device, label,
+                    needed.max(buffer.size().saturating_mul(2)).max(64),
+                ),
+            );
+            grew = true;
+            let copy_len = prev_valid & !3u64;
+            if copy_len > 0 {
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pool-grow-copy"),
+                });
+                enc.copy_buffer_to_buffer(&old_buffer, 0, buffer, 0, copy_len);
+                queue.submit(std::iter::once(enc.finish()));
+            }
+            tail_start = copy_len;
+        }
+
+        // 2. Re-apply in-place EDITS to already-resident data — dirty
+        //    ranges below `tail_start` (the resident prefix). The CALLER
+        //    drops consumed append-dirty (`clear_geometry_dirty_below`)
+        //    each frame, so by the time the cursor has passed the append
+        //    region its dirty is gone and this loop writes only genuine
+        //    edits (a sculpt stamp to resident data, KB-scale). Without
+        //    that drop, a pool's append-dirty (which spans the whole
+        //    appended region) would re-upload the entire resident prefix
+        //    every frame and starve the tail budget.
+        for (off, len) in dirty.iter() {
+            let o = off as u64;
+            let e = (o + len as u64).min(tail_start);
+            if o < tail_start && e > o {
+                queue.write_buffer(buffer, o, &data[o as usize..e as usize]);
+                bytes_written += e - o;
+                range_count += 1;
+            }
+        }
+
+        // 3. Budget the un-resident tail `[tail_start, needed)`.
+        let (lo, hi) = budgeted_tail(tail_start, needed, budget);
+        if hi > lo {
+            queue.write_buffer(buffer, lo, &data[lo as usize..hi as usize]);
+            bytes_written += hi - lo;
+            range_count += 1;
+        }
+
+        // 4. Advance the GPU high-water cursor. `hi` is the new resident
+        //    boundary of the contiguous tail; it never regresses below
+        //    `tail_start`.
+        *valid_bytes = hi.max(tail_start);
+        let drained = *valid_bytes >= needed;
+        if drained {
+            *valid_bytes = needed;
+        }
+        (UploadStats { grew, bytes_written, range_count }, drained)
     }
 
     /// Delta-aware upload for the octree's interleaved-vec4<u32> GPU
@@ -1029,5 +1303,66 @@ impl ArvxScene {
                 wgpu::BindGroupEntry { binding: 12, resource: instance_sculpt.as_entire_binding() },
             ],
         })
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::budgeted_tail;
+
+    /// A tail larger than the budget walks across calls, advancing the
+    /// high-water mark by `budget` each time until it reaches `len`.
+    #[test]
+    fn budget_splits_large_tail() {
+        let len = 20;
+        let budget = 8;
+        let (lo0, hi0) = budgeted_tail(0, len, budget);
+        assert_eq!((lo0, hi0), (0, 8));
+        let (lo1, hi1) = budgeted_tail(hi0, len, budget);
+        assert_eq!((lo1, hi1), (8, 16));
+        let (lo2, hi2) = budgeted_tail(hi1, len, budget);
+        assert_eq!((lo2, hi2), (16, 20)); // final slice is the 4-byte remainder
+        assert_eq!(hi2, len, "tail fully drained after 3 calls");
+    }
+
+    /// A small pool (or stamp) under the budget completes in one call —
+    /// this is the path that keeps a sculpt edit atomic (never split).
+    #[test]
+    fn budget_completes_small_in_one() {
+        let len = 4096;
+        let (lo, hi) = budgeted_tail(0, len, 8 * 1024 * 1024);
+        assert_eq!((lo, hi), (0, 4096));
+        assert_eq!(hi, len);
+    }
+
+    /// Budget exhausted earlier in the frame (remaining == 0) makes no
+    /// progress this call — `lo == hi`, the cursor doesn't move.
+    #[test]
+    fn budget_zero_remaining_is_noop() {
+        let (lo, hi) = budgeted_tail(8, 20, 0);
+        assert_eq!((lo, hi), (8, 8));
+    }
+
+    /// Already-drained pool (cursor at `len`) is idempotent — no write.
+    #[test]
+    fn hw_at_len_is_noop() {
+        let (lo, hi) = budgeted_tail(20, 20, 8);
+        assert_eq!((lo, hi), (20, 20));
+    }
+
+    /// A cursor somehow past `len` (pool shrank via deallocate) clamps to
+    /// `len` and writes nothing.
+    #[test]
+    fn hw_past_len_clamps() {
+        let (lo, hi) = budgeted_tail(40, 20, 8);
+        assert_eq!((lo, hi), (20, 20));
+    }
+
+    /// A budget larger than the whole remaining tail writes it all in one
+    /// slice (the `ARVX_GEO_UPLOAD_BUDGET_BYTES=u64::MAX` regression path).
+    #[test]
+    fn huge_budget_writes_whole_tail_at_once() {
+        let (lo, hi) = budgeted_tail(5, 100, u64::MAX);
+        assert_eq!((lo, hi), (5, 100));
     }
 }

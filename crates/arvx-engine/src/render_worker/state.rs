@@ -315,6 +315,48 @@ impl RenderWorker {
     }
 }
 
+/// Cross-frame cursor for the byte-budgeted geometry upload (the #3
+/// render-thread stall fix). The per-pool GPU high-water marks live on
+/// `ArvxScene` (`*_valid`); the per-asset mesh-upload progress lives on
+/// `ArvxRenderer` (and each asset's own `mesh_dirty` flag, cleared per
+/// asset on completion, is the mesh cursor). This carries only the
+/// references-phase flag and the epoch it belongs to.
+///
+/// `refs_uploaded` resets whenever the snapshot's `geometry_epoch`
+/// differs from `in_progress_epoch` — a fresh epoch means new appended
+/// geometry, so the octree references must re-upload. The pool cursors
+/// are NOT reset (their GPU bytes stay valid; they simply chase the new,
+/// larger pool length).
+#[derive(Default)]
+pub(super) struct GeoBudgetState {
+    /// The `geometry_epoch` this drain is tracking. `0` = idle.
+    pub(super) in_progress_epoch: u64,
+    /// Phase B (octree + brick_face_links) shipped for this epoch.
+    pub(super) refs_uploaded: bool,
+}
+
+impl GeoBudgetState {
+    /// Begin (or restart) the drain for `epoch`: references not yet shipped.
+    pub(super) fn restart(&mut self, epoch: u64) {
+        self.in_progress_epoch = epoch;
+        self.refs_uploaded = false;
+    }
+}
+
+/// Per-frame byte ceiling for the geometry upload, from
+/// `ARVX_GEO_UPLOAD_BUDGET_BYTES` (default 8 MiB). `0` is clamped to a
+/// 1 MiB floor (a literal 0 would never drain); set it to a huge value to
+/// restore single-frame uploads for A/B comparison.
+pub(super) fn geo_upload_budget_bytes() -> u64 {
+    const DEFAULT: u64 = 8 * 1024 * 1024;
+    const FLOOR: u64 = 1024 * 1024;
+    std::env::var("ARVX_GEO_UPLOAD_BUDGET_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|b| b.max(FLOOR))
+        .unwrap_or(DEFAULT)
+}
+
 /// Internal per-render-thread state. Owns wgpu resources, the
 /// in-flight pick channel, and the two-snapshot interpolation window.
 pub(super) struct RenderState {
@@ -410,6 +452,13 @@ pub(super) struct RenderState {
     /// frame, not a one-shot dirty bit).
     pub(super) last_uploaded_geometry_epoch: u64,
 
+    /// Cross-frame cursor for the byte-budgeted geometry upload (#3
+    /// render-thread stall fix). See [`GeoBudgetState`].
+    pub(super) geo_budget: GeoBudgetState,
+    /// Per-frame byte ceiling for the geometry upload (env-configured
+    /// once at construction). See [`geo_upload_budget_bytes`].
+    pub(super) geo_upload_budget_bytes: u64,
+
     /// `view_proj` of the most recent rendered frame, per viewport.
     /// Overrides the `prev_vp` baked into incoming snapshots before
     /// camera + volumetric uploads — without this, TAA reprojection
@@ -503,6 +552,8 @@ impl RenderState {
             // 0 = "never uploaded any geometry yet" — the first
             // snapshot with epoch > 0 triggers an upload.
             last_uploaded_geometry_epoch: 0,
+            geo_budget: GeoBudgetState::default(),
+            geo_upload_budget_bytes: geo_upload_budget_bytes(),
             // Empty until the first render — the first frame's
             // override falls back to the snapshot's own view_proj
             // (i.e. prev_vp == view_proj, no motion).

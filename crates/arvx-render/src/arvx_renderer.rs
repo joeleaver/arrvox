@@ -150,6 +150,14 @@ pub struct ArvxRenderer {
     /// appended new mesh data (R4c-V2 sculpt path is append-only).
     /// Cleared on `release_mesh_for_asset`.
     mesh_buffers: Vec<Option<MeshBuffersEntry>>,
+    /// In-flight, byte-budgeted mesh uploads for FRESH assets whose
+    /// VBO+IBO is too large to upload in one render frame (a 2.5M-voxel
+    /// asset's mesh is ~200 MiB → ~600 ms of `write_buffer` = a present
+    /// freeze). The asset's full-size buffers are allocated up front and
+    /// filled across frames; it is NOT promoted into `mesh_buffers` (and
+    /// so stays undrawn — `mesh_buffer()` returns `None`) until both
+    /// buffers are complete. Indexed by `AssetHandle::raw()`.
+    mesh_upload_progress: Vec<Option<MeshUploadInProgress>>,
     /// Per-asset meshlet cluster table on the GPU (Phase 5).
     /// `(buffer, cluster_count)`; the buffer holds a flat
     /// `[MeshletCluster]` array uploaded via `cast_slice` and is
@@ -221,6 +229,21 @@ struct MeshBuffersEntry {
     /// Bytes of vertex data already written to `vbo`. The next upload
     /// streams `vertices_bytes[vbo_uploaded_bytes..]` at this offset.
     vbo_uploaded_bytes: u64,
+}
+
+/// A fresh asset's mesh upload spread across frames under the geometry
+/// upload byte budget. The buffers are full-size from the start (so the
+/// object handles are stable); `*_hw` track how many bytes have been
+/// written. When both reach their length the entry is promoted into
+/// `mesh_buffers` and the asset becomes drawable.
+struct MeshUploadInProgress {
+    vbo: wgpu::Buffer,
+    ibo: wgpu::Buffer,
+    vbo_len: u64,
+    ibo_len: u64,
+    vbo_hw: u64,
+    ibo_hw: u64,
+    dispatch_index_count: u32,
 }
 
 /// Allocate a fresh GPU buffer sized for `data` (with 2× headroom over
@@ -372,6 +395,7 @@ impl ArvxRenderer {
             mesh_glass_shadow,
             mesh_glass_debug_force,
             mesh_buffers: Vec::new(),
+            mesh_upload_progress: Vec::new(),
             mesh_cluster_buffers: Vec::new(),
             mesh_cluster_diag: Vec::new(),
             proxy_mesh_buffers: Vec::new(),
@@ -532,11 +556,135 @@ impl ArvxRenderer {
         bytes_written
     }
 
+    /// Byte-budgeted mesh upload for FRESH assets — fills the VBO+IBO
+    /// across frames so a 200 MiB single-asset mesh never freezes the
+    /// present in one ~600 ms `write_buffer`. The full-size buffers are
+    /// allocated up front and the asset is NOT promoted into
+    /// `mesh_buffers` (so `mesh_buffer()` returns `None` → undrawn) until
+    /// both are complete. Returns `(bytes_written, done)`.
+    ///
+    /// An EDIT/re-upload of an already-drawable asset (sculpt, re-bake)
+    /// delegates to the atomic dirty-driven [`Self::upload_mesh_for_asset`]
+    /// — those deltas are small and must update the live mesh in place.
+    pub fn upload_mesh_for_asset_budgeted(
+        &mut self,
+        queue: &wgpu::Queue,
+        handle_raw: u32,
+        vertices: &[MeshVertex],
+        indices: &[u32],
+        vertices_dirty: &arvx_core::DirtyRanges,
+        indices_dirty: &arvx_core::DirtyRanges,
+        dispatch_index_count: u32,
+        budget: u64,
+    ) -> (u64, bool) {
+        let idx = handle_raw as usize;
+
+        // Empty mesh → clear both the drawable and in-progress slots.
+        if vertices.is_empty() || indices.is_empty() || dispatch_index_count == 0 {
+            if let Some(slot) = self.mesh_buffers.get_mut(idx) {
+                *slot = None;
+            }
+            if let Some(slot) = self.mesh_upload_progress.get_mut(idx) {
+                *slot = None;
+            }
+            return (0, true);
+        }
+
+        let in_progress = self
+            .mesh_upload_progress
+            .get(idx)
+            .is_some_and(|s| s.is_some());
+        let already_drawable = self.mesh_buffers.get(idx).is_some_and(|s| s.is_some());
+
+        // Live asset being edited (not mid-budgeted-upload) → atomic path.
+        if already_drawable && !in_progress {
+            let bytes = self.upload_mesh_for_asset(
+                queue, handle_raw, vertices, indices,
+                vertices_dirty, indices_dirty, dispatch_index_count,
+            );
+            return (bytes, true);
+        }
+
+        let vbo_bytes: &[u8] = bytemuck::cast_slice(vertices);
+        let ibo_bytes: &[u8] = bytemuck::cast_slice(indices);
+        let vbo_len = vbo_bytes.len() as u64;
+        let ibo_len = ibo_bytes.len() as u64;
+
+        if idx >= self.mesh_upload_progress.len() {
+            self.mesh_upload_progress.resize_with(idx + 1, || None);
+        }
+        // (Re)allocate full-size buffers when starting, or when the CPU
+        // mesh changed size under us (re-bake at the same handle).
+        let needs_alloc = match self.mesh_upload_progress[idx].as_ref() {
+            None => true,
+            Some(p) => p.vbo_len != vbo_len || p.ibo_len != ibo_len,
+        };
+        if needs_alloc {
+            let vbo = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mesh asset vbo (budgeted)"),
+                size: vbo_len,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let ibo = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mesh asset ibo (budgeted)"),
+                size: ibo_len,
+                usage: wgpu::BufferUsages::INDEX
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.mesh_upload_progress[idx] = Some(MeshUploadInProgress {
+                vbo, ibo, vbo_len, ibo_len, vbo_hw: 0, ibo_hw: 0, dispatch_index_count,
+            });
+        } else {
+            self.mesh_upload_progress[idx].as_mut().unwrap().dispatch_index_count =
+                dispatch_index_count;
+        }
+
+        let p = self.mesh_upload_progress[idx].as_mut().unwrap();
+        let mut remaining = budget;
+        let mut written = 0u64;
+        // Fill the VBO tail first, then the IBO once the VBO is complete.
+        if p.vbo_hw < vbo_len && remaining > 0 {
+            let hi = (p.vbo_hw + remaining).min(vbo_len);
+            queue.write_buffer(&p.vbo, p.vbo_hw, &vbo_bytes[p.vbo_hw as usize..hi as usize]);
+            let n = hi - p.vbo_hw;
+            written += n;
+            remaining -= n;
+            p.vbo_hw = hi;
+        }
+        if p.vbo_hw == vbo_len && p.ibo_hw < ibo_len && remaining > 0 {
+            let hi = (p.ibo_hw + remaining).min(ibo_len);
+            queue.write_buffer(&p.ibo, p.ibo_hw, &ibo_bytes[p.ibo_hw as usize..hi as usize]);
+            let n = hi - p.ibo_hw;
+            written += n;
+            p.ibo_hw = hi;
+        }
+        let done = p.vbo_hw == vbo_len && p.ibo_hw == ibo_len;
+        if done {
+            let p = self.mesh_upload_progress[idx].take().unwrap();
+            if idx >= self.mesh_buffers.len() {
+                self.mesh_buffers.resize_with(idx + 1, || None);
+            }
+            self.mesh_buffers[idx] = Some(MeshBuffersEntry {
+                vbo: p.vbo,
+                ibo: p.ibo,
+                dispatch_index_count: p.dispatch_index_count,
+                vbo_uploaded_bytes: p.vbo_len,
+            });
+        }
+        (written, done)
+    }
+
     /// Drop the cached mesh buffers for `handle_raw`. Called when an
     /// asset is released or invalidated.
     pub fn release_mesh_for_asset(&mut self, handle_raw: u32) {
         let idx = handle_raw as usize;
         if let Some(slot) = self.mesh_buffers.get_mut(idx) {
+            *slot = None;
+        }
+        if let Some(slot) = self.mesh_upload_progress.get_mut(idx) {
             *slot = None;
         }
     }
@@ -1903,6 +2051,27 @@ impl ArvxRenderer {
 
     pub fn upload_geometry(&mut self, queue: &wgpu::Queue, data: &GeometryUpload) {
         self.scene.upload_geometry(&self.device, queue, data);
+    }
+
+    /// Byte-budgeted geometry upload (Phase A data pools + Phase B
+    /// references). See [`ArvxScene::upload_geometry_budgeted`]. The
+    /// render worker drives Phase C (per-asset meshes) itself and uses
+    /// the returned progress to gate epoch advance + dirty clears.
+    pub fn upload_geometry_budgeted(
+        &mut self,
+        queue: &wgpu::Queue,
+        data: &GeometryUpload,
+        budget: u64,
+        refs_uploaded: &mut bool,
+    ) -> crate::arvx_scene::GeoBudgetProgress {
+        self.scene
+            .upload_geometry_budgeted(&self.device, queue, data, budget, refs_uploaded)
+    }
+
+    /// The four data pools' GPU high-water marks `(leaf_attr, color, bone,
+    /// brick)`. See [`ArvxScene::pool_valid_marks`].
+    pub fn pool_valid_marks(&self) -> (u64, u64, u64, u64) {
+        self.scene.pool_valid_marks()
     }
 
     pub fn upload_frame(&mut self, queue: &wgpu::Queue, data: &FrameUpload) {

@@ -477,6 +477,31 @@ impl ArvxSceneManager {
         self.leaf_attr_pool.dirty_bones_mut().clear();
     }
 
+    /// Drop the per-pool dirty ranges below each pool's GPU high-water
+    /// mark — i.e. the appended bytes the byte-budgeted upload has already
+    /// shipped. Called every frame of a multi-frame drain with the render
+    /// side's `(leaf_attr, color, bone, brick)` `valid_bytes`. Without it
+    /// a pool that drains early keeps re-uploading its whole resident
+    /// prefix every frame (its append-dirty spans the entire appended
+    /// region), starving the tail budget so later pools never drain.
+    ///
+    /// Only the four DATA pools are touched — the octree (and face_links)
+    /// upload atomically in the references phase and their dirty is
+    /// cleared wholesale by [`Self::clear_geometry_dirty_ranges`] on
+    /// completion.
+    pub fn clear_geometry_dirty_below(
+        &mut self,
+        leaf_attr: u64,
+        color: u64,
+        bone: u64,
+        brick: u64,
+    ) {
+        self.leaf_attr_pool.dirty_attrs_mut().retain_from(leaf_attr as u32);
+        self.leaf_attr_pool.dirty_colors_mut().retain_from(color as u32);
+        self.leaf_attr_pool.dirty_bones_mut().retain_from(bone as u32);
+        self.brick_pool.dirty_ranges_mut().retain_from(brick as u32);
+    }
+
     /// Returns a lock-free snapshot of the three pool buffers the
     /// painted-material walk reads. Hold the returned [`WalkSnapshot`]
     /// outside the `scene_mgr` lock to walk the octree without
