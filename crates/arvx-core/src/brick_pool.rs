@@ -66,16 +66,15 @@ pub const fn brick_flat_index(x: u32, y: u32, z: u32) -> u32 {
 pub struct BrickPool {
     /// Flat cell storage: `data[brick_id * BRICK_CELLS + flat_index]`.
     ///
-    /// Wrapped in `Arc<Vec<u32>>` (instead of plain `Vec<u32>`) so the
-    /// painted-material walk's `WalkSnapshot` can take a constant-time
-    /// `Arc::clone` and traverse pool data outside the `scene_mgr` lock
-    /// without paying the ~200 MB memcpy of the prior `.to_vec()` design.
-    /// Internal mutations route through [`Self::data_mut`] which calls
-    /// `Arc::make_mut`: while no snapshot is outstanding refcount is 1
-    /// and writes are in-place; while a snapshot is held, the first
-    /// mutation pays a one-time clone (which the caller would have paid
-    /// anyway, just earlier in the timeline). See PERF_DEBT.md A2.
-    data: std::sync::Arc<Vec<u32>>,
+    /// A [`SnapshotVec`] so the painted-material / collider walk's
+    /// `WalkSnapshot` can take a constant-time snapshot and traverse pool data
+    /// outside the `scene_mgr` lock. Asset/terrain splices append to the tail
+    /// via [`SnapshotVec::tail_mut`] which **never clones**, even with a
+    /// snapshot outstanding — the old `Arc<Vec>` + `Arc::make_mut` cloned the
+    /// whole (1.6 GB-class) brick pool on every splice, the load-freeze root
+    /// cause. In-place edits (dealloc-zero, set_cell) still copy-on-write via
+    /// [`SnapshotVec::make_mut`] when a snapshot is held.
+    data: crate::snapshot_vec::SnapshotVec<u32>,
     /// Number of allocated bricks (bump pointer, in bricks, not cells).
     next_free_brick: u32,
     /// Free list of reclaimed brick ranges — `(brick_start, brick_count)`.
@@ -91,32 +90,31 @@ impl BrickPool {
     pub fn new(capacity_bricks: u32) -> Self {
         let capacity_cells = (capacity_bricks as usize) * (BRICK_CELLS as usize);
         Self {
-            data: std::sync::Arc::new(vec![BRICK_EMPTY; capacity_cells]),
+            data: crate::snapshot_vec::SnapshotVec::with_capacity(capacity_cells, BRICK_EMPTY),
             next_free_brick: 0,
             free_list: Vec::new(),
             dirty: crate::DirtyRanges::new(),
         }
     }
 
-    /// Mutable access to the inner storage for in-pool writes. Routes
-    /// through `Arc::make_mut` so an outstanding `WalkSnapshot` clone
-    /// causes a one-time copy-on-write rather than corrupting the
-    /// snapshot. In steady state (no snapshot held) this is a free
-    /// `&mut Vec<u32>` — refcount is 1, no clone happens.
+    /// Mutable access to the inner storage for IN-PLACE writes (dealloc-zero,
+    /// set_cell). Copies-on-write if a `WalkSnapshot` is outstanding — same
+    /// one-time cost as the old `Arc::make_mut`. NOT used for tail appends
+    /// (splice); those go through [`SnapshotVec::tail_mut`] which never clones.
     #[inline]
-    fn data_mut(&mut self) -> &mut Vec<u32> {
-        std::sync::Arc::make_mut(&mut self.data)
+    fn data_mut(&mut self) -> &mut [u32] {
+        self.data.make_mut()
     }
 
-    /// Cheap shareable handle to the brick data, used by
+    /// Cheap O(1) snapshot of the brick data, used by
     /// `ArvxSceneManager::walk_snapshot` to hand pool storage to the
-    /// painted-material walk without copying. Holding the returned
-    /// `Arc` until after a future mutation triggers copy-on-write
-    /// inside `data_mut`; release it once the walk is done so writes
-    /// stay in place.
+    /// painted-material / collider walks without copying. Pins the current
+    /// live-cell watermark (`next_free_brick * BRICK_CELLS`); tail appends after
+    /// this snapshot don't disturb it.
     #[inline]
-    pub fn data_arc(&self) -> std::sync::Arc<Vec<u32>> {
-        self.data.clone()
+    pub fn data_snapshot(&self) -> crate::snapshot_vec::SnapshotVecView<u32> {
+        self.data
+            .snapshot(self.next_free_brick as usize * BRICK_CELLS as usize)
     }
 
     /// Mark a brick's byte range dirty for the next upload.
@@ -211,7 +209,7 @@ impl BrickPool {
         }
 
         // Clear cells first — unordered is fine.
-        let cur_len = self.data.len();
+        let cur_len = self.data.capacity();
         let data = self.data_mut();
         for &id in brick_ids {
             let start = id as usize * BRICK_CELLS as usize;
@@ -292,7 +290,7 @@ impl BrickPool {
     pub fn deallocate(&mut self, brick_id: u32) {
         let start = brick_id as usize * BRICK_CELLS as usize;
         let end = start + BRICK_CELLS as usize;
-        if end > self.data.len() {
+        if end > self.data.capacity() {
             return;
         }
         for cell in &mut self.data_mut()[start..end] {
@@ -358,16 +356,16 @@ impl BrickPool {
     /// Current pool capacity measured in bricks.
     #[inline]
     pub fn capacity_bricks(&self) -> u32 {
-        (self.data.len() / BRICK_CELLS as usize) as u32
+        (self.data.capacity() / BRICK_CELLS as usize) as u32
     }
 
     /// Grow the pool to at least `new_cap` bricks. Preserves existing data.
     pub fn grow(&mut self, new_cap: u32) {
         let target_cells = (new_cap as usize) * (BRICK_CELLS as usize);
-        if target_cells <= self.data.len() {
+        if target_cells <= self.data.capacity() {
             return;
         }
-        self.data_mut().resize(target_cells, BRICK_EMPTY);
+        self.data.resize(target_cells, BRICK_EMPTY);
     }
 
     /// Raw byte view of the allocated region (for GPU upload).
@@ -398,6 +396,19 @@ impl BrickPool {
     /// bulk pass. The destination range comes from
     /// [`allocate_contiguous_bump`], which never reuses freed bricks, so
     /// it is fresh `BRICK_EMPTY` capacity before the copy.
+    /// `&mut [u32]` over the freshly-reserved brick tail — `n_bricks` bricks
+    /// starting at brick id `brick_start` — WITHOUT cloning, even with a
+    /// `WalkSnapshot` outstanding. The range must have been reserved by
+    /// [`Self::allocate_contiguous_bump`] (tail, ≥ any snapshot watermark). The
+    /// caller fills it (e.g. the terrain integrate's leaf-slot shift). Replaces
+    /// a per-brick `brick_cells_mut` loop whose first write would
+    /// `Arc::make_mut`-clone the whole brick pool.
+    pub fn brick_tail_mut(&mut self, brick_start: u32, n_bricks: u32) -> &mut [u32] {
+        let start = brick_start as usize * BRICK_CELLS as usize;
+        let len = n_bricks as usize * BRICK_CELLS as usize;
+        self.data.tail_mut(start, len)
+    }
+
     pub fn splice_assimilate_shifted(&mut self, other: &BrickPool, slot_offset: u32) -> u32 {
         let count = other.allocated_count();
         let start = self
@@ -408,9 +419,13 @@ impl BrickPool {
         }
         let src = other.as_slice();
         let dst_start = start as usize * BRICK_CELLS as usize;
-        let data = self.data_mut();
+        // Write the fresh tail via `tail_mut` — NEVER clones, even with a
+        // WalkSnapshot outstanding (the old `data_mut()` = `Arc::make_mut`
+        // cloned the whole 1.6 GB-class brick pool here, the load-freeze root
+        // cause). The shift folds file-local slot ids to scene-global.
+        let dst = self.data.tail_mut(dst_start, src.len());
         for (i, &cell) in src.iter().enumerate() {
-            data[dst_start + i] = match cell {
+            dst[i] = match cell {
                 BRICK_EMPTY | BRICK_INTERIOR => cell,
                 slot => slot + slot_offset,
             };

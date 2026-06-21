@@ -74,9 +74,14 @@ impl ArvxSceneManager {
             .leaf_attr_pool
             .allocate_contiguous_bump(n_attrs)?;
         let has_distances = !artifact.leaf_attr_dists.is_empty();
-        for (i, attr) in artifact.leaf_attrs.iter().enumerate() {
+        // Bulk COW-free tail write of the LeafAttr data (the old per-slot
+        // `get_mut` loop's first write would `Arc::make_mut`-clone the whole
+        // pool — the terrain-integrate freeze). Colors/dists are plain `Vec`s
+        // (not snapshot-shared), so their per-slot writes never clone.
+        self.leaf_attr_pool
+            .write_attr_tail(leaf_attr_slot_start, &artifact.leaf_attrs);
+        for (i, _attr) in artifact.leaf_attrs.iter().enumerate() {
             let scene_id = leaf_attr_slot_start + i as u32;
-            *self.leaf_attr_pool.get_mut(scene_id) = *attr;
             let color = artifact.leaf_attr_colors[i];
             if color != 0 {
                 self.leaf_attr_pool.set_color(scene_id, color);
@@ -102,17 +107,22 @@ impl ArvxSceneManager {
             .brick_pool
             .allocate_contiguous_bump(n_bricks)?;
 
-        for (worker_id, cells) in artifact.brick_cells.iter().enumerate() {
-            let scene_id = brick_start + worker_id as u32;
-            let dst = self.brick_pool.brick_cells_mut(scene_id);
-            debug_assert_eq!(dst.len(), cells.len());
-            debug_assert_eq!(BRICK_CELLS as usize, cells.len());
-            for (d, &c) in dst.iter_mut().zip(cells.iter()) {
-                *d = if c == BRICK_EMPTY || c == BRICK_INTERIOR {
-                    c
-                } else {
-                    leaf_attr_slot_start + c
-                };
+        // Bulk COW-free tail write of the contiguous brick range (the old
+        // per-brick `brick_cells_mut` loop's first write would
+        // `Arc::make_mut`-clone the whole 1.6 GB-class brick pool — the bulk of
+        // the terrain-integrate freeze).
+        {
+            let dst = self.brick_pool.brick_tail_mut(brick_start, n_bricks);
+            for (worker_id, cells) in artifact.brick_cells.iter().enumerate() {
+                debug_assert_eq!(BRICK_CELLS as usize, cells.len());
+                let base = worker_id * BRICK_CELLS as usize;
+                for (j, &c) in cells.iter().enumerate() {
+                    dst[base + j] = if c == BRICK_EMPTY || c == BRICK_INTERIOR {
+                        c
+                    } else {
+                        leaf_attr_slot_start + c
+                    };
+                }
             }
         }
 

@@ -157,8 +157,8 @@ fn worker_loop(inbox: Receiver<ColliderBatch>, outbox: Sender<ColliderResult>) {
 }
 
 fn build_one(
-    octree: &Arc<Vec<u32>>,
-    bricks: &Arc<Vec<u32>>,
+    octree: &[u32],
+    bricks: &[u32],
     job: &ColliderJob,
 ) -> ColliderCache {
     let all_nodes: &[u32] = octree;

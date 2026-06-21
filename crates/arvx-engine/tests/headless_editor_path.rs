@@ -199,3 +199,79 @@ fn p2_render_survives_tightest_inflight_cap() {
         obs.gpu_objects()
     );
 }
+
+/// WINDOWLESS repro of the real arvx1 project load freeze — drives the engine's
+/// `OpenProject` over the same path the editor uses, with NO GUI window (so it
+/// doesn't pop up on anyone's screen). This is the diagnosis vehicle for the
+/// scene_mgr lock-contention (#2) + synchronous geometry upload (#3) stalls:
+/// the `[asset-splice]` phase breakdown, `[terrain-tick]`, `[geo-epoch]`,
+/// `[lock]`, and `[render-frame]` canaries all print to stderr.
+///
+/// `#[ignore]` — depends on the local `/home/joe/dev/arvx1` project. Run with:
+///   cargo test -p arvx-engine --test headless_editor_path --release -- \
+///     --ignored --nocapture arvx1_load
+#[test]
+#[ignore = "depends on local /home/joe/dev/arvx1 project; run explicitly for load-freeze diagnosis"]
+fn arvx1_load_windowless() {
+    // OpenProject reads the .arvxproject FILE (not the directory).
+    const PROJECT: &str = "/home/joe/dev/arvx1/arvx1.arvxproject";
+    if !std::path::Path::new(PROJECT).exists() {
+        eprintln!("[arvx1_load] project file missing at {PROJECT} — skipping");
+        return;
+    }
+    unsafe {
+        std::env::set_var("ARVX_TERRAIN_PROFILE", "1");
+        std::env::set_var("ARVX_LOCK_PROFILE", "1");
+    }
+
+    let (engine, obs) = Observed::spawn_engine(1280, 720);
+    assert!(
+        wait_until(Duration::from_secs(60), || obs.frames() > 0),
+        "engine never produced a first frame within 60s"
+    );
+
+    eprintln!("[arvx1_load] sending OpenProject {PROJECT}");
+    engine
+        .cmd_tx
+        .send(EngineCommand::OpenProject {
+            path: PROJECT.to_string(),
+        })
+        .expect("send OpenProject");
+
+    // Wait for the scene to materialize (gpu_objects climbs as assets/terrain
+    // integrate). Generous deadline — the whole point is that this load is slow.
+    assert!(
+        wait_until(Duration::from_secs(90), || obs.gpu_objects() >= 5),
+        "arvx1 scene never integrated within 90s — gpu_objects={}",
+        obs.gpu_objects()
+    );
+
+    // Let the FULL load + settle run so every canary prints. Sample the frame
+    // counter on a FIXED 1s wall-clock cadence (not wait-on-advance, which
+    // would race ahead and miss the later, slow splices/integrates). A 1s
+    // window with 0 new frames = a freeze; the per-second deltas are the
+    // headless freeze trace.
+    let mut prev = obs.frames();
+    for sec in 0..75 {
+        std::thread::sleep(Duration::from_secs(1));
+        let now = obs.frames();
+        let delta = now - prev;
+        if delta == 0 {
+            eprintln!(
+                "[arvx1_load] t={sec}s FREEZE — 0 frames in 1s (frames={now} gpu_objects={})",
+                obs.gpu_objects()
+            );
+        } else if delta < 10 {
+            eprintln!(
+                "[arvx1_load] t={sec}s STUTTER — only {delta} frames in 1s (gpu_objects={})",
+                obs.gpu_objects()
+            );
+        }
+        prev = now;
+    }
+    eprintln!(
+        "[arvx1_load] done — frames={} gpu_objects={}",
+        obs.frames(),
+        obs.gpu_objects()
+    );
+}

@@ -33,6 +33,7 @@ pub mod sculpt;
 pub mod sculpt_overlay;
 pub mod sdf;
 pub mod sdf_primitive;
+pub mod snapshot_vec;
 pub mod sparse_octree;
 pub mod voxel;
 pub mod voxelize_octree;

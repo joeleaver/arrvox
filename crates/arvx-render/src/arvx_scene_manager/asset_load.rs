@@ -1006,6 +1006,7 @@ impl ArvxSceneManager {
         let scene_brick_offset = self
             .brick_pool
             .splice_assimilate_shifted(&brick_pool, leaf_attr_slot_start);
+        let ph_pools = t_splice.elapsed().as_secs_f32() * 1000.0;
 
         // Shift the tree's file-local BRICK node ids to scene-global.
         {
@@ -1039,6 +1040,7 @@ impl ArvxSceneManager {
                 v.leaf_attr_id += leaf_attr_slot_start;
             }
         }
+        let ph_shifts = t_splice.elapsed().as_secs_f32() * 1000.0;
 
         // Brick face-links — the tree's brick ids are now scene-global,
         // so the rows are ready to merge.
@@ -1048,9 +1050,11 @@ impl ArvxSceneManager {
                 arvx_core::brick_face_links::compute_brick_face_links(&tree, max_brick);
             self.merge_face_links(&face_links);
         }
+        let ph_facelinks = t_splice.elapsed().as_secs_f32() * 1000.0;
 
         // Allocate the octree, preserving its populated internal_attr_index.
         let handle = self.octree.allocate(&tree);
+        let ph_octree = t_splice.elapsed().as_secs_f32() * 1000.0;
 
         // Slab-allocator dirty ranges — full re-mark so the first upload
         // pushes the freshly-spliced IBO/VBO to the GPU.
@@ -1068,11 +1072,18 @@ impl ArvxSceneManager {
             mesh_vertices_dirty.mark_full(vbo_total_bytes);
         }
 
+        let ph_total = t_splice.elapsed().as_secs_f32() * 1000.0;
         eprintln!(
-            "[asset-splice] {} splice={:.1}ms voxels={}",
+            "[asset-splice] {} splice={:.1}ms voxels={} | pools={:.1} shifts={:.1} \
+             facelinks={:.1} octree={:.1} rest={:.1}",
             path.display(),
-            t_splice.elapsed().as_secs_f32() * 1000.0,
+            ph_total,
             actual_cell_count,
+            ph_pools,
+            ph_shifts - ph_pools,
+            ph_facelinks - ph_shifts,
+            ph_octree - ph_facelinks,
+            ph_total - ph_octree,
         );
 
         AssetEntry {
