@@ -458,6 +458,15 @@ pub(super) struct RenderState {
     /// Per-frame byte ceiling for the geometry upload (env-configured
     /// once at construction). See [`geo_upload_budget_bytes`].
     pub(super) geo_upload_budget_bytes: u64,
+    /// Deadline until which a geometry load is considered "active". The geo
+    /// block refreshes it (now + ~200 ms) whenever it does upload work; the
+    /// loop uses a LOWER inflight cap while `Instant::now() < this` so the
+    /// staging belt recycles fast and upload `write_buffer` doesn't block
+    /// behind a deep render queue. Time-based hysteresis (not the per-epoch
+    /// `GeoBudgetState`) so it survives the brief gaps between epochs in a
+    /// continuous multi-asset load — where the per-epoch flag flickers to
+    /// idle and the cap would wrongly snap back to the high value.
+    pub(super) geo_active_until: std::time::Instant,
 
     /// `view_proj` of the most recent rendered frame, per viewport.
     /// Overrides the `prev_vp` baked into incoming snapshots before
@@ -554,6 +563,7 @@ impl RenderState {
             last_uploaded_geometry_epoch: 0,
             geo_budget: GeoBudgetState::default(),
             geo_upload_budget_bytes: geo_upload_budget_bytes(),
+            geo_active_until: std::time::Instant::now(),
             // Empty until the first render — the first frame's
             // override falls back to the snapshot's own view_proj
             // (i.e. prev_vp == view_proj, no motion).

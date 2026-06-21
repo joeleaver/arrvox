@@ -2403,7 +2403,7 @@ impl ArvxRenderer {
         let Some(results) = self.profiler.process_finished_frame(self.timestamp_period) else {
             return Vec::new();
         };
-        results
+        let passes: Vec<(String, f32)> = results
             .iter()
             .map(|r| {
                 let ms = r
@@ -2413,7 +2413,27 @@ impl ArvxRenderer {
                     .unwrap_or(0.0);
                 (r.label.clone(), ms)
             })
-            .collect()
+            .collect();
+        // Per-pass GPU breakdown of the heaviest frames, gated on
+        // `ARVX_GPU_PASS_PROFILE` (off by default; same spirit as the other
+        // `ARVX_*_PROFILE` knobs). Used to find that shadows dominate the
+        // loaded-scene frame (~half of ~25 ms) — relevant to future
+        // LOD-during-load work beyond the inflight-cap fix.
+        if std::env::var("ARVX_GPU_PASS_PROFILE").is_ok() {
+            let total: f32 = passes.iter().map(|(_, ms)| *ms).sum();
+            if total > 25.0 {
+                let mut sorted = passes.clone();
+                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top: String = sorted
+                    .iter()
+                    .take(6)
+                    .map(|(l, ms)| format!("{l}={ms:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!("[gpu-pass] total={total:.1}ms | {top}");
+            }
+        }
+        passes
     }
 
     pub fn update_shade_params(&self, queue: &wgpu::Queue, params: &ShadeParams) {

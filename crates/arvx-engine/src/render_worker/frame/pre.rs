@@ -102,6 +102,15 @@ pub(super) fn run_pre_frame(
     //    dropped by the newest-wins inbox.
     if frame.geometry_epoch > state.last_uploaded_geometry_epoch { 'geo: {
         let geo_epoch_t0 = std::time::Instant::now();
+        // Mark a load "active" for ~600 ms whenever geometry is PENDING —
+        // set BEFORE the try_lock so it stays set even while a big-asset
+        // splice holds scene_mgr (try_lock fails, the upload is skipped, but
+        // the load is still in progress). The loop holds the lower inflight
+        // cap while active so a deep render queue can't build up behind the
+        // splice and stall the upload that follows it (#8). 600 ms spans a
+        // big splice's lock hold; refreshed every frame there's pending geo.
+        state.geo_active_until =
+            std::time::Instant::now() + std::time::Duration::from_millis(600);
         // Never block the render thread on a sim-side asset splice. A
         // big-asset splice can hold `scene_mgr` for 100-400ms; WAITING on
         // it here is exactly the `lock=367ms` stall that produced the

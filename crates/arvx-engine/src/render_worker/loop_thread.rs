@@ -64,6 +64,23 @@ pub(super) fn run_render_thread(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
+    // While a geometry load is active, use a LOWER inflight cap.
+    // `queue.write_buffer` staging frees only when the submit it rode
+    // completes; with N frames queued the next frame's upload write_buffer
+    // blocks behind ~N×(per-frame GPU time, ~25 ms loaded) of work. The geo
+    // upload is already byte-budgeted, but at the normal cap of 4 that queue
+    // depth still adds ~95-120 ms of upload backpressure on the heaviest
+    // load frames. Dropping to 1 during the load fully serializes render vs
+    // upload so the queue can't build up — worst-case upload hitch falls to
+    // ~40 ms (measured: cap 4→~100, 2→~65, 1→~40). Normal (non-load) frames
+    // keep `max_inflight` for GPU overlap / throughput. Raise this to 2 to
+    // trade a slightly larger hitch for more in-flight overlap during load.
+    let max_inflight_loading: u32 = std::env::var("ARVX_MAX_INFLIGHT_SUBMITS_LOADING")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .min(max_inflight)
+        .max(1);
 
     // Bootstrap: wait for the first snapshot. `None` = shutdown
     // signal arrived before any snapshot ever did.
@@ -145,8 +162,19 @@ pub(super) fn run_render_thread(
         //     `on_submitted_work_done`, fired by the poll thread's
         //     `device.poll`). At the cap, skip this iteration with a short
         //     bounded sleep — never an indefinite block, never readback-coupled.
+        // Effective cap: lower while a geometry load is active so the
+        // staging belt recycles fast and upload write_buffer doesn't block
+        // behind a deep render queue. The deadline is refreshed by the geo
+        // block (pre.rs); time-based so it spans the gaps between a load's
+        // epochs (the per-epoch flag flickers idle there and would snap the
+        // cap back to the high value on exactly the frames that spike).
+        let cap = if iter_start < state.geo_active_until {
+            max_inflight_loading
+        } else {
+            max_inflight
+        };
         let inflight_now = state.inflight_submits.load(Ordering::Relaxed);
-        if inflight_now >= max_inflight {
+        if inflight_now >= cap {
             let now = std::time::Instant::now();
             let since = *pace_blocked_since.get_or_insert(now);
             let blocked_ms = now.duration_since(since).as_secs_f32() * 1000.0;
@@ -160,7 +188,7 @@ pub(super) fn run_render_thread(
                 if due {
                     pace_last_log = Some(now);
                     eprintln!(
-                        "[render-pace] WEDGED inflight={inflight_now}/{max_inflight} for {blocked_ms:.0}ms \
+                        "[render-pace] WEDGED inflight={inflight_now}/{cap} for {blocked_ms:.0}ms \
                          — submissions not draining (poll thread stalled?)"
                     );
                 }
