@@ -635,11 +635,19 @@ impl ArvxScene {
             );
             grew |= octree_stats.grew;
             consumed += octree_stats.bytes_written;
-            // face_links has no delta tracker — full re-write, same
-            // "references" tier as the octree.
-            grew |= Self::ensure_and_write(
-                device, queue, &mut self.brick_face_links_buffer, "arvx_brick_face_links",
-                data.brick_face_links,
+            // `brick_face_links` has NO live GPU consumer: its only reader,
+            // `lib::octree::descend_proto_octree`, is never CALLED in any
+            // pass (it's bound only so the WESL composer parses lib::octree;
+            // naga DCE drops the reads). The old `ensure_and_write` here
+            // re-uploaded the full pool (~33 MiB → ~35 ms) every references
+            // frame for data nothing reads. Keep the buffer SIZED so the
+            // bind group stays valid, but skip the dead data write.
+            // (If a real proto-march consumer is ever wired up, this must
+            // become a delta-tracked upload — a full-write here is a perf
+            // regression, not a correctness fix.)
+            grew |= Self::ensure_capacity(
+                device, &mut self.brick_face_links_buffer, "arvx_brick_face_links",
+                data.brick_face_links.len() as u64,
             );
             *refs_uploaded = true;
         }
