@@ -64,8 +64,12 @@ pub fn ms_since_process_ns(nanos_then: u64) -> Option<f64> {
 #[derive(Clone)]
 pub struct WalkSnapshot {
     pub octree_data: std::sync::Arc<Vec<u32>>,
-    pub brick_pool_data: std::sync::Arc<Vec<u32>>,
-    pub leaf_attr_data: std::sync::Arc<Vec<arvx_core::LeafAttr>>,
+    /// Brick + leaf-attr pools share an append-only [`SnapshotVecView`] (not an
+    /// `Arc<Vec>`): tail appends by concurrent splices don't disturb this
+    /// pinned `[0..live]` prefix, so the worker walks consistent geometry
+    /// WITHOUT forcing the whole pool to copy-on-write. Both deref to `&[T]`.
+    pub brick_pool_data: arvx_core::snapshot_vec::SnapshotVecView<u32>,
+    pub leaf_attr_data: arvx_core::snapshot_vec::SnapshotVecView<arvx_core::LeafAttr>,
     /// `geometry_epoch` value at the time this snapshot was taken.
     pub epoch: u64,
 }
@@ -496,8 +500,8 @@ impl ArvxSceneManager {
     pub fn walk_snapshot(&self) -> WalkSnapshot {
         WalkSnapshot {
             octree_data: self.octree.data_arc(),
-            brick_pool_data: self.brick_pool.data_arc(),
-            leaf_attr_data: self.leaf_attr_pool.data_arc(),
+            brick_pool_data: self.brick_pool.data_snapshot(),
+            leaf_attr_data: self.leaf_attr_pool.data_snapshot(),
             epoch: self.geometry_epoch(),
         }
     }

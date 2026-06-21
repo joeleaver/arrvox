@@ -628,9 +628,25 @@ impl EngineState {
         // Splice under the lock; bump the geometry epoch here — geometry
         // enters the pools now (mirrors `acquire_asset`'s top-of-fn bump).
         let (handle, info) = {
+            // [lock] probe (ARVX_LOCK_PROFILE): separate time spent WAITING to
+            // acquire scene_mgr (= contention) from time HOLDING it doing the
+            // splice (= work). Settles whether the multi-hundred-ms splice
+            // spikes are lock-wait or grow/copy work under the lock.
+            let t_acq = std::time::Instant::now();
             let mut sm = self.scene_mgr.lock().unwrap();
+            let wait_ms = t_acq.elapsed().as_secs_f32() * 1000.0;
+            let t_hold = std::time::Instant::now();
             sm.bump_geometry_epoch();
-            sm.integrate_loaded_asset(loaded)
+            let r = sm.integrate_loaded_asset(loaded);
+            if std::env::var("ARVX_LOCK_PROFILE").is_ok() {
+                eprintln!(
+                    "[lock] asset-splice scene_mgr wait={:.1}ms hold={:.1}ms ({})",
+                    wait_ms,
+                    t_hold.elapsed().as_secs_f32() * 1000.0,
+                    res.path.display(),
+                );
+            }
+            r
         };
 
         let live: Vec<hecs::Entity> = waiters

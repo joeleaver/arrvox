@@ -23,17 +23,16 @@ const BONE_STRIDE: u32 = std::mem::size_of::<BoneVoxel>() as u32;
 /// A flat pool of [`LeafAttr`] entries indexed by slot number, with
 /// parallel color and bone-weight arrays at the same indices.
 pub struct LeafAttrPool {
-    /// Per-slot LeafAttr storage. Wrapped in `Arc<Vec<LeafAttr>>` (not
-    /// plain `Vec<LeafAttr>`) so the painted-material walk's
-    /// `WalkSnapshot` can share the buffer via constant-time
-    /// `Arc::clone` instead of paying the ~65 MB memcpy of the prior
-    /// `.to_vec()` design. Internal mutations route through
-    /// [`Self::data_mut`] (`Arc::make_mut`): refcount=1 in steady state,
-    /// so writes are in-place; an outstanding snapshot triggers a
-    /// one-time clone-on-write that the next snapshot's caller would
-    /// have paid anyway. See PERF_DEBT.md A2. `colors` and `bones` stay
-    /// plain `Vec` — they aren't part of the walk_snapshot.
-    data: std::sync::Arc<Vec<LeafAttr>>,
+    /// Per-slot LeafAttr storage. A [`SnapshotVec`] (append-only, snapshot-
+    /// able) so the painted-material walk's `WalkSnapshot` can share the buffer
+    /// via a constant-time snapshot. Crucially, **asset/terrain splices append
+    /// to the tail without cloning** even while a snapshot is outstanding
+    /// ([`SnapshotVec::tail_mut`]) — the old `Arc<Vec>` + `Arc::make_mut` cloned
+    /// the whole (multi-million-slot) pool on every splice, the load-freeze root
+    /// cause. In-place edits (sculpt) still copy-on-write via
+    /// [`SnapshotVec::make_mut`] when a snapshot is held. `colors`/`bones`/
+    /// `dists` stay plain `Vec` — they aren't part of the walk_snapshot.
+    data: crate::snapshot_vec::SnapshotVec<LeafAttr>,
     /// Parallel color array: packed R|G|B|A u32 (A reserved / intensity).
     /// 0 = no override, fall back to material base_color.
     colors: Vec<u32>,
@@ -66,7 +65,10 @@ impl LeafAttrPool {
     /// Create with the given initial capacity (number of entries).
     pub fn new(capacity: u32) -> Self {
         Self {
-            data: std::sync::Arc::new(vec![LeafAttr::EMPTY; capacity as usize]),
+            data: crate::snapshot_vec::SnapshotVec::with_capacity(
+                capacity as usize,
+                LeafAttr::EMPTY,
+            ),
             colors: vec![0u32; capacity as usize],
             bones: vec![BoneVoxel::default(); capacity as usize],
             dists: vec![0i16; capacity as usize],
@@ -78,22 +80,23 @@ impl LeafAttrPool {
         }
     }
 
-    /// Mutable access to the inner `data` storage for in-pool writes.
-    /// Routes through `Arc::make_mut` so an outstanding `WalkSnapshot`
-    /// clone causes a one-time copy-on-write rather than corrupting
-    /// the snapshot. In steady state (refcount=1) this is a free
-    /// `&mut Vec<LeafAttr>`.
+    /// Mutable access to the inner `data` storage for IN-PLACE writes (sculpt
+    /// edits, dealloc-zero). Copies-on-write if a `WalkSnapshot` is outstanding
+    /// — same one-time cost as the old `Arc::make_mut`. NOT used for tail
+    /// appends (splice); those go through [`SnapshotVec::tail_mut`] which never
+    /// clones.
     #[inline]
-    fn data_mut(&mut self) -> &mut Vec<LeafAttr> {
-        std::sync::Arc::make_mut(&mut self.data)
+    fn data_mut(&mut self) -> &mut [LeafAttr] {
+        self.data.make_mut()
     }
 
-    /// Cheap shareable handle to the LeafAttr data, used by
+    /// Cheap O(1) snapshot of the LeafAttr data, used by
     /// `ArvxSceneManager::walk_snapshot` to hand pool storage to the
-    /// painted-material walk without copying.
+    /// painted-material / collider walks without copying. Pins the current
+    /// `next_free` watermark; tail appends after this snapshot don't disturb it.
     #[inline]
-    pub fn data_arc(&self) -> std::sync::Arc<Vec<LeafAttr>> {
-        self.data.clone()
+    pub fn data_snapshot(&self) -> crate::snapshot_vec::SnapshotVecView<LeafAttr> {
+        self.data.snapshot(self.next_free as usize)
     }
 
     #[inline]
@@ -157,8 +160,8 @@ impl LeafAttrPool {
 
         let start = self.next_free;
         let end = start.checked_add(count)?;
-        if end as usize > self.data.len() {
-            let new_cap = (self.data.len() as u32 * 2).max(end);
+        if end as usize > self.data.capacity() {
+            let new_cap = (self.data.capacity() as u32 * 2).max(end);
             self.grow(new_cap);
         }
         self.next_free = end;
@@ -175,8 +178,8 @@ impl LeafAttrPool {
         if count == 0 { return Some(self.next_free); }
         let start = self.next_free;
         let end = start.checked_add(count)?;
-        if end as usize > self.data.len() {
-            let new_cap = (self.data.len() as u32 * 2).max(end);
+        if end as usize > self.data.capacity() {
+            let new_cap = (self.data.capacity() as u32 * 2).max(end);
             self.grow(new_cap);
         }
         self.next_free = end;
@@ -197,8 +200,8 @@ impl LeafAttrPool {
             return Some(start);
         }
 
-        if (self.next_free as usize) >= self.data.len() {
-            let new_cap = (self.data.len() as u32).checked_mul(2)?;
+        if (self.next_free as usize) >= self.data.capacity() {
+            let new_cap = (self.data.capacity() as u32).checked_mul(2)?;
             self.grow(new_cap);
         }
         let slot = self.next_free;
@@ -215,7 +218,7 @@ impl LeafAttrPool {
             return;
         }
         let end = (start + count) as usize;
-        if end > self.data.len() {
+        if end > self.data.capacity() {
             return;
         }
         let data = self.data_mut();
@@ -279,13 +282,13 @@ impl LeafAttrPool {
     pub fn allocated_count(&self) -> u32 { self.next_free }
 
     #[inline]
-    pub fn capacity(&self) -> u32 { self.data.len() as u32 }
+    pub fn capacity(&self) -> u32 { self.data.capacity() as u32 }
 
     pub fn grow(&mut self, new_cap: u32) {
-        if new_cap as usize <= self.data.len() {
+        if new_cap as usize <= self.data.capacity() {
             return;
         }
-        self.data_mut().resize(new_cap as usize, LeafAttr::EMPTY);
+        self.data.resize(new_cap as usize, LeafAttr::EMPTY);
         self.colors.resize(new_cap as usize, 0);
         self.bones.resize(new_cap as usize, BoneVoxel::default());
         self.dists.resize(new_cap as usize, 0);
@@ -345,6 +348,22 @@ impl LeafAttrPool {
     /// memcpy'd in here in three `copy_from_slice` passes instead of the
     /// per-slot `get_mut`/`set_color`/`set_bone` loop the inline loader
     /// ran under the lock.
+    /// Bulk-write `attrs` into the freshly-reserved tail starting at slot
+    /// `start` WITHOUT cloning (the COW-free append path), even with a
+    /// `WalkSnapshot` outstanding. The range must have been reserved by
+    /// [`Self::allocate_contiguous_bump`] (which also marked it dirty), and
+    /// `start` must be the tail (≥ any snapshot's watermark). Used by the
+    /// terrain / procedural integrate paths instead of a per-slot `get_mut`
+    /// loop, whose first write would `Arc::make_mut`-clone the whole pool.
+    pub fn write_attr_tail(&mut self, start: u32, attrs: &[LeafAttr]) {
+        if attrs.is_empty() {
+            return;
+        }
+        self.data
+            .tail_mut(start as usize, attrs.len())
+            .copy_from_slice(attrs);
+    }
+
     pub fn splice_assimilate(&mut self, other: &LeafAttrPool) -> u32 {
         let count = other.allocated_count();
         let start = self
@@ -355,8 +374,11 @@ impl LeafAttrPool {
         }
         let (s, n) = (start as usize, count as usize);
         // `allocate_contiguous_bump` already grew capacity to cover
-        // `[start, start + count)` and marked the range dirty.
-        self.data_mut()[s..s + n].copy_from_slice(other.as_slice());
+        // `[start, start + count)` and marked the range dirty. Write the fresh
+        // tail via `tail_mut` — NEVER clones, even with a WalkSnapshot
+        // outstanding (the old `data_mut()` = `Arc::make_mut` cloned the whole
+        // multi-million-slot pool here, the load-freeze root cause).
+        self.data.tail_mut(s, n).copy_from_slice(other.as_slice());
         self.colors[s..s + n].copy_from_slice(&other.colors[..n]);
         self.bones[s..s + n].copy_from_slice(&other.bones[..n]);
         self.dists[s..s + n].copy_from_slice(&other.dists[..n]);

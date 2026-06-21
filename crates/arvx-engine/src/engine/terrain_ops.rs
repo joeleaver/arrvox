@@ -303,17 +303,33 @@ impl super::state::EngineState {
         };
 
         let (asset_handle, info) = {
+            // [lock] probe (ARVX_LOCK_PROFILE): WAIT (contention) vs HOLD (work)
+            // for the terrain-tile integrate — settles whether the 400-1048ms
+            // integrate spikes are blocking on a concurrent splice/upload or
+            // are genuine integrate work held under the lock.
+            let t_acq = std::time::Instant::now();
             let mut sm = match self.scene_mgr.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            sm.integrate_baked_tile(
+            let wait_ms = t_acq.elapsed().as_secs_f32() * 1000.0;
+            let t_hold = std::time::Instant::now();
+            let out = sm.integrate_baked_tile(
                 artifact,
                 mesh,
                 aabb,
                 voxel_size_m,
                 synthetic_path,
-            )?
+            );
+            if std::env::var("ARVX_LOCK_PROFILE").is_ok() {
+                eprintln!(
+                    "[lock] terrain-integrate scene_mgr wait={:.1}ms hold={:.1}ms (tile {},{},{} lvl{})",
+                    wait_ms,
+                    t_hold.elapsed().as_secs_f32() * 1000.0,
+                    key.x, key.y, key.z, key.level,
+                );
+            }
+            out?
         };
 
         let (root_offset, len, depth, base_voxel_size) = match info.spatial {

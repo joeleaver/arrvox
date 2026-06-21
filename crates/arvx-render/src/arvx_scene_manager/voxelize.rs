@@ -187,9 +187,14 @@ impl ArvxSceneManager {
             .leaf_attr_pool
             .allocate_contiguous_bump(n_attrs)?;
         let t_attr_alloc = t_start.elapsed();
-        for (i, attr) in artifact.leaf_attrs.iter().enumerate() {
+        // Bulk COW-free tail write of the LeafAttr data (the old per-slot
+        // `get_mut` loop's first write would `Arc::make_mut`-clone the whole
+        // pool). `colors` is a plain `Vec` (not snapshot-shared) — per-slot is
+        // fine.
+        self.leaf_attr_pool
+            .write_attr_tail(leaf_attr_slot_start, &artifact.leaf_attrs);
+        for (i, _attr) in artifact.leaf_attrs.iter().enumerate() {
             let scene_id = leaf_attr_slot_start + i as u32;
-            *self.leaf_attr_pool.get_mut(scene_id) = *attr;
             let color = artifact.leaf_attr_colors[i];
             if color != 0 {
                 self.leaf_attr_pool.set_color(scene_id, color);
