@@ -28,6 +28,14 @@ pub(super) fn MaterialPropertiesSection() -> NodeHandle {
         div {
             style: "display:flex;flex-direction:column;height:100%;",
 
+            // `#[once]`: build this branch once per selection, as rsx did
+            // before rinch #2105. Since then a branch that binds a value
+            // (`info`) is rebuilt whenever that value changes, and
+            // `mat_info` changes on every slider tick and colour-picker move
+            // this panel's own controls make, so without the marker each tick
+            // would tear down the form mid-drag. Selection changes are handled
+            // by the keyed `for` below.
+            #[once]
             if let Some(info) = mat_info.get() {
                 div {
                     style: "display:flex;flex-direction:column;gap:0;height:100%;",
